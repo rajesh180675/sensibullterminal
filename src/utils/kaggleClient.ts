@@ -189,14 +189,23 @@ export async function checkBackendHealth(backendUrl: string): Promise<HealthResu
     const url = apiUrl(backendUrl, endpoint);
     try {
       const data = await fetchJson<{
-        status?: string; connected?: boolean; ws_running?: boolean;
+        status?: string;
+        connected?: boolean;
+        breeze?: boolean;
+        ws_running?: boolean;
         rest_calls_min?: number; queue_depth?: number; version?: string;
       }>(url, { method: 'GET' }, 15_000);
+
+      const breezeConnected =
+        typeof data.connected === 'boolean' ? data.connected :
+        typeof data.breeze === 'boolean' ? data.breeze :
+        undefined;
+
       return {
-        ok: true, connected: data.connected === true,
+        ok: true, connected: breezeConnected === true,
         wsRunning: data.ws_running, restCallsMin: data.rest_calls_min,
         queueDepth: data.queue_depth,
-        message: `Backend v${data.version ?? '?'} online — Breeze: ${data.connected}`,
+        message: `Backend v${data.version ?? '?'} online — Breeze: ${breezeConnected ?? 'unknown'}`,
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
