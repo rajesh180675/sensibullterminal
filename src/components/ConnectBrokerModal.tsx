@@ -126,7 +126,7 @@ const KAGGLE_CODE_SNIPPET = `# ════════════════�
 #
 # What this does:
 #   1. Installs packages (breeze-connect, fastapi, uvicorn)
-#   2. Starts FastAPI on port 8000
+#   2. Starts FastAPI on a free local port (defaults to 8000)
 #   3. Opens a public tunnel (tries localhost.run, serveo.net, Cloudflare)
 #   4. Prints the public URL — COPY THIS into Arena
 # ═══════════════════════════════════════════════════════════════════
@@ -142,7 +142,7 @@ import time
 import json
 import hashlib
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 
 # ── 1. Install packages ──────────────────────────────────────────────────────
@@ -186,6 +186,7 @@ async def options_handler(path: str):
 
 # Global breeze instance
 breeze_instance = None
+BACKEND_PORT = int(os.environ.get("BREEZE_PORT", "8000"))
 
 # ── 3. Health endpoints ───────────────────────────────────────────────────────
 
@@ -195,7 +196,7 @@ async def root():
         "status": "online",
         "connected": breeze_instance is not None,
         "version": "8.0",
-        "timestamp": datetime.utcnow().isoformat() + "Z"
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
 @app.get("/health")
@@ -204,7 +205,7 @@ async def health():
         "status": "online",
         "connected": breeze_instance is not None,
         "version": "8.0",
-        "timestamp": datetime.utcnow().isoformat() + "Z"
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
 @app.get("/ping")
@@ -281,7 +282,7 @@ async def api_expiries(stock_code: str = Query("NIFTY")):
     for i in range(60):
         d = today + timedelta(days=i)
         if d.weekday() == target_day:
-            if i == 0 and datetime.utcnow().hour >= 10:
+            if i == 0 and datetime.now(timezone.utc).hour >= 10:
                 continue  # Skip today if market closed
             results.append({
                 "date": d.strftime("%d-%b-%Y"),
@@ -611,15 +612,26 @@ async def api_funds():
 
 # ── 13. Tunnel providers ──────────────────────────────────────────────────────
 
-def start_uvicorn_bg():
+def pick_free_port(preferred=8000):
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+
+def start_uvicorn_bg(port):
     t = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error"),
+        target=lambda: uvicorn.run(app, host="0.0.0.0", port=port, log_level="error"),
         daemon=True, name="uvicorn"
     )
     t.start()
     return t
 
-def wait_for_port(port=8000, timeout=15):
+def wait_for_port(port, timeout=15):
     import socket
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -637,7 +649,7 @@ def try_localhost_run():
         log = "/tmp/lhr.log"
         open(log, "w").close()
         subprocess.Popen(
-            ["ssh", "-R", "80:localhost:8000",
+            ["ssh", "-R", f"80:localhost:{BACKEND_PORT}",
              "-o", "StrictHostKeyChecking=no",
              "-o", "ServerAliveInterval=30",
              "-o", "ConnectTimeout=15",
@@ -664,7 +676,7 @@ def try_serveo():
         log = "/tmp/serveo.log"
         open(log, "w").close()
         subprocess.Popen(
-            ["ssh", "-R", "80:localhost:8000",
+            ["ssh", "-R", f"80:localhost:{BACKEND_PORT}",
              "-o", "StrictHostKeyChecking=no",
              "-o", "ServerAliveInterval=30",
              "-o", "ConnectTimeout=15",
@@ -702,7 +714,7 @@ def try_cloudflare():
     open(log, "w").close()
     try:
         subprocess.Popen(
-            [cf, "tunnel", "--url", "http://localhost:8000", "--no-autoupdate"],
+            [cf, "tunnel", "--url", f"http://localhost:{BACKEND_PORT}", "--no-autoupdate"],
             stdout=open(log, "a"), stderr=subprocess.STDOUT
         )
         # Pattern must match trycloudflare.com URLs
@@ -722,14 +734,17 @@ def try_cloudflare():
 # ── 14. MAIN ──────────────────────────────────────────────────────────────────
 
 def main():
+    global BACKEND_PORT
     SEP = "=" * 68
     print(f"\\n{SEP}")
     print("  ICICI BREEZE BACKEND v8")
     print(SEP)
 
-    start_uvicorn_bg()
-    if wait_for_port(8000, 15):
-        print("  FastAPI running on http://localhost:8000")
+    BACKEND_PORT = pick_free_port(BACKEND_PORT)
+    print(f"  Starting FastAPI on port {BACKEND_PORT}...")
+    start_uvicorn_bg(BACKEND_PORT)
+    if wait_for_port(BACKEND_PORT, 15):
+        print(f"  FastAPI running on http://localhost:{BACKEND_PORT}")
     else:
         print("  WARNING: FastAPI may not have started")
 
@@ -793,7 +808,7 @@ def main():
         time.sleep(30)
         beat += 1
         if beat % 4 == 0:
-            ts = datetime.utcnow().strftime("%H:%M:%S")
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             print(f"  heartbeat {ts} UTC | connected={breeze_instance is not None}")
 
 main()`;

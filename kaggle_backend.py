@@ -37,13 +37,14 @@ import asyncio
 import queue
 import hashlib
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Callable
 from collections import deque
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("BreezeEngine")
+BACKEND_PORT = int(os.environ.get("BREEZE_PORT", "8000"))
 
 # ── Install dependencies ────────────────────────────────────────────────────────
 print("Installing packages...")
@@ -284,7 +285,7 @@ class BreezeEngine:
             d = today + timedelta(days=i)
             if d.weekday() == target_day:
                 # Skip today if market already closed (10:00 UTC ≈ 15:30 IST)
-                if i == 0 and datetime.utcnow().hour >= 10:
+                if i == 0 and datetime.now(timezone.utc).hour >= 10:
                     continue
                 results.append({
                     "date":      d.strftime("%d-%b-%Y"),
@@ -785,7 +786,7 @@ async def root():
         "rest_calls_min":  engine.rate_limiter.calls_last_minute,
         "queue_depth":     engine.rate_limiter.queue_depth,
         "version":         "7.0",
-        "timestamp":       datetime.utcnow().isoformat() + "Z",
+        "timestamp":       datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
 
@@ -800,13 +801,13 @@ async def health():
         "rest_calls_min":  engine.rate_limiter.calls_last_minute,
         "queue_depth":     engine.rate_limiter.queue_depth,
         "version":         "7.0",
-        "timestamp":       datetime.utcnow().isoformat() + "Z",
+        "timestamp":       datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
 
 @app.get("/ping")
 async def ping():
-    return {"status": "online", "version": "7.0", "ts": datetime.utcnow().isoformat() + "Z"}
+    return {"status": "online", "version": "7.0", "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
 
 
 # ── Connect / Disconnect ───────────────────────────────────────────────────────
@@ -1226,7 +1227,7 @@ async def api_checksum(request: Request):
         body      = await request.json()
         timestamp = body.get(
             "timestamp",
-            datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         )
         checksum  = BreezeEngine.generate_checksum(
             timestamp,
@@ -1242,9 +1243,20 @@ async def api_checksum(request: Request):
 # Tunnel Providers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def start_uvicorn_thread():
+def pick_free_port(preferred: int = 8000) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+
+
+def start_uvicorn_thread(port: int):
     t = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning"),
+        target=lambda: uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning"),
         daemon=True,
         name="uvicorn",
     )
@@ -1252,7 +1264,7 @@ def start_uvicorn_thread():
     return t
 
 
-def wait_for_port(port: int = 8000, timeout: int = 15) -> bool:
+def wait_for_port(port: int, timeout: int = 15) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -1271,7 +1283,7 @@ def try_localhost_run() -> Optional[str]:
         log_path = "/tmp/lhr.log"
         with open(log_path, "w") as lf:
             subprocess.Popen(
-                ["ssh", "-R", "80:localhost:8000",
+                ["ssh", "-R", f"80:localhost:{BACKEND_PORT}",
                  "-o", "StrictHostKeyChecking=no",
                  "-o", "ServerAliveInterval=30",
                  "-o", "ConnectTimeout=15",
@@ -1302,7 +1314,7 @@ def try_serveo() -> Optional[str]:
         log_path = "/tmp/serveo.log"
         with open(log_path, "w") as lf:
             subprocess.Popen(
-                ["ssh", "-R", "80:localhost:8000",
+                ["ssh", "-R", f"80:localhost:{BACKEND_PORT}",
                  "-o", "StrictHostKeyChecking=no",
                  "-o", "ServerAliveInterval=30",
                  "-o", "ConnectTimeout=15",
@@ -1347,7 +1359,7 @@ def try_cloudflare() -> Optional[str]:
     try:
         with open(log_path, "a") as lf:
             subprocess.Popen(
-                [cf, "tunnel", "--url", "http://localhost:8000", "--no-autoupdate"],
+                [cf, "tunnel", "--url", f"http://localhost:{BACKEND_PORT}", "--no-autoupdate"],
                 stdout=lf,
                 stderr=subprocess.STDOUT,
             )
@@ -1373,6 +1385,7 @@ def try_cloudflare() -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global BACKEND_PORT
     SEP = "=" * 68
 
     print(f"\n{SEP}")
@@ -1399,10 +1412,11 @@ def main():
     print("    GET   /health  /ping  /     health check")
     print()
 
-    print("Starting FastAPI on port 8000...")
-    start_uvicorn_thread()
-    if wait_for_port(8000, 15):
-        print("FastAPI running on http://localhost:8000\n")
+    BACKEND_PORT = pick_free_port(BACKEND_PORT)
+    print(f"Starting FastAPI on port {BACKEND_PORT}...")
+    start_uvicorn_thread(BACKEND_PORT)
+    if wait_for_port(BACKEND_PORT, 15):
+        print(f"FastAPI running on http://localhost:{BACKEND_PORT}\n")
     else:
         print("WARNING: FastAPI may not have started\n")
 
@@ -1472,7 +1486,7 @@ def main():
             time.sleep(30)
             beat += 1
             if beat % 4 == 0:
-                ts = datetime.utcnow().strftime("%H:%M:%S")
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
                 print(
                     f"  heartbeat {ts} UTC"
                     f" | connected={engine.connected}"
