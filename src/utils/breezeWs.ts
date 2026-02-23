@@ -92,13 +92,16 @@ export class BreezeWsClient {
     if (this.stopped) return;
     this._setStatus('connecting');
 
-    // Convert https:// → wss:// for WebSocket URL
+    // Build an absolute URL first so relative backends (e.g. /api/kaggle)
+    // also work in browser deployments.
     const base = this.backendUrl
       .replace(/\/api\/?$/, '')   // strip /api suffix
       .replace(/\/$/, '');
-    const wsUrl = base
-      .replace(/^https:\/\//, 'wss://')
-      .replace(/^http:\/\//, 'ws://') + '/ws/ticks';
+
+    const resolved = new URL(base || '/', window.location.origin);
+    resolved.protocol = resolved.protocol === 'https:' ? 'wss:' : 'ws:';
+    resolved.pathname = `${resolved.pathname.replace(/\/$/, '')}/ws/ticks`;
+    const wsUrl = resolved.toString();
 
     console.log('[BreezeWs] Connecting to:', wsUrl);
 

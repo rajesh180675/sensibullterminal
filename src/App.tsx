@@ -463,7 +463,9 @@ export function App() {
     setSession(s);
     setLoadingMsg('Connected! Initialising live data...');
 
-    if (isKaggleBackend(s.proxyBase)) {
+    if (!isKaggleBackend(s.proxyBase)) return;
+
+    try {
       startWsConnection(s.proxyBase);
 
       const liveExpiries = await fetchLiveExpiries(symbol, s);
@@ -475,8 +477,13 @@ export function App() {
       }
 
       await fetchLivePositions(s);
+    } catch (e) {
+      console.error('[App] Live initialisation failed:', e);
+      setLoadingMsg(`⚠️ Live init failed: ${e instanceof Error ? e.message : String(e)}`);
+      setSession(prev => prev ? { ...prev, isConnected: false } : prev);
+      stopLiveData();
     }
-  }, [symbol, expiry, fetchLiveChain, fetchLiveExpiries, fetchLivePositions, startWsConnection]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [symbol, expiry, fetchLiveChain, fetchLiveExpiries, fetchLivePositions, startWsConnection, stopLiveData]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Cleanup on disconnect / unmount ──────────────────────────────────────
   useEffect(() => { if (!session?.isConnected) stopLiveData(); }, [session?.isConnected, stopLiveData]);

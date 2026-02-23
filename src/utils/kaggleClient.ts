@@ -43,11 +43,11 @@ function isCfUrl(url: string): boolean {
 
 // ── Core fetch ────────────────────────────────────────────────────────────────
 
-async function fetchJson<T = unknown>(
+export async function fetchJsonSafe<T = unknown>(
   url: string,
   options: RequestInit = {},
   timeoutMs = 28_000,
-): Promise<T> {
+): Promise<{ ok: boolean; status: number; data?: T; raw?: string; error?: string }> {
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -55,6 +55,7 @@ async function fetchJson<T = unknown>(
     'Accept': 'application/json',
     ...((options.headers as Record<string, string>) || {}),
   };
+  if (TERMINAL_AUTH_TOKEN) headers['X-Terminal-Auth'] = TERMINAL_AUTH_TOKEN;
   if (isCfUrl(url)) headers['bypass-tunnel-reminder'] = 'true';
 
   try {
@@ -67,22 +68,49 @@ async function fetchJson<T = unknown>(
         trim.includes('Just a moment') || trim.includes('cloudflare') ||
         trim.includes('cf-browser-verification')) {
       const cfBase = getBase(url);
-      throw new Error(
-        `Cloudflare interstitial detected.\n\n` +
-        `FIX: Open in a NEW browser tab: ${cfBase}/health\n` +
-        `Wait for JSON {"status":"online"}, then retry.`
-      );
+      return {
+        ok: false,
+        status: res.status,
+        raw: text.slice(0, 1000),
+        error:
+          `Cloudflare interstitial detected. Open in a NEW browser tab: ${cfBase}/health ` +
+          `and wait for JSON before retrying.`,
+      };
     }
 
-    try { return JSON.parse(text) as T; }
-    catch { throw new Error(`Non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`); }
+    try {
+      const json = JSON.parse(text) as T;
+      return { ok: res.ok, status: res.status, data: json };
+    } catch {
+      return { ok: false, status: res.status, raw: text.slice(0, 5000), error: 'Non-JSON response' };
+    }
   } catch (e) {
-    if ((e as Error).name === 'AbortError')
-      throw new Error(`Request timed out after ${timeoutMs/1000}s — check Kaggle cell is running`);
-    throw e;
+    if ((e as Error).name === 'AbortError') {
+      return { ok: false, status: 0, error: `Request timed out after ${timeoutMs/1000}s — check Kaggle cell is running` };
+    }
+    return { ok: false, status: 0, error: e instanceof Error ? e.message : String(e) };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchJson<T = unknown>(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 28_000,
+): Promise<T> {
+  const result = await fetchJsonSafe<T>(url, options, timeoutMs);
+  if (!result.ok || result.data === undefined) {
+    console.warn('[kaggleClient] fetchJson failed', {
+      url,
+      status: result.status,
+      error: result.error,
+      raw: result.raw?.slice(0, 300),
+    });
+    const details = result.error || (result.raw ? `Non-JSON: ${result.raw.slice(0, 200)}` : 'Unknown network error');
+    throw new Error(`HTTP ${result.status || '?'} — ${details}`);
+  }
+  return result.data;
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -185,34 +213,61 @@ export interface HistoricalCandle {
 // ── Health check ──────────────────────────────────────────────────────────────
 
 export async function checkBackendHealth(backendUrl: string): Promise<HealthResult> {
-  for (const endpoint of ['/health', '/ping', '/']) {
+  for (const endpoint of ['/health', '/ping', '/api/health', '/api/ping', '/']) {
     const url = apiUrl(backendUrl, endpoint);
-    try {
-      const data = await fetchJson<{
-        status?: string;
-        connected?: boolean;
-        breeze?: boolean;
-        ws_running?: boolean;
-        rest_calls_min?: number; queue_depth?: number; version?: string;
-      }>(url, { method: 'GET' }, 15_000);
+    const result = await fetchJsonSafe<{
+      status?: string;
+      connected?: boolean;
+      breeze?: boolean;
+      breeze_connected?: boolean;
+      is_connected?: boolean;
+      ok?: boolean;
+      error?: string;
+      data?: { connected?: boolean; breeze?: boolean; breeze_connected?: boolean; is_connected?: boolean };
+      ws_running?: boolean;
+      rest_calls_min?: number; queue_depth?: number; version?: string;
+    }>(url, { method: 'GET' }, 15_000);
 
-      const breezeConnected =
-        typeof data.connected === 'boolean' ? data.connected :
-        typeof data.breeze === 'boolean' ? data.breeze :
-        undefined;
-
-      return {
-        ok: true, connected: breezeConnected === true,
-        wsRunning: data.ws_running, restCallsMin: data.rest_calls_min,
-        queueDepth: data.queue_depth,
-        message: `Backend v${data.version ?? '?'} online — Breeze: ${breezeConnected ?? 'unknown'}`,
-      };
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+    if (!result.ok || !result.data) {
+      console.warn('[kaggleClient] health probe failed', {
+        url,
+        status: result.status,
+        error: result.error,
+        raw: result.raw?.slice(0, 240),
+      });
+      const msg = result.error || '';
       if (msg.includes('Cloudflare') || msg.includes('timed out')) {
         return { ok: false, connected: false, message: msg };
       }
+      continue;
     }
+
+    const data = result.data;
+    const breezeConnected =
+      typeof data.connected === 'boolean' ? data.connected :
+      typeof data.breeze === 'boolean' ? data.breeze :
+      typeof data.breeze_connected === 'boolean' ? data.breeze_connected :
+      typeof data.is_connected === 'boolean' ? data.is_connected :
+      typeof data.data?.connected === 'boolean' ? data.data.connected :
+      typeof data.data?.breeze === 'boolean' ? data.data.breeze :
+      typeof data.data?.breeze_connected === 'boolean' ? data.data.breeze_connected :
+      typeof data.data?.is_connected === 'boolean' ? data.data.is_connected :
+      undefined;
+
+    const online = data.status === 'online' || data.ok === true || endpoint.includes('ping') || endpoint === '/';
+    if (!online) {
+      console.warn('[kaggleClient] health probe returned unexpected shape', { url, data });
+      continue;
+    }
+
+    return {
+      ok: true,
+      connected: breezeConnected === true,
+      wsRunning: data.ws_running,
+      restCallsMin: data.rest_calls_min,
+      queueDepth: data.queue_depth,
+      message: `Backend v${data.version ?? '?'} online — Breeze: ${breezeConnected ?? 'unknown'}`,
+    };
   }
   return { ok: false, connected: false, message: 'Cannot reach backend — check Kaggle cell is running' };
 }
