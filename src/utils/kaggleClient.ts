@@ -185,13 +185,16 @@ export interface HistoricalCandle {
 // ── Health check ──────────────────────────────────────────────────────────────
 
 export async function checkBackendHealth(backendUrl: string): Promise<HealthResult> {
-  for (const endpoint of ['/health', '/ping', '/']) {
+  for (const endpoint of ['/health', '/ping', '/api/health', '/api/ping', '/']) {
     const url = apiUrl(backendUrl, endpoint);
     try {
       const data = await fetchJson<{
         status?: string;
         connected?: boolean;
         breeze?: boolean;
+        breeze_connected?: boolean;
+        is_connected?: boolean;
+        data?: { connected?: boolean; breeze?: boolean; breeze_connected?: boolean; is_connected?: boolean };
         ws_running?: boolean;
         rest_calls_min?: number; queue_depth?: number; version?: string;
       }>(url, { method: 'GET' }, 15_000);
@@ -199,6 +202,12 @@ export async function checkBackendHealth(backendUrl: string): Promise<HealthResu
       const breezeConnected =
         typeof data.connected === 'boolean' ? data.connected :
         typeof data.breeze === 'boolean' ? data.breeze :
+        typeof data.breeze_connected === 'boolean' ? data.breeze_connected :
+        typeof data.is_connected === 'boolean' ? data.is_connected :
+        typeof data.data?.connected === 'boolean' ? data.data.connected :
+        typeof data.data?.breeze === 'boolean' ? data.data.breeze :
+        typeof data.data?.breeze_connected === 'boolean' ? data.data.breeze_connected :
+        typeof data.data?.is_connected === 'boolean' ? data.data.is_connected :
         undefined;
 
       return {
