@@ -299,6 +299,10 @@ export function App() {
   // ── Start WebSocket connection ─────────────────────────────────────────────
   const startWsConnection = useCallback((backendUrl: string) => {
     setWsStatus('connecting');
+    if (stopPollRef.current) {
+      stopPollRef.current();
+      stopPollRef.current = null;
+    }
     breezeWs.connect(
       backendUrl,
       handleTickUpdate,
@@ -310,6 +314,9 @@ export function App() {
           setLoadingMsg('⟳ WebSocket reconnecting...');
         } else if (status === 'error') {
           console.warn('[App] WS failed — falling back to REST tick polling');
+          if (stopPollRef.current) {
+            stopPollRef.current();
+          }
           const stopFn = startTickPolling(backendUrl, handleTickUpdate);
           stopPollRef.current = stopFn;
           setLoadingMsg('⚠️ WS unavailable — REST polling fallback active');
@@ -427,8 +434,14 @@ export function App() {
       if (session?.isConnected && isKaggleBackend(session.proxyBase)) {
         const liveExpiries = await fetchLiveExpiries(symbol, session);
         const newExpiry    = liveExpiries[0];
-        setExpiry(newExpiry);
-        await fetchLiveChain(symbol, newExpiry, session);
+        if (newExpiry) {
+          setExpiry(newExpiry);
+          await fetchLiveChain(symbol, newExpiry, session);
+        } else {
+          setLoadingMsg('⚠️ No expiries returned from backend');
+          setChain(generateChain(symbol));
+          setLastUpdate(new Date());
+        }
       } else {
         setExpiry(getExpiries(symbol)[0]);
         setChain(generateChain(symbol));
@@ -591,9 +604,13 @@ export function App() {
   }, [session, fetchLivePositions]);
 
   // ATM fix: recompute isATM on every chain render using live spotPrice
+  const nearestStrikeDiff = chain.length > 0
+    ? Math.min(...chain.map(r => Math.abs(r.strike - spotPrice)))
+    : Number.POSITIVE_INFINITY;
+
   const chainWithAtm = chain.map(row => ({
     ...row,
-    isATM: Math.abs(row.strike - spotPrice) === Math.min(...chain.map(r => Math.abs(r.strike - spotPrice))),
+    isATM: Math.abs(row.strike - spotPrice) === nearestStrikeDiff,
   }));
 
   const isLive             = !!(session?.isConnected && isKaggleBackend(session.proxyBase));
