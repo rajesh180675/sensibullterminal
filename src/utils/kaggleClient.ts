@@ -25,6 +25,7 @@ function apiUrl(rawUrl: string, path: string): string {
 export function isKaggleBackend(proxyBase: string): boolean {
   if (!proxyBase) return false;
   const lower = proxyBase.toLowerCase().trim();
+  if (lower === '/api/kaggle' || lower.startsWith('/api/kaggle/')) return true;
   return (
     lower.includes('trycloudflare.com') || lower.includes('ngrok-free.app') ||
     lower.includes('ngrok.io')          || lower.includes('ngrok.app')       ||

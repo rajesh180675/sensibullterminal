@@ -102,6 +102,7 @@ export const MARKET_INDICES: MarketIndex[] = [
 // ── CORS proxies for Arena/sandbox environments ───────────────
 // Usage: set PROXY_BASE in src/utils/breezeClient.ts to one of these
 export const CORS_PROXIES = {
+  vercelKaggle: '/api/kaggle',
   corsh:    'https://cors-anywhere.herokuapp.com/',
   allorigins: 'https://api.allorigins.win/raw?url=',
   vite:     '/api/breeze',   // Vite dev proxy (see vite.config.ts comment)

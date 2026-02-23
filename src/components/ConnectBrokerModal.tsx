@@ -804,7 +804,7 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
   const [apiKey,       setApiKey]       = useState(session?.apiKey       ?? '');
   const [apiSecret,    setApiSecret]    = useState(session?.apiSecret    ?? '');
   const [sessionToken, setSessionToken] = useState(session?.sessionToken ?? '');
-  const [proxyBase,    setProxyBase]    = useState(session?.proxyBase    ?? CORS_PROXIES.corsh);
+  const [proxyBase,    setProxyBase]    = useState(session?.proxyBase    ?? CORS_PROXIES.vercelKaggle);
   const [showSecret,   setShowSecret]   = useState(false);
   const [status,       setStatus]       = useState<Status>('idle');
   const [statusMsg,    setStatusMsg]    = useState('');
@@ -1041,7 +1041,7 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
                   )}
                 </Field>
 
-                <Field label="Backend / CORS Proxy URL" hint="Kaggle URL (recommended) or cors-anywhere proxy">
+                <Field label="Backend / CORS Proxy URL" hint="Use /api/kaggle on Vercel (recommended) or a direct Kaggle URL">
                   <div className="flex flex-wrap gap-1.5 mb-2">
                     {Object.entries(CORS_PROXIES).map(([k, v]) => (
                       <PresetBtn key={k} label={k} active={proxyBase === v} onClick={() => setProxyBase(v)} />
@@ -1056,7 +1056,7 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
 
                   <div className="flex gap-2">
                     <input value={proxyBase} onChange={e => setProxyBase(e.target.value)}
-                      placeholder="https://xyz.trycloudflare.com  or  https://cors-anywhere.herokuapp.com/"
+                      placeholder="/api/kaggle  or  https://xyz.trycloudflare.com"
                       className={INPUT + ' flex-1'} />
                     <button onClick={handleHealthCheck}
                       className="px-2 py-1 bg-[#1e2135] border border-gray-700/30 rounded-xl
@@ -1081,6 +1081,13 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
                         cors-anywhere.herokuapp.com/corsdemo
                       </a>{' '}
                       → "Request temporary access"
+                    </div>
+                  )}
+
+                  {proxyBase.trim() === '/api/kaggle' && (
+                    <div className="mt-2 text-[10px] text-blue-300 bg-blue-500/8 border border-blue-500/20 rounded-lg p-2">
+                      Vercel proxy mode: set <strong className="text-white">KAGGLE_BACKEND_URL</strong> in Vercel
+                      environment variables to your running Kaggle/tunnel base URL.
                     </div>
                   )}
                 </Field>
