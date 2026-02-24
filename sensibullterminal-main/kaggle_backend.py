@@ -698,18 +698,12 @@ class BreezeEngine:
 # ── Singleton ──────────────────────────────────────────────────────────────────
 engine = BreezeEngine()
 
-# ── Backend auth token (optional — protects public tunnels) ──────────────────
-# FIX (Bug #1): Auth is now OPTIONAL.
-#   • If TERMINAL_AUTH_TOKEN env var is set → enforce it (good for production)
-#   • If not set → auth is DISABLED, all requests pass through
+# ── Backend auth token (protects public tunnels) ─────────────────────────────
+# Anyone who knows the tunnel URL could otherwise place live orders.
+# The frontend must send:  X-Terminal-Auth: <token>
 #
-# To enable: in Kaggle notebook, add a cell BEFORE this one:
-#   import os; os.environ["TERMINAL_AUTH_TOKEN"] = "my-secret-token"
-# Then set the same value as KAGGLE_TERMINAL_AUTH in Vercel env vars.
-#
-# Without auth (default): tunnel URL alone acts as the secret.
-BACKEND_AUTH_TOKEN = os.environ.get("TERMINAL_AUTH_TOKEN") or ""
-AUTH_ENABLED = bool(BACKEND_AUTH_TOKEN)
+# You can rotate by re-running the notebook cell.
+BACKEND_AUTH_TOKEN = os.environ.get("TERMINAL_AUTH_TOKEN") or os.urandom(18).hex()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -730,9 +724,6 @@ app.add_middleware(
 
 
 def _is_authed(request: Request) -> bool:
-    # FIX (Bug #1): If auth is not configured, allow everything
-    if not AUTH_ENABLED:
-        return True
     token = request.headers.get("x-terminal-auth") or request.headers.get("X-Terminal-Auth") or ""
     return token == BACKEND_AUTH_TOKEN
 
@@ -1382,20 +1373,12 @@ def try_cloudflare() -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    SEP = "=" * 68
+
     print(f"\n{SEP}")
     print("  ICICI BREEZE BACKEND v7 — BreezeEngine")
     print(SEP)
     print()
-    if AUTH_ENABLED:
-        print("  ⚠️  BACKEND AUTH IS ENABLED")
-        print(f"  Auth token: {BACKEND_AUTH_TOKEN}")
-        print("  → Set KAGGLE_TERMINAL_AUTH=" + BACKEND_AUTH_TOKEN + " in Vercel env vars")
-        print("  → Or set TERMINAL_AUTH_TOKEN env var before running this cell to customise")
-        print()
-    else:
-        print("  🔓 Auth is DISABLED (default). Anyone with the tunnel URL can connect.")
-        print("  To enable: set TERMINAL_AUTH_TOKEN env var before running this cell.")
-        print()
     print("  Endpoints:")
     print("    POST  /api/connect          authenticate (generate_session)")
     print("    GET   /api/expiries         weekly expiry dates")

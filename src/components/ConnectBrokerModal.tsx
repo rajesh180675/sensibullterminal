@@ -20,7 +20,9 @@ import {
   connectToBreeze,
   checkBackendHealth,
   isKaggleBackend,
+  setTerminalAuthToken,
 } from '../utils/kaggleClient';
+import { setWsAuthToken } from '../utils/breezeWs';
 
 interface Props {
   onClose:     () => void;
@@ -113,118 +115,845 @@ const Row: React.FC<{ label: string; val: string; cls?: string }> = ({ label, va
   <div><span className="text-gray-600">{label}: </span><span className={cls}>{val}</span></div>
 );
 
-// ── KAGGLE CODE SNIPPET — this is what users paste and run ────────────────────
-// CRITICAL: Every line of Python here must be syntactically valid.
-// All endpoints required by the frontend must be present.
-// Verified against breeze-connect SDK source.
-const KAGGLE_CODE_SNIPPET = `# ═══════════════════════════════════════════════════════════════════
-# ICICI BREEZE BACKEND v8 — Paste this ENTIRE block into ONE Kaggle cell
+// ── KAGGLE CODE SNIPPET — kaggle_backend.py v7 (full BreezeEngine) ─────────────
+// FIX (Bug #3): This is now the full v7 backend with:
+//   ✓ RateLimiter (max 100 REST calls/min)
+//   ✓ WebSocket streaming (/ws/ticks)
+//   ✓ WS subscription endpoint (/api/ws/subscribe)
+//   ✓ REST tick fallback (/api/ticks)
+//   ✓ Optional auth (disabled by default — no more random blocking token)
+//   ✓ All order endpoints (place, squareoff, cancel, modify)
+//   ✓ Full portfolio (positions, holdings, funds, orders, trades)
+const KAGGLE_CODE_SNIPPET = `# ═══════════════════════════════════════════════════════════════════════════════
+# ICICI BREEZE BACKEND v7 — Production BreezeEngine
+# Paste this ENTIRE file into ONE Kaggle notebook cell and run.
 #
-# Kaggle settings (REQUIRED):
-#   Settings (gear icon) → Internet → ON
+# Kaggle settings required:
+#   Settings → Internet → ON   (mandatory)
 #   Settings → Accelerator → GPU P100  (optional, keeps alive longer)
 #
-# What this does:
-#   1. Installs packages (breeze-connect, fastapi, uvicorn)
-#   2. Starts FastAPI on a free local port (defaults to 8000)
-#   3. Opens a public tunnel (tries localhost.run, serveo.net, Cloudflare)
-#   4. Prints the public URL — COPY THIS into Arena
-# ═══════════════════════════════════════════════════════════════════
+# RATE LIMIT PROTECTION:
+#   RateLimiter: max 1 REST call per 600ms → safe under 100/min ICICI limit
+#   WebSocket:   push-based ticks → ZERO REST calls for live prices
+#   get_option_chain_quotes: called ONCE per expiry change, NEVER in loop
+#
+# ANTI-BAN RULES (enforced):
+#   NO get_option_chain_quotes() in setInterval or while loop
+#   NO get_quotes() in a polling loop
+#   ALL live prices from WebSocket on_ticks callback ONLY
+#   ALL REST calls serialized through RateLimiter queue
+#
+# TUNNEL PROVIDERS (tried in order, first success wins):
+#   1. localhost.run  — SSH, no account, no interstitial ← best
+#   2. serveo.net     — SSH, no account, no interstitial
+#   3. Cloudflare     — binary download, no account, has browser interstitial
+# ═══════════════════════════════════════════════════════════════════════════════
 
 import subprocess
 import sys
 import os
 import urllib.request
 import stat
+import socket
 import re
 import threading
 import time
 import json
+import asyncio
+import queue
 import hashlib
 import shutil
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Any
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Callable
+from collections import deque
+import logging
 
-# ── 1. Install packages ──────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("BreezeEngine")
+
+# ── Install dependencies ────────────────────────────────────────────────────────
 print("Installing packages...")
-for pkg in ["breeze-connect", "fastapi", "uvicorn[standard]", "python-multipart"]:
+PKGS = ["breeze-connect", "fastapi", "uvicorn[standard]", "websockets", "python-multipart"]
+for pkg in PKGS:
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", pkg, "-q"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 print("Packages ready")
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 import uvicorn
 
-# ── 2. FastAPI app ────────────────────────────────────────────────────────────
-app = FastAPI(title="ICICI Breeze Backend v8")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RateLimiter
+# Token-bucket: max 100 REST calls/min = 1 per 600ms
+# All Breeze REST calls must go through enqueue()
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RateLimiter:
+    MIN_INTERVAL_MS = 600
+    MAX_QUEUE_SIZE  = 50
+
+    def __init__(self):
+        self._queue      = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
+        self._last_call  = 0.0
+        self._call_times = deque(maxlen=100)
+        self._worker     = threading.Thread(target=self._process, daemon=True)
+        self._worker.start()
+        log.info("[RateLimiter] started — 1 call per 600ms max")
+
+    def enqueue(self, fn: Callable, *args, **kwargs) -> Any:
+        result_box = {"result": None, "error": None}
+        done = threading.Event()
+
+        def task():
+            try:
+                result_box["result"] = fn(*args, **kwargs)
+            except Exception as exc:
+                result_box["error"] = exc
+            finally:
+                done.set()
+
+        try:
+            self._queue.put_nowait(task)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._queue.put_nowait(task)
+
+        done.wait(timeout=45)
+        if result_box["error"]:
+            raise result_box["error"]
+        return result_box["result"]
+
+    def _process(self):
+        while True:
+            try:
+                task = self._queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            now = time.monotonic()
+            elapsed_ms = (now - self._last_call) * 1000
+            if elapsed_ms < self.MIN_INTERVAL_MS:
+                time.sleep((self.MIN_INTERVAL_MS - elapsed_ms) / 1000)
+            self._last_call = time.monotonic()
+            self._call_times.append(time.time())
+            task()
+
+    @property
+    def calls_last_minute(self) -> int:
+        cutoff = time.time() - 60
+        return sum(1 for t in self._call_times if t > cutoff)
+
+    @property
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TickStore
+# Thread-safe store updated by WebSocket on_ticks callback
+# Versioned so frontend only gets payloads when data actually changes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TickStore:
+    def __init__(self):
+        self._ticks   = {}
+        self._lock    = threading.Lock()
+        self._version = 0
+
+    def update(self, key: str, data: dict) -> None:
+        with self._lock:
+            existing = self._ticks.get(key, {})
+            existing.update(data)
+            existing["_ts"] = time.time()
+            self._ticks[key] = existing
+            self._version += 1
+
+    def get_all(self) -> dict:
+        with self._lock:
+            return {"ticks": dict(self._ticks), "version": self._version}
+
+    def get_version(self) -> int:
+        with self._lock:
+            return self._version
+
+    def clear(self) -> None:
+        with self._lock:
+            self._ticks.clear()
+            self._version = 0
+
+    def to_option_chain_delta(self) -> List[dict]:
+        with self._lock:
+            rows = []
+            for key, tick in self._ticks.items():
+                parts = key.split(":")
+                if len(parts) < 3:
+                    continue
+                stock, strike_str, right = parts[0], parts[1], parts[2]
+                try:
+                    strike = int(float(strike_str))
+                except Exception:
+                    continue
+                rows.append({
+                    "stock_code":   stock,
+                    "strike":       strike,
+                    "right":        right,
+                    "ltp":          tick.get("ltp", 0),
+                    "oi":           tick.get("oi", 0),
+                    "volume":       tick.get("volume", 0),
+                    "iv":           tick.get("iv", 0),
+                    "bid":          tick.get("bid", 0),
+                    "ask":          tick.get("ask", 0),
+                    "change_pct":   tick.get("change_pct", 0),
+                    "last_updated": tick.get("_ts", 0),
+                })
+            return rows
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BreezeEngine
+# Wraps the official breeze-connect SDK with:
+#   - session management
+#   - REST rate limiting
+#   - WebSocket streaming + TickStore
+#   - order management (place, cancel, modify, square-off)
+#   - portfolio: positions, holdings, funds, orders, trades
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BreezeEngine:
+    def __init__(self):
+        self.breeze       = None
+        self.session_key  = ""
+        self.api_key      = ""
+        self.api_secret   = ""
+        self.connected    = False
+        self.ws_running   = False
+        self.subscribed   = set()
+        self.rate_limiter = RateLimiter()
+        self.tick_store   = TickStore()
+        self._ws_thread   = None
+        self._ws_lock     = threading.Lock()
+        log.info("[BreezeEngine] initialised")
+
+    # ── Authentication ────────────────────────────────────────────────────────
+
+    def connect(self, api_key: str, api_secret: str, session_token: str) -> dict:
+        from breeze_connect import BreezeConnect
+        self.api_key    = api_key
+        self.api_secret = api_secret
+        log.info(f"[Engine] connect — key:{api_key[:8]}... token:{session_token[:8]}...")
+        b = BreezeConnect(api_key=api_key)
+        # Official SDK handles /customerdetails with correct checksum internally
+        b.generate_session(api_secret=api_secret, session_token=session_token)
+        self.breeze      = b
+        self.session_key = b.session_key
+        self.connected   = True
+        self.tick_store.clear()
+        log.info(f"[Engine] connected — session:{self.session_key[:12]}...")
+
+        user_info = {}
+        try:
+            det = b.get_customer_details()
+            if isinstance(det, dict) and det.get("Success"):
+                s = det["Success"]
+                user_info = {
+                    "name":  s.get("name", ""),
+                    "email": s.get("email", ""),
+                }
+        except Exception as exc:
+            log.warning(f"[Engine] get_customer_details: {exc}")
+
+        return {
+            "success":       True,
+            "session_token": self.session_key,
+            "message":       "Connected via BreezeEngine v7",
+            **user_info,
+        }
+
+    def disconnect(self) -> None:
+        self._stop_ws()
+        self.breeze = None
+        self.session_key = ""
+        self.connected = False
+        self.subscribed.clear()
+        self.tick_store.clear()
+        log.info("[Engine] disconnected")
+
+    # ── Checksum utility ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def generate_checksum(timestamp: str, payload: dict, secret: str) -> str:
+        """SHA256(timestamp + json.dumps(payload) + secret) — matches SDK exactly."""
+        body_str = json.dumps(payload)
+        return hashlib.sha256((timestamp + body_str + secret).encode("utf-8")).hexdigest()
+
+    # ── Expiry utilities ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_weekly_expiries(stock_code: str, count: int = 5) -> List[dict]:
+        """
+        NIFTY  → Tuesday  (weekday 1, 0=Mon … 6=Sun)
+        SENSEX → Thursday (weekday 3)
+        """
+        is_sensex  = "SENSEX" in stock_code.upper() or "BSESEN" in stock_code.upper()
+        target_day = 3 if is_sensex else 1   # Thu or Tue
+        today      = datetime.now().date()
+        results    = []
+        for i in range(60):
+            d = today + timedelta(days=i)
+            if d.weekday() == target_day:
+                # Skip today if market already closed (10:00 UTC ≈ 15:30 IST)
+                if i == 0 and datetime.utcnow().hour >= 10:
+                    continue
+                results.append({
+                    "date":      d.strftime("%d-%b-%Y"),
+                    "label":     d.strftime("%d %b %y"),
+                    "days_away": (d - today).days,
+                    "weekday":   d.strftime("%A"),
+                    "timestamp": d.isoformat(),
+                })
+                if len(results) >= count:
+                    break
+        return results
+
+    # ── REST: Option Chain ────────────────────────────────────────────────────
+    # Called ONCE per expiry change — NEVER in any loop
+
+    def fetch_option_chain(
+        self,
+        stock_code: str,
+        exchange_code: str,
+        expiry_date: str,
+        right: str = "Call",
+        strike_price: str = "",
+    ) -> List[dict]:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+
+        right_norm = "Call" if right.lower().startswith("c") else "Put"
+        log.info(f"[REST] get_option_chain_quotes {stock_code} {expiry_date} {right_norm}")
+
+        def _call():
+            return self.breeze.get_option_chain_quotes(
+                stock_code=stock_code,
+                exchange_code=exchange_code,
+                product_type="options",
+                expiry_date=expiry_date,
+                right=right_norm,
+                strike_price=strike_price,
+            )
+
+        result = self.rate_limiter.enqueue(_call)
+        rows   = result.get("Success") if isinstance(result, dict) else []
+
+        # Seed TickStore with REST snapshot → UI loads instantly
+        if rows:
+            suffix = "CE" if right_norm == "Call" else "PE"
+            for row in rows:
+                try:
+                    strike = str(int(float(
+                        row.get("strike_price") or
+                        row.get("strike-price") or 0
+                    )))
+                    key = f"{stock_code}:{strike}:{suffix}"
+                    self.tick_store.update(key, {
+                        "ltp":    float(row.get("ltp")             or row.get("last_traded_price")    or 0),
+                        "oi":     float(row.get("open_interest")   or row.get("open-interest")        or 0),
+                        "volume": float(row.get("total_quantity_traded") or row.get("total-quantity-traded") or 0),
+                        "iv":     float(row.get("implied_volatility") or row.get("implied-volatility") or 0),
+                        "bid":    float(row.get("best_bid_price")  or row.get("best-bid-price")       or 0),
+                        "ask":    float(row.get("best_offer_price") or row.get("best-offer-price")    or 0),
+                    })
+                except Exception as exc:
+                    log.debug(f"seed tick error: {exc}")
+
+        return rows or []
+
+    # ── REST: Single Quote ────────────────────────────────────────────────────
+
+    def get_quote(
+        self,
+        stock_code: str,
+        exchange_code: str,
+        expiry_date: str,
+        right: str,
+        strike_price: str,
+    ) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+
+        def _call():
+            return self.breeze.get_quotes(
+                stock_code=stock_code,
+                exchange_code=exchange_code,
+                expiry_date=expiry_date,
+                right=right,
+                strike_price=strike_price,
+                product_type="options",
+            )
+
+        return self.rate_limiter.enqueue(_call)
+
+    # ── REST: Order Management ────────────────────────────────────────────────
+
+    def place_order(self, leg: dict) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+
+        right_norm = "Call" if (leg.get("right") or "call").lower().startswith("c") else "Put"
+
+        def _call():
+            return self.breeze.place_order(
+                stock_code=leg["stock_code"],
+                exchange_code=leg.get("exchange_code", "NFO"),
+                product=leg.get("product", "options"),
+                action=leg.get("action", "buy").lower(),
+                order_type=leg.get("order_type", "market"),
+                stoploss=str(leg.get("stoploss", "0")),
+                quantity=str(leg["quantity"]),
+                price=str(leg.get("price", "0")),
+                validity="day",
+                validity_date=leg["expiry_date"],
+                disclosed_quantity="0",
+                expiry_date=leg["expiry_date"],
+                right=right_norm,
+                strike_price=str(leg["strike_price"]),
+                user_remark=leg.get("user_remark", "OptionsTerminalV7"),
+            )
+
+        return self.rate_limiter.enqueue(_call)
+
+    def place_strategy_order(self, legs: List[dict]) -> List[dict]:
+        """Place multiple legs concurrently — RateLimiter serialises API calls."""
+        if not self.connected:
+            raise RuntimeError("Not connected")
+
+        results      = []
+        threads      = []
+        results_lock = threading.Lock()
+
+        def place_one(leg: dict, idx: int):
+            try:
+                r  = self.place_order(leg)
+                ok = isinstance(r, dict) and r.get("Status") == 200
+                oid = (r.get("Success") or {}).get("order_id", "") if ok else ""
+                with results_lock:
+                    results.append({
+                        "leg_index": idx,
+                        "success":   ok,
+                        "order_id":  oid,
+                        "error":     r.get("Error", "") if not ok else "",
+                        "raw":       r,
+                    })
+            except Exception as exc:
+                with results_lock:
+                    results.append({"leg_index": idx, "success": False, "error": str(exc)})
+
+        for i, leg in enumerate(legs):
+            t = threading.Thread(target=place_one, args=(leg, i), daemon=True)
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join(timeout=60)
+
+        results.sort(key=lambda x: x["leg_index"])
+        return results
+
+    def square_off_position(self, leg: dict) -> dict:
+        """Exit a position by placing the opposite action."""
+        original = (leg.get("action") or "buy").lower()
+        exit_leg = {**leg, "action": "sell" if original == "buy" else "buy",
+                    "user_remark": "SquareOff_OptionsTerminal"}
+        return self.place_order(exit_leg)
+
+    def cancel_order(self, order_id: str, exchange_code: str = "NFO") -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+
+        def _call():
+            return self.breeze.cancel_order(
+                exchange_code=exchange_code,
+                order_id=order_id,
+            )
+
+        return self.rate_limiter.enqueue(_call)
+
+    def modify_order(
+        self,
+        order_id: str,
+        exchange_code: str,
+        quantity: str,
+        price: str,
+        stoploss: str = "0",
+        validity: str = "day",
+    ) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+
+        def _call():
+            return self.breeze.modify_order(
+                exchange_code=exchange_code,
+                order_id=order_id,
+                quantity=quantity,
+                price=price,
+                stoploss=stoploss,
+                validity=validity,
+            )
+
+        return self.rate_limiter.enqueue(_call)
+
+    # ── REST: Books ───────────────────────────────────────────────────────────
+
+    def get_order_book(self) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        now = datetime.now()
+        return self.rate_limiter.enqueue(
+            self.breeze.get_order_list,
+            exchange_code="NFO",
+            from_date=now.strftime("%Y-%m-%dT00:00:00.000Z"),
+            to_date=now.strftime("%Y-%m-%dT23:59:59.000Z"),
+        )
+
+    def get_trade_book(self) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        now = datetime.now()
+        return self.rate_limiter.enqueue(
+            self.breeze.get_trade_list,
+            exchange_code="NFO",
+            from_date=now.strftime("%Y-%m-%dT00:00:00.000Z"),
+            to_date=now.strftime("%Y-%m-%dT23:59:59.000Z"),
+        )
+
+    # ── REST: Portfolio ───────────────────────────────────────────────────────
+
+    def get_positions(self) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        pos = self.rate_limiter.enqueue(self.breeze.get_portfolio_positions)
+        hld = self.rate_limiter.enqueue(self.breeze.get_portfolio_holdings)
+        return {
+            "positions": pos.get("Success", []) if isinstance(pos, dict) else [],
+            "holdings":  hld.get("Success", []) if isinstance(hld, dict) else [],
+        }
+
+    def get_funds(self) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        result = self.rate_limiter.enqueue(self.breeze.get_funds)
+        return result.get("Success", {}) if isinstance(result, dict) else {}
+
+    # ── REST: Historical OHLCV ────────────────────────────────────────────────
+
+    def get_historical(
+        self,
+        stock_code: str,
+        exchange_code: str,
+        interval: str,
+        from_date: str,
+        to_date: str,
+        expiry_date: str = "",
+        right: str = "",
+        strike_price: str = "",
+    ) -> List[dict]:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+
+        def _call():
+            kwargs: dict = dict(
+                interval=interval,
+                from_date=from_date,
+                to_date=to_date,
+                stock_code=stock_code,
+                exchange_code=exchange_code,
+            )
+            if expiry_date:
+                kwargs["expiry_date"]  = expiry_date
+                kwargs["product_type"] = "options"
+            if right:
+                kwargs["right"] = right
+            if strike_price:
+                kwargs["strike_price"] = strike_price
+            return self.breeze.get_historical_data_v2(**kwargs)
+
+        result = self.rate_limiter.enqueue(_call)
+        return result.get("Success", []) if isinstance(result, dict) else []
+
+    # ── WebSocket ─────────────────────────────────────────────────────────────
+
+    def _on_ticks(self, ticks) -> None:
+        if not ticks:
+            return
+        if isinstance(ticks, dict):
+            ticks = [ticks]
+        for tick in ticks:
+            try:
+                stock     = (tick.get("stock_code") or tick.get("symbol") or "").upper()
+                strike    = tick.get("strike_price") or tick.get("strike") or "0"
+                right_raw = (tick.get("right") or tick.get("option_type") or "CE").upper()
+                right     = "CE" if right_raw.startswith("C") else "PE"
+                if not stock:
+                    continue
+                key = f"{stock}:{strike}:{right}"
+                self.tick_store.update(key, {
+                    "ltp":        float(tick.get("last_traded_price") or tick.get("ltp") or 0),
+                    "oi":         float(tick.get("open_interest")     or tick.get("oi")  or 0),
+                    "volume":     float(tick.get("total_quantity_traded") or tick.get("volume") or 0),
+                    "iv":         float(tick.get("implied_volatility") or tick.get("iv") or 0),
+                    "bid":        float(tick.get("best_bid_price")    or tick.get("bid_price") or 0),
+                    "ask":        float(tick.get("best_offer_price")  or tick.get("ask_price") or 0),
+                    "change_pct": float(tick.get("change_percent")    or tick.get("change_pct") or 0),
+                    "feed_time":  str(tick.get("exchange_feed_time")  or ""),
+                })
+                log.debug(f"[WS tick] {key} ltp={tick.get('last_traded_price', 0)}")
+            except Exception as exc:
+                log.warning(f"[WS] parse error: {exc}")
+
+    def start_websocket(self) -> None:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        with self._ws_lock:
+            if self._ws_thread and self._ws_thread.is_alive():
+                log.info("[WS] already running")
+                return
+
+            def _run():
+                try:
+                    self.breeze.on_ticks = self._on_ticks
+                    self.breeze.ws_connect()
+                    self.ws_running = True
+                    log.info("[WS] ws_connect() established")
+                except Exception as exc:
+                    log.error(f"[WS] ws_connect() failed: {exc}")
+                    self.ws_running = False
+
+            self._ws_thread = threading.Thread(target=_run, daemon=True, name="BreezeWS")
+            self._ws_thread.start()
+            # Wait up to 15s for WS to establish
+            deadline = time.time() + 15
+            while not self.ws_running and time.time() < deadline:
+                time.sleep(0.5)
+
+    def _stop_ws(self) -> None:
+        if self.breeze and self.ws_running:
+            try:
+                self.breeze.ws_disconnect()
+            except Exception:
+                pass
+        self.ws_running = False
+        self.subscribed.clear()
+
+    def subscribe_option_chain(
+        self,
+        stock_code: str,
+        exchange_code: str,
+        expiry_date: str,
+        strikes: List[int],
+        rights: List[str] = None,
+    ) -> dict:
+        if rights is None:
+            rights = ["Call", "Put"]
+        if not self.ws_running:
+            self.start_websocket()
+            time.sleep(2)
+
+        count  = 0
+        errors = []
+
+        for strike in strikes:
+            for right in rights:
+                right_norm = "Call" if right.lower().startswith("c") else "Put"
+                sub_key    = f"{stock_code}:{strike}:{right_norm[0]}E:{expiry_date}"
+                if sub_key in self.subscribed:
+                    continue
+                try:
+                    self.breeze.subscribe_feeds(
+                        stock_code=stock_code,
+                        exchange_code=exchange_code,
+                        product_type="options",
+                        expiry_date=expiry_date,
+                        strike_price=str(strike),
+                        right=right_norm,
+                        get_exchange_quotes=True,
+                        get_market_depth=False,
+                    )
+                    self.subscribed.add(sub_key)
+                    count += 1
+                    time.sleep(0.05)
+                except Exception as exc:
+                    errors.append(f"{sub_key}: {exc}")
+
+        return {
+            "subscribed":  count,
+            "total_subs":  len(self.subscribed),
+            "errors":      errors,
+        }
+
+    def unsubscribe_all(self) -> None:
+        if not self.ws_running or not self.breeze:
+            return
+        for sub_key in list(self.subscribed):
+            try:
+                parts = sub_key.split(":")
+                if len(parts) >= 4:
+                    stock, strike, right_abbr, expiry = parts
+                    right = "Call" if right_abbr.startswith("C") else "Put"
+                    self.breeze.unsubscribe_feeds(
+                        stock_code=stock,
+                        exchange_code="NFO" if stock == "NIFTY" else "BFO",
+                        product_type="options",
+                        expiry_date=expiry,
+                        strike_price=strike,
+                        right=right,
+                    )
+            except Exception:
+                pass
+        self.subscribed.clear()
+        log.info("[WS] all feeds unsubscribed")
+
+
+# ── Singleton ──────────────────────────────────────────────────────────────────
+engine = BreezeEngine()
+
+# ── Backend auth token (optional — protects public tunnels) ──────────────────
+# FIX (Bug #1): Auth is now OPTIONAL.
+#   • If TERMINAL_AUTH_TOKEN env var is set → enforce it (good for production)
+#   • If not set → auth is DISABLED, all requests pass through
+#
+# To enable: in Kaggle notebook, add a cell BEFORE this one:
+#   import os; os.environ["TERMINAL_AUTH_TOKEN"] = "my-secret-token"
+# Then set the same value as KAGGLE_TERMINAL_AUTH in Vercel env vars.
+#
+# Without auth (default): tunnel URL alone acts as the secret.
+BACKEND_AUTH_TOKEN = os.environ.get("TERMINAL_AUTH_TOKEN") or ""
+AUTH_ENABLED = bool(BACKEND_AUTH_TOKEN)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FastAPI Application
+# ═══════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(title="ICICI Breeze Backend v7", version="7.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
 
-# Handle OPTIONS preflight
+
+def _is_authed(request: Request) -> bool:
+    # FIX (Bug #1): If auth is not configured, allow everything
+    if not AUTH_ENABLED:
+        return True
+    token = request.headers.get("x-terminal-auth") or request.headers.get("X-Terminal-Auth") or ""
+    return token == BACKEND_AUTH_TOKEN
+
+
+@app.middleware("http")
+async def cors_everywhere(request: Request, call_next):
+    # CORS preflight
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin":  "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age":       "86400",
+            },
+        )
+
+    # Protect ALL /api/* endpoints with a shared-secret header.
+    # (Tunnel URLs are public; without this, anyone can place real orders.)
+    if request.url.path.startswith("/api/"):
+        if not _is_authed(request):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "success": False,
+                    "error": "Unauthorized. Missing/invalid X-Terminal-Auth header.",
+                },
+            )
+
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+
 @app.options("/{path:path}")
 async def options_handler(path: str):
     return Response(
         status_code=200,
         headers={
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin":  "*",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",
-        }
+        },
     )
 
-# Global breeze instance
-breeze_instance = None
-BACKEND_PORT = int(os.environ.get("BREEZE_PORT", "8000"))
 
-# ── 3. Health endpoints ───────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     return {
-        "status": "online",
-        "connected": breeze_instance is not None,
-        "version": "8.0",
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        "status":          "online",
+        "connected":       engine.connected,
+        "ws_running":      engine.ws_running,
+        "subscriptions":   len(engine.subscribed),
+        "tick_count":      len(engine.tick_store.get_all()["ticks"]),
+        "rest_calls_min":  engine.rate_limiter.calls_last_minute,
+        "queue_depth":     engine.rate_limiter.queue_depth,
+        "version":         "7.0",
+        "timestamp":       datetime.utcnow().isoformat() + "Z",
     }
+
 
 @app.get("/health")
 async def health():
     return {
-        "status": "online",
-        "connected": breeze_instance is not None,
-        "version": "8.0",
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        "status":          "online",
+        "connected":       engine.connected,
+        "ws_running":      engine.ws_running,
+        "subscriptions":   len(engine.subscribed),
+        "tick_count":      len(engine.tick_store.get_all()["ticks"]),
+        "rest_calls_min":  engine.rate_limiter.calls_last_minute,
+        "queue_depth":     engine.rate_limiter.queue_depth,
+        "version":         "7.0",
+        "timestamp":       datetime.utcnow().isoformat() + "Z",
     }
+
 
 @app.get("/ping")
 async def ping():
-    return {"status": "online", "version": "8.0"}
+    return {"status": "online", "version": "7.0", "ts": datetime.utcnow().isoformat() + "Z"}
 
-# ── 4. Connect ────────────────────────────────────────────────────────────────
-# This is the MOST IMPORTANT endpoint.
-# Uses official breeze-connect SDK — handles all auth internally.
+
+# ── Connect / Disconnect ───────────────────────────────────────────────────────
 
 @app.post("/api/connect")
 async def api_connect(request: Request):
-    global breeze_instance
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    qp = request.query_params
+    qp            = request.query_params
     api_key       = body.get("api_key")       or qp.get("api_key")
     api_secret    = body.get("api_secret")    or qp.get("api_secret")
     session_token = (
@@ -232,69 +961,50 @@ async def api_connect(request: Request):
         body.get("apisession")    or qp.get("apisession")
     )
 
-    if not api_key or not api_secret or not session_token:
+    if not all([api_key, api_secret, session_token]):
         return JSONResponse(
             status_code=400,
-            content={"success": False, "error": "Missing: api_key, api_secret, session_token"}
+            content={"success": False, "error": "Missing: api_key, api_secret, session_token"},
         )
 
     try:
-        from breeze_connect import BreezeConnect
-        b = BreezeConnect(api_key=api_key)
-        # Official SDK — handles /customerdetails, checksum, everything
-        b.generate_session(api_secret=api_secret, session_token=session_token)
-        breeze_instance = b
-        print(f"[Backend] Connected. Session: {b.session_key[:12]}...")
-        return {
-            "success": True,
-            "session_token": b.session_key,
-            "message": "Connected via BreezeConnect SDK v8"
-        }
-    except Exception as e:
-        msg = str(e)
-        hint = ""
-        if "null" in msg.lower() or "object" in msg.lower():
-            hint = " → Token stale: get a fresh ?apisession= token today"
-        elif "key" in msg.lower():
-            hint = " → Check API Key and Secret"
-        print(f"[Backend] Connect error: {msg}")
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, engine.connect, api_key, api_secret, session_token
+        )
+        return result
+    except Exception as exc:
+        msg  = str(exc)
+        hint = (
+            " → Token stale, get a fresh ?apisession= today."
+            if "null" in msg.lower()
+            else " → Check API Key/Secret."
+            if "key" in msg.lower()
+            else ""
+        )
         return JSONResponse(
             status_code=200,
-            content={"success": False, "error": msg + hint}
+            content={"success": False, "error": msg + hint},
         )
+
 
 @app.post("/api/disconnect")
 async def api_disconnect():
-    global breeze_instance
-    breeze_instance = None
-    return {"success": True}
+    await asyncio.get_event_loop().run_in_executor(None, engine.disconnect)
+    return {"success": True, "message": "Disconnected"}
 
-# ── 5. Expiry dates ───────────────────────────────────────────────────────────
+
+# ── Expiry dates ───────────────────────────────────────────────────────────────
 
 @app.get("/api/expiries")
-async def api_expiries(stock_code: str = Query("NIFTY")):
-    # NIFTY  → Tuesday  (weekday index 1, Mon=0)
-    # SENSEX → Thursday (weekday index 3)
-    is_sensex = "SENSEX" in stock_code.upper() or "BSESEN" in stock_code.upper()
-    target_day = 3 if is_sensex else 1
-    today = datetime.now().date()
-    results = []
-    for i in range(60):
-        d = today + timedelta(days=i)
-        if d.weekday() == target_day:
-            if i == 0 and datetime.now(timezone.utc).hour >= 10:
-                continue  # Skip today if market closed
-            results.append({
-                "date": d.strftime("%d-%b-%Y"),
-                "label": d.strftime("%d %b %y"),
-                "days_away": (d - today).days,
-                "weekday": d.strftime("%A"),
-            })
-            if len(results) >= 5:
-                break
-    return {"success": True, "stock_code": stock_code, "expiries": results}
+async def api_expiries(
+    stock_code:    str = Query("NIFTY"),
+    exchange_code: str = Query("NFO"),
+):
+    expiries = BreezeEngine.get_weekly_expiries(stock_code, count=5)
+    return {"success": True, "stock_code": stock_code, "expiries": expiries}
 
-# ── 6. Option Chain (REST snapshot — call ONCE per expiry, NOT in a loop) ─────
+
+# ── Option Chain (REST snapshot — called ONCE per expiry) ──────────────────────
 
 @app.get("/api/optionchain")
 async def api_optionchain(
@@ -304,99 +1014,157 @@ async def api_optionchain(
     right:         Optional[str] = Query("Call"),
     strike_price:  str           = Query(""),
 ):
-    if not breeze_instance:
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected. POST /api/connect first.")
 
     right_norm = "Call" if (right or "Call").lower().startswith("c") else "Put"
-    print(f"[Backend] get_option_chain_quotes {stock_code} {expiry_date} {right_norm}")
-
     try:
-        result = breeze_instance.get_option_chain_quotes(
-            stock_code=stock_code,
-            exchange_code=exchange_code,
-            product_type="options",
-            expiry_date=expiry_date,
-            right=right_norm,
-            strike_price=strike_price,
+        data = await asyncio.get_event_loop().run_in_executor(
+            None,
+            engine.fetch_option_chain,
+            stock_code, exchange_code, expiry_date, right_norm, strike_price,
         )
-        rows = result.get("Success", []) if isinstance(result, dict) else []
-        print(f"[Backend] Option chain: {len(rows or [])} rows")
-        return {"success": True, "data": rows or [], "count": len(rows or [])}
-    except Exception as e:
-        print(f"[Backend] optionchain error: {e}")
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
+        return {"success": True, "data": data, "count": len(data)}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
-# ── 7. Place Order ────────────────────────────────────────────────────────────
-# VERIFIED field values for breeze.place_order():
-#   action:     "buy"  | "sell"  (lowercase)
-#   order_type: "market" | "limit" (lowercase)
-#   right:      "Call" | "Put"  (capital first letter)
-#   product:    "options" (lowercase)
-#   validity:   "day"
 
-@app.post("/api/order")
-async def api_order(request: Request):
-    if not breeze_instance:
+# ── Single Quote ───────────────────────────────────────────────────────────────
+
+@app.get("/api/quote")
+async def api_quote(
+    stock_code:    str = Query(...),
+    exchange_code: str = Query(...),
+    expiry_date:   str = Query(...),
+    right:         str = Query(...),
+    strike_price:  str = Query(...),
+):
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None, engine.get_quote,
+            stock_code, exchange_code, expiry_date, right, strike_price,
+        )
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+# ── WebSocket subscription ─────────────────────────────────────────────────────
+
+@app.post("/api/ws/subscribe")
+async def api_ws_subscribe(request: Request):
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON body"})
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
 
-    stock_code    = body.get("stock_code", "")
+    stock_code    = body.get("stock_code", "NIFTY")
     exchange_code = body.get("exchange_code", "NFO")
-    action        = str(body.get("action", "buy")).lower()       # must be "buy" or "sell"
-    order_type    = str(body.get("order_type", "market")).lower()  # "market" or "limit"
-    quantity      = str(body.get("quantity", "1"))
-    price         = str(body.get("price", "0"))
-    expiry_date   = str(body.get("expiry_date", ""))
-    right_raw     = str(body.get("right", "call"))
-    # Breeze place_order expects "Call" or "Put" (capital first letter)
-    right_norm    = "Call" if right_raw.lower().startswith("c") else "Put"
-    strike_price  = str(body.get("strike_price", ""))
-    stoploss      = str(body.get("stoploss", "0"))
-    user_remark   = str(body.get("user_remark", "OptionsTerminalV8"))
+    expiry_date   = body.get("expiry_date", "")
+    strikes       = body.get("strikes", [])
+    rights        = body.get("rights", ["Call", "Put"])
 
-    print(f"[Backend] place_order: {action.upper()} {stock_code} {right_norm} {strike_price} x{quantity} @ {order_type} {price}")
-
-    try:
-        result = breeze_instance.place_order(
-            stock_code=stock_code,
-            exchange_code=exchange_code,
-            product="options",         # lowercase "options"
-            action=action,             # "buy" or "sell" lowercase
-            order_type=order_type,     # "market" or "limit" lowercase
-            stoploss=stoploss,
-            quantity=quantity,
-            price=price,
-            validity="day",
-            validity_date=expiry_date,
-            disclosed_quantity="0",
-            expiry_date=expiry_date,
-            right=right_norm,          # "Call" or "Put" capital first
-            strike_price=strike_price,
-            user_remark=user_remark,
+    if not expiry_date or not strikes:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "expiry_date and strikes required"},
         )
-        print(f"[Backend] place_order result: {result}")
-        ok  = isinstance(result, dict) and result.get("Status") == 200
-        oid = ""
-        if ok:
-            success_data = result.get("Success") or {}
-            if isinstance(success_data, dict):
-                oid = str(success_data.get("order_id", ""))
-        err = ""
-        if not ok and isinstance(result, dict):
-            err = str(result.get("Error", "Order placement failed"))
-        return {"success": ok, "order_id": oid, "error": err, "raw": result}
-    except Exception as e:
-        print(f"[Backend] place_order exception: {e}")
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
 
-# ── 8. Strategy Execute (multi-leg concurrent) ────────────────────────────────
+    await asyncio.get_event_loop().run_in_executor(None, engine.unsubscribe_all)
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            engine.subscribe_option_chain,
+            stock_code, exchange_code, expiry_date, strikes, rights,
+        )
+        return {"success": True, **result}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+# ── WebSocket streaming (frontend connects here) ───────────────────────────────
+
+@app.websocket("/ws/ticks")
+async def ws_ticks(websocket: WebSocket):
+    await websocket.accept()
+    log.info(f"[WS endpoint] frontend connected: {websocket.client}")
+    last_version      = -1
+    heartbeat_counter = 0
+    try:
+        while True:
+            await asyncio.sleep(0.5)
+            current_version = engine.tick_store.get_version()
+            heartbeat_counter += 1
+
+            if current_version == last_version:
+                if heartbeat_counter % 10 == 0:
+                    await websocket.send_json({
+                        "type":    "heartbeat",
+                        "ts":      time.time(),
+                        "ws_live": engine.ws_running,
+                    })
+                continue
+
+            last_version = current_version
+            await websocket.send_json({
+                "type":    "tick_update",
+                "version": current_version,
+                "ticks":   engine.tick_store.to_option_chain_delta(),
+                "ts":      time.time(),
+                "ws_live": engine.ws_running,
+            })
+    except WebSocketDisconnect:
+        log.info("[WS endpoint] frontend disconnected")
+    except Exception as exc:
+        log.warning(f"[WS endpoint] error: {exc}")
+
+
+# ── Tick REST fallback ─────────────────────────────────────────────────────────
+
+@app.get("/api/ticks")
+async def api_ticks(since_version: int = Query(0)):
+    data = engine.tick_store.get_all()
+    if data["version"] <= since_version:
+        return {"changed": False, "version": data["version"]}
+    return {
+        "changed": True,
+        "version": data["version"],
+        "ticks":   engine.tick_store.to_option_chain_delta(),
+        "ws_live": engine.ws_running,
+    }
+
+
+# ── Orders ─────────────────────────────────────────────────────────────────────
+
+@app.post("/api/order")
+async def api_order(request: Request):
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+    try:
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, engine.place_strategy_order, [body]
+        )
+        r = results[0]
+        return {
+            "success":  r["success"],
+            "order_id": r.get("order_id", ""),
+            "error":    r.get("error", ""),
+        }
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
 
 @app.post("/api/strategy/execute")
 async def api_strategy_execute(request: Request):
-    if not breeze_instance:
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
         body = await request.json()
@@ -407,232 +1175,219 @@ async def api_strategy_execute(request: Request):
     if not legs:
         return JSONResponse(status_code=400, content={"success": False, "error": "No legs provided"})
 
-    import threading
-    results = []
-    results_lock = threading.Lock()
+    try:
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, engine.place_strategy_order, legs
+        )
+        return {"success": all(r["success"] for r in results), "results": results}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
-    def place_one(leg, idx):
-        stock_code    = leg.get("stock_code", "")
-        exchange_code = leg.get("exchange_code", "NFO")
-        action        = str(leg.get("action", "buy")).lower()
-        order_type    = str(leg.get("order_type", "market")).lower()
-        quantity      = str(leg.get("quantity", "1"))
-        price         = str(leg.get("price", "0"))
-        expiry_date   = str(leg.get("expiry_date", ""))
-        right_raw     = str(leg.get("right", "call"))
-        right_norm    = "Call" if right_raw.lower().startswith("c") else "Put"
-        strike_price  = str(leg.get("strike_price", ""))
 
-        try:
-            r = breeze_instance.place_order(
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-                product="options",
-                action=action,
-                order_type=order_type,
-                stoploss="0",
-                quantity=quantity,
-                price=price,
-                validity="day",
-                validity_date=expiry_date,
-                disclosed_quantity="0",
-                expiry_date=expiry_date,
-                right=right_norm,
-                strike_price=strike_price,
-                user_remark="StrategyV8",
-            )
-            ok  = isinstance(r, dict) and r.get("Status") == 200
-            oid = ""
-            if ok:
-                sd = r.get("Success") or {}
-                if isinstance(sd, dict):
-                    oid = str(sd.get("order_id", ""))
-            err = str(r.get("Error", "")) if not ok and isinstance(r, dict) else ""
-            with results_lock:
-                results.append({"leg_index": idx, "success": ok, "order_id": oid, "error": err})
-        except Exception as e:
-            with results_lock:
-                results.append({"leg_index": idx, "success": False, "error": str(e)})
-
-    threads = [threading.Thread(target=place_one, args=(leg, i), daemon=True)
-               for i, leg in enumerate(legs)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=60)
-
-    results.sort(key=lambda x: x["leg_index"])
-    return {"success": all(r["success"] for r in results), "results": results}
-
-# ── 9. Square Off (exit position — reverses action) ───────────────────────────
+# ── Square Off ─────────────────────────────────────────────────────────────────
 
 @app.post("/api/squareoff")
 async def api_squareoff(request: Request):
     """
-    Exits a position. Send the ORIGINAL action (e.g. "buy").
-    Backend reverses it (buy→sell, sell→buy) to create the exit order.
+    Square off (exit) a position.
+    Send the same body as /api/order — backend reverses the action automatically.
     """
-    if not breeze_instance:
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-
-    original_action = str(body.get("action", "buy")).lower()
-    exit_action     = "sell" if original_action == "buy" else "buy"
-
-    stock_code    = body.get("stock_code", "")
-    exchange_code = body.get("exchange_code", "NFO")
-    order_type    = str(body.get("order_type", "market")).lower()
-    quantity      = str(body.get("quantity", "1"))
-    price         = str(body.get("price", "0"))
-    expiry_date   = str(body.get("expiry_date", ""))
-    right_raw     = str(body.get("right", "call"))
-    right_norm    = "Call" if right_raw.lower().startswith("c") else "Put"
-    strike_price  = str(body.get("strike_price", ""))
-
-    print(f"[Backend] squareoff: orig={original_action} exit={exit_action} "
-          f"{stock_code} {right_norm} {strike_price} x{quantity} @ {order_type} {price}")
-
     try:
-        result = breeze_instance.place_order(
-            stock_code=stock_code,
-            exchange_code=exchange_code,
-            product="options",
-            action=exit_action,       # reversed action
-            order_type=order_type,
-            stoploss="0",
-            quantity=quantity,
-            price=price,
-            validity="day",
-            validity_date=expiry_date,
-            disclosed_quantity="0",
-            expiry_date=expiry_date,
-            right=right_norm,
-            strike_price=strike_price,
-            user_remark="SquareOffV8",
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, engine.square_off_position, body
         )
-        print(f"[Backend] squareoff result: {result}")
         ok  = isinstance(result, dict) and result.get("Status") == 200
-        oid = ""
-        if ok:
-            sd = result.get("Success") or {}
-            if isinstance(sd, dict):
-                oid = str(sd.get("order_id", ""))
-        err = str(result.get("Error", "")) if not ok and isinstance(result, dict) else ""
-        return {"success": ok, "order_id": oid, "error": err, "exit_action": exit_action}
-    except Exception as e:
-        print(f"[Backend] squareoff exception: {e}")
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
+        oid = (result.get("Success") or {}).get("order_id", "") if ok else ""
+        return {
+            "success":  ok,
+            "order_id": oid,
+            "error":    result.get("Error", "") if not ok else "",
+        }
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
-# ── 10. Cancel / Modify Order ─────────────────────────────────────────────────
+
+# ── Cancel / Modify ────────────────────────────────────────────────────────────
 
 @app.post("/api/order/cancel")
 async def api_cancel_order(request: Request):
-    if not breeze_instance:
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+
     order_id      = body.get("order_id", "")
     exchange_code = body.get("exchange_code", "NFO")
     if not order_id:
         return JSONResponse(status_code=400, content={"success": False, "error": "order_id required"})
-    try:
-        result = breeze_instance.cancel_order(exchange_code=exchange_code, order_id=order_id)
-        ok = isinstance(result, dict) and result.get("Status") == 200
-        return {"success": ok, "error": str(result.get("Error", "")) if not ok else ""}
-    except Exception as e:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
 
-# ── 11. Order Book / Trade Book ───────────────────────────────────────────────
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, engine.cancel_order, order_id, exchange_code
+        )
+        ok = isinstance(result, dict) and result.get("Status") == 200
+        return {"success": ok, "error": result.get("Error", "") if not ok else ""}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+@app.patch("/api/order/modify")
+async def api_modify_order(request: Request):
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            engine.modify_order,
+            body.get("order_id", ""),
+            body.get("exchange_code", "NFO"),
+            str(body.get("quantity", "0")),
+            str(body.get("price", "0")),
+            str(body.get("stoploss", "0")),
+            body.get("validity", "day"),
+        )
+        ok = isinstance(result, dict) and result.get("Status") == 200
+        return {"success": ok, "error": result.get("Error", "") if not ok else ""}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+# ── Order Book / Trade Book ────────────────────────────────────────────────────
 
 @app.get("/api/orders")
 async def api_order_book():
-    if not breeze_instance:
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
-        now = datetime.now()
-        result = breeze_instance.get_order_list(
-            exchange_code="NFO",
-            from_date=now.strftime("%Y-%m-%dT00:00:00.000Z"),
-            to_date=now.strftime("%Y-%m-%dT23:59:59.000Z"),
-        )
-        rows = result.get("Success", []) if isinstance(result, dict) else []
-        return {"success": True, "data": rows or []}
-    except Exception as e:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
+        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_order_book)
+        return {"success": True, "data": data.get("Success", []) if isinstance(data, dict) else []}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
 
 @app.get("/api/trades")
 async def api_trade_book():
-    if not breeze_instance:
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
-        now = datetime.now()
-        result = breeze_instance.get_trade_list(
-            exchange_code="NFO",
-            from_date=now.strftime("%Y-%m-%dT00:00:00.000Z"),
-            to_date=now.strftime("%Y-%m-%dT23:59:59.000Z"),
-        )
-        rows = result.get("Success", []) if isinstance(result, dict) else []
-        return {"success": True, "data": rows or []}
-    except Exception as e:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
+        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_trade_book)
+        return {"success": True, "data": data.get("Success", []) if isinstance(data, dict) else []}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
-# ── 12. Positions / Funds ─────────────────────────────────────────────────────
+
+# ── Positions / Holdings ───────────────────────────────────────────────────────
 
 @app.get("/api/positions")
 async def api_positions():
-    if not breeze_instance:
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
-        pos = breeze_instance.get_portfolio_positions()
-        hld = breeze_instance.get_portfolio_holdings()
-        return {
-            "success": True,
-            "data": {
-                "positions": pos.get("Success", []) if isinstance(pos, dict) else [],
-                "holdings":  hld.get("Success", []) if isinstance(hld, dict) else [],
-            }
-        }
-    except Exception as e:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
+        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_positions)
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+# ── Funds ──────────────────────────────────────────────────────────────────────
 
 @app.get("/api/funds")
 async def api_funds():
-    if not breeze_instance:
+    if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
-        result = breeze_instance.get_funds()
-        return {"success": True, "data": result.get("Success", {}) if isinstance(result, dict) else {}}
-    except Exception as e:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(e)})
+        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_funds)
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
-# ── 13. Tunnel providers ──────────────────────────────────────────────────────
 
-def pick_free_port(preferred=8000):
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(("127.0.0.1", preferred))
-            return preferred
-        except OSError:
-            s.bind(("127.0.0.1", 0))
-            return int(s.getsockname()[1])
+# ── Historical Data ────────────────────────────────────────────────────────────
 
-def start_uvicorn_bg(port):
+@app.get("/api/historical")
+async def api_historical(
+    stock_code:    str = Query(...),
+    exchange_code: str = Query(...),
+    interval:      str = Query("1day"),
+    from_date:     str = Query(...),
+    to_date:       str = Query(...),
+    expiry_date:   str = Query(""),
+    right:         str = Query(""),
+    strike_price:  str = Query(""),
+):
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None,
+            engine.get_historical,
+            stock_code, exchange_code, interval, from_date, to_date,
+            expiry_date, right, strike_price,
+        )
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+# ── Rate limit status ──────────────────────────────────────────────────────────
+
+@app.get("/api/ratelimit")
+async def api_ratelimit():
+    return {
+        "calls_last_minute": engine.rate_limiter.calls_last_minute,
+        "max_per_minute":    100,
+        "min_interval_ms":   RateLimiter.MIN_INTERVAL_MS,
+        "queue_depth":       engine.rate_limiter.queue_depth,
+    }
+
+
+# ── Checksum verify ────────────────────────────────────────────────────────────
+
+@app.post("/api/checksum")
+async def api_checksum(request: Request):
+    try:
+        body      = await request.json()
+        timestamp = body.get(
+            "timestamp",
+            datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        )
+        checksum  = BreezeEngine.generate_checksum(
+            timestamp,
+            body.get("payload", {}),
+            body.get("secret", ""),
+        )
+        return {"checksum": checksum, "timestamp": timestamp}
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tunnel Providers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def start_uvicorn_thread():
     t = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=port, log_level="error"),
-        daemon=True, name="uvicorn"
+        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning"),
+        daemon=True,
+        name="uvicorn",
     )
     t.start()
     return t
 
-def wait_for_port(port, timeout=15):
-    import socket
+
+def wait_for_port(port: int = 8000, timeout: int = 15) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -642,176 +1397,241 @@ def wait_for_port(port, timeout=15):
             time.sleep(0.5)
     return False
 
-def try_localhost_run():
+
+def try_localhost_run() -> Optional[str]:
     if not shutil.which("ssh"):
         return None
     try:
-        log = "/tmp/lhr.log"
-        open(log, "w").close()
-        subprocess.Popen(
-            ["ssh", "-R", f"80:localhost:{BACKEND_PORT}",
-             "-o", "StrictHostKeyChecking=no",
-             "-o", "ServerAliveInterval=30",
-             "-o", "ConnectTimeout=15",
-             "nokey@localhost.run"],
-            stdout=open(log, "a"), stderr=subprocess.STDOUT
-        )
-        pat = re.compile(r"https://[a-z0-9-]+\\.lhr\\.life")
-        for _ in range(25):
+        print("  Trying localhost.run (SSH)...")
+        log_path = "/tmp/lhr.log"
+        with open(log_path, "w") as lf:
+            subprocess.Popen(
+                ["ssh", "-R", "80:localhost:8000",
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "ServerAliveInterval=30",
+                 "-o", "ConnectTimeout=15",
+                 "nokey@localhost.run"],
+                stdout=lf, stderr=subprocess.STDOUT,
+            )
+        pat = re.compile(r"https://[a-z0-9\\-]+\\.lhr\\.life")
+        deadline = time.time() + 40
+        while time.time() < deadline:
             time.sleep(2)
             try:
-                m = pat.search(open(log).read())
-                if m:
-                    return m.group(0)
+                with open(log_path) as f:
+                    m = pat.search(f.read())
+                    if m:
+                        return m.group(0)
             except Exception:
                 pass
     except Exception:
         pass
     return None
 
-def try_serveo():
+
+def try_serveo() -> Optional[str]:
     if not shutil.which("ssh"):
         return None
     try:
-        log = "/tmp/serveo.log"
-        open(log, "w").close()
-        subprocess.Popen(
-            ["ssh", "-R", f"80:localhost:{BACKEND_PORT}",
-             "-o", "StrictHostKeyChecking=no",
-             "-o", "ServerAliveInterval=30",
-             "-o", "ConnectTimeout=15",
-             "serveo.net"],
-            stdout=open(log, "a"), stderr=subprocess.STDOUT
-        )
+        print("  Trying serveo.net (SSH)...")
+        log_path = "/tmp/serveo.log"
+        with open(log_path, "w") as lf:
+            subprocess.Popen(
+                ["ssh", "-R", "80:localhost:8000",
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "ServerAliveInterval=30",
+                 "-o", "ConnectTimeout=15",
+                 "serveo.net"],
+                stdout=lf, stderr=subprocess.STDOUT,
+            )
         pat = re.compile(r"https://[a-z0-9]+\\.serveo\\.net")
-        for _ in range(25):
+        deadline = time.time() + 40
+        while time.time() < deadline:
             time.sleep(2)
             try:
-                m = pat.search(open(log).read())
-                if m:
-                    return m.group(0)
+                with open(log_path) as f:
+                    m = pat.search(f.read())
+                    if m:
+                        return m.group(0)
             except Exception:
                 pass
     except Exception:
         pass
     return None
 
-def try_cloudflare():
+
+def try_cloudflare() -> Optional[str]:
     cf = "/tmp/cloudflared"
     if not os.path.exists(cf):
-        print("  Downloading cloudflared...")
         try:
+            print("  Downloading cloudflared...")
             urllib.request.urlretrieve(
                 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-                cf
+                cf,
             )
             os.chmod(cf, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
-        except Exception as e:
-            print(f"  Download failed: {e}")
+            print("  cloudflared downloaded")
+        except Exception as exc:
+            print(f"  cloudflared download failed: {exc}")
             return None
 
-    log = "/tmp/cf.log"
-    open(log, "w").close()
+    log_path = "/tmp/cf.log"
+    # Clear log before starting
+    open(log_path, "w").close()
+
     try:
-        subprocess.Popen(
-            [cf, "tunnel", "--url", f"http://localhost:{BACKEND_PORT}", "--no-autoupdate"],
-            stdout=open(log, "a"), stderr=subprocess.STDOUT
-        )
-        # Pattern must match trycloudflare.com URLs
+        with open(log_path, "a") as lf:
+            subprocess.Popen(
+                [cf, "tunnel", "--url", "http://localhost:8000", "--no-autoupdate"],
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+            )
         pat = re.compile(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com")
-        for _ in range(40):
+        deadline = time.time() + 90
+        while time.time() < deadline:
             time.sleep(3)
             try:
-                matches = pat.findall(open(log).read())
-                if matches:
-                    return matches[-1]
+                with open(log_path) as f:
+                    urls = pat.findall(f.read())
+                    if urls:
+                        return urls[-1]
             except Exception:
                 pass
-    except Exception as e:
-        print(f"  Cloudflare error: {e}")
+    except Exception as exc:
+        print(f"  Cloudflare error: {exc}")
+
     return None
 
-# ── 14. MAIN ──────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN — start FastAPI + tunnel
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    global BACKEND_PORT
-    SEP = "=" * 68
     print(f"\\n{SEP}")
-    print("  ICICI BREEZE BACKEND v8")
+    print("  ICICI BREEZE BACKEND v7 — BreezeEngine")
     print(SEP)
-
-    BACKEND_PORT = pick_free_port(BACKEND_PORT)
-    print(f"  Starting FastAPI on port {BACKEND_PORT}...")
-    start_uvicorn_bg(BACKEND_PORT)
-    if wait_for_port(BACKEND_PORT, 15):
-        print(f"  FastAPI running on http://localhost:{BACKEND_PORT}")
+    print()
+    if AUTH_ENABLED:
+        print("  ⚠️  BACKEND AUTH IS ENABLED")
+        print(f"  Auth token: {BACKEND_AUTH_TOKEN}")
+        print("  → Set KAGGLE_TERMINAL_AUTH=" + BACKEND_AUTH_TOKEN + " in Vercel env vars")
+        print("  → Or set TERMINAL_AUTH_TOKEN env var before running this cell to customise")
+        print()
     else:
-        print("  WARNING: FastAPI may not have started")
+        print("  🔓 Auth is DISABLED (default). Anyone with the tunnel URL can connect.")
+        print("  To enable: set TERMINAL_AUTH_TOKEN env var before running this cell.")
+        print()
+    print("  Endpoints:")
+    print("    POST  /api/connect          authenticate (generate_session)")
+    print("    GET   /api/expiries         weekly expiry dates")
+    print("    GET   /api/optionchain      snapshot — call ONCE per expiry")
+    print("    POST  /api/ws/subscribe     subscribe Breeze WS feeds")
+    print("    WS    /ws/ticks             live tick stream to frontend")
+    print("    POST  /api/strategy/execute multi-leg concurrent order")
+    print("    POST  /api/squareoff        exit / square-off a position")
+    print("    POST  /api/order/cancel     cancel pending order")
+    print("    PATCH /api/order/modify     modify order price/qty")
+    print("    GET   /api/orders           order book (today)")
+    print("    GET   /api/trades           trade book (today)")
+    print("    GET   /api/positions        portfolio positions + holdings")
+    print("    GET   /api/funds            available margin / funds")
+    print("    GET   /api/historical       OHLCV candle data")
+    print("    GET   /api/ratelimit        rate limiter status")
+    print("    POST  /api/checksum         checksum verification utility")
+    print("    GET   /health  /ping  /     health check")
+    print()
 
-    print("\\n  Finding public tunnel (tries 3 providers)...")
+    print("Starting FastAPI on port 8000...")
+    start_uvicorn_thread()
+    if wait_for_port(8000, 15):
+        print("FastAPI running on http://localhost:8000\\n")
+    else:
+        print("WARNING: FastAPI may not have started\\n")
+
+    print("Finding public tunnel (trying 3 providers)...")
+
     public_url = None
-
     for fn, name in [
-        (try_localhost_run, "localhost.run (SSH — no interstitial)"),
-        (try_serveo,        "serveo.net (SSH — no interstitial)"),
-        (try_cloudflare,    "Cloudflare Tunnel"),
+        (try_localhost_run, "localhost.run"),
+        (try_serveo,        "serveo.net"),
+        (try_cloudflare,    "Cloudflare"),
     ]:
-        print(f"  Trying {name}...")
+        print(f"\\n  {name}...")
         url = fn()
         if url:
             public_url = url
             print(f"  OK: {url}")
             break
-        print(f"  Failed, trying next...")
+        print(f"  {name} unavailable, trying next...")
 
     print(f"\\n{SEP}")
+
     if public_url:
         is_cf = "trycloudflare" in public_url
         print("  BACKEND IS LIVE!")
         print(SEP)
         print()
-        print(f"  URL: {public_url}")
+        print(f"  Public URL:  {public_url}")
         print()
-        print("  COPY THIS → paste into Arena Connect Broker field:")
+        print("  " + "-" * 64)
+        print("  COPY THIS URL into Arena app Connect Broker field:")
         print(f"  {public_url}")
+        print("  " + "-" * 64)
         print()
-        print(f"  Health:   {public_url}/health")
-        print(f"  Connect:  {public_url}/api/connect  (POST)")
-        print(f"  Chain:    {public_url}/api/optionchain?stock_code=NIFTY&exchange_code=NFO&expiry_date=01-Jul-2025&right=Call")
+        print(f"  Health:    {public_url}/health")
+        print(f"  WebSocket: {public_url.replace('https', 'wss')}/ws/ticks")
+        print(f"  Connect:   {public_url}/api/connect   (POST)")
+        print(f"  Chain:     {public_url}/api/optionchain?stock_code=NIFTY&exchange_code=NFO&expiry_date=01-Jul-2025&right=Call")
+
         if is_cf:
             print()
-            print("  NOTE (Cloudflare): If Arena shows 'Failed to fetch':")
-            print(f"    Open in a NEW browser tab: {public_url}/health")
-            print("    You should see: {'status': 'online'}")
+            print("  NOTE (Cloudflare only): If Arena shows 'Failed to fetch':")
+            print(f"    Open in a browser tab: {public_url}/health")
+            print("    You should see {\\"status\\":\\"online\\"}")
             print("    Then retry in Arena.")
     else:
         print("  WARNING: No public tunnel found.")
-        print("  Make sure Kaggle Internet is ON and re-run.")
+        print("  Make sure Kaggle Internet is ON and re-run this cell.")
+
     print(SEP)
     print()
-    print("  Steps:")
+    print("Steps:")
     print("  1. Copy URL above")
-    print("  2. Arena → Connect Broker → paste URL into CORS Proxy field")
-    print("  3. Enter API Key, Secret, today's Session Token")
-    print("  4. Click Validate Live → should show Connected!")
+    print("  2. Arena app -> Connect Broker -> paste URL")
+    print("  3. Enter API Key, API Secret, today's Session Token")
+    print("  4. Click Validate Live -> Connected via BreezeEngine v7!")
     print()
-    print("  Daily Session Token:")
+    print("Daily Session Token:")
     print("  https://api.icicidirect.com/apiuser/login?api_key=YOUR_KEY")
-    print("  Login → copy ?apisession=XXXXX from redirect URL")
+    print("  Login -> copy ?apisession=XXXXX from redirect URL")
     print(SEP)
     print()
-    print("  Backend running. Keep this cell alive.")
-    print("  Press the Kaggle Stop button to quit.\\n")
+    print("Backend running. Keep cell alive. Press the Stop button to quit.\\n")
 
-    beat = 0
-    while True:
-        time.sleep(30)
-        beat += 1
-        if beat % 4 == 0:
-            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            print(f"  heartbeat {ts} UTC | connected={breeze_instance is not None}")
+    try:
+        beat = 0
+        while True:
+            time.sleep(30)
+            beat += 1
+            if beat % 4 == 0:
+                ts = datetime.utcnow().strftime("%H:%M:%S")
+                print(
+                    f"  heartbeat {ts} UTC"
+                    f" | connected={engine.connected}"
+                    f" | ws={engine.ws_running}"
+                    f" | subs={len(engine.subscribed)}"
+                    f" | REST/min={engine.rate_limiter.calls_last_minute}"
+                    f" | ticks={engine.tick_store.get_version()}"
+                )
+    except KeyboardInterrupt:
+        print("\\nShutting down...")
+        engine.disconnect()
 
-main()`;
+
+main()
+`;
+
 
 // ── Main modal component ──────────────────────────────────────────────────────
 export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, session }) => {
@@ -820,6 +1640,8 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
   const [apiSecret,    setApiSecret]    = useState(session?.apiSecret    ?? '');
   const [sessionToken, setSessionToken] = useState(session?.sessionToken ?? '');
   const [proxyBase,    setProxyBase]    = useState(session?.proxyBase    ?? CORS_PROXIES.vercelKaggle);
+  // FIX (Bug #2): Auth token field — only needed if TERMINAL_AUTH_TOKEN is set in Kaggle
+  const [authToken,    setAuthToken]    = useState(session?.backendAuthToken ?? '');
   const [showSecret,   setShowSecret]   = useState(false);
   const [status,       setStatus]       = useState<Status>('idle');
   const [statusMsg,    setStatusMsg]    = useState('');
@@ -846,10 +1668,13 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
     if (!proxyBase.trim()) { setHealthMsg('Enter a URL first'); setHealthOk(false); return; }
     setHealthMsg('⏳ Pinging backend...');
     setHealthOk(null);
+    // FIX (Bug #2): Set auth token before health check so fetchJson includes it
+    setTerminalAuthToken(authToken.trim() || undefined);
+    setWsAuthToken(authToken.trim() || undefined);
     const result = await checkBackendHealth(proxyBase.trim());
     setHealthOk(result.ok);
     setHealthMsg(result.ok ? `✓ ${result.message}` : `✗ ${result.message}`);
-  }, [proxyBase]);
+  }, [proxyBase, authToken]);
 
   // ── Validate Live ───────────────────────────────────────────────────────────
   const handleValidateLive = useCallback(async () => {
@@ -863,12 +1688,17 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
     setLastDebug(undefined);
 
     const baseSession: BreezeSession = {
-      apiKey:       apiKey.trim(),
-      apiSecret:    apiSecret.trim(),
-      sessionToken: sessionToken.trim(),
-      proxyBase:    proxyBase.trim(),
-      isConnected:  false,
+      apiKey:           apiKey.trim(),
+      apiSecret:        apiSecret.trim(),
+      sessionToken:     sessionToken.trim(),
+      proxyBase:        proxyBase.trim(),
+      backendAuthToken: authToken.trim() || undefined,
+      isConnected:      false,
     };
+
+    // FIX (Bug #2): Apply auth token globally BEFORE any API calls
+    setTerminalAuthToken(authToken.trim() || undefined);
+    setWsAuthToken(authToken.trim() || undefined);
 
     // ── Mode A: Python backend (Kaggle) ──────────────────────────────────────
     if (isBackend) {
@@ -926,21 +1756,24 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
       setStatus('error');
       setStatusMsg(e instanceof Error ? e.message : String(e));
     }
-  }, [apiKey, apiSecret, sessionToken, proxyBase, allFilled, isBackend, onConnected, onClose]);
+  }, [apiKey, apiSecret, sessionToken, proxyBase, authToken, allFilled, isBackend, onConnected, onClose]);
 
   // ── Save offline (no validation) ────────────────────────────────────────────
   const handleSaveOffline = useCallback(() => {
     if (!allFilled) { setStatus('error'); setStatusMsg('Fill in all fields first.'); return; }
+    setTerminalAuthToken(authToken.trim() || undefined);
+    setWsAuthToken(authToken.trim() || undefined);
     onConnected({
-      apiKey:       apiKey.trim(),
-      apiSecret:    apiSecret.trim(),
-      sessionToken: sessionToken.trim(),
-      proxyBase:    proxyBase.trim(),
-      isConnected:  false,
-      connectedAt:  new Date(),
+      apiKey:           apiKey.trim(),
+      apiSecret:        apiSecret.trim(),
+      sessionToken:     sessionToken.trim(),
+      proxyBase:        proxyBase.trim(),
+      backendAuthToken: authToken.trim() || undefined,
+      isConnected:      false,
+      connectedAt:      new Date(),
     });
     onClose();
-  }, [apiKey, apiSecret, sessionToken, proxyBase, allFilled, onConnected, onClose]);
+  }, [apiKey, apiSecret, sessionToken, proxyBase, authToken, allFilled, onConnected, onClose]);
 
   const TABS: { id: Tab; label: string }[] = [
     { id: 'connect', label: '🔐 Connect' },
@@ -1109,6 +1942,22 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
               </div>
 
               {/* Status */}
+              {/* Auth token — only shown for Kaggle backend mode */}
+              {isBackend && (
+                <Field label="Backend Auth Token" hint="Optional — only if Kaggle cell sets TERMINAL_AUTH_TOKEN">
+                  <input
+                    value={authToken}
+                    onChange={e => setAuthToken(e.target.value)}
+                    placeholder="Leave blank unless Kaggle output shows an auth token"
+                    className={INPUT}
+                  />
+                  <p className="text-[10px] text-gray-700 mt-1">
+                    By default auth is <strong className="text-gray-500">disabled</strong> in v7 backend — leave blank.{' '}
+                    Only fill this if you explicitly set <code className="text-gray-500">TERMINAL_AUTH_TOKEN</code> in Kaggle.
+                  </p>
+                </Field>
+              )}
+
               {status !== 'idle' && (
                 <div className={`flex items-start gap-2 p-3 rounded-xl text-[11px] border ${
                   status === 'ok'    ? 'bg-emerald-500/6 border-emerald-500/20 text-emerald-300' :
@@ -1125,12 +1974,14 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
                     {status === 'error' && isBackend && (
                       <div className="mt-2 space-y-1 text-[10px] text-gray-400 border-t border-gray-700/40 pt-2">
                         <p className="text-amber-300 font-semibold">Backend troubleshooting:</p>
-                        {(statusMsg.includes('HTML') || statusMsg.includes('cloudflare') || statusMsg.includes('trycloudflare')) ? (
+                        {(statusMsg.includes('HTML') || statusMsg.toLowerCase().includes('cloudflare') || statusMsg.toLowerCase().includes('trycloudflare') || statusMsg.includes('interstitial')) ? (
                           <>
                             <p className="text-red-300 font-semibold">Cloudflare Interstitial Detected</p>
-                            <p>① Open in a <strong className="text-white">new browser tab</strong>: <span className="text-blue-400 break-all">{proxyBase.replace(/\/api\/?$/, '')}/health</span></p>
-                            <p>② Click through any warning until you see {'{status: "online"}'}</p>
-                            <p>③ Close tab → retry <strong className="text-white">ping</strong> → <strong className="text-white">Validate Live</strong></p>
+                            <p>① Copy your tunnel URL from Kaggle output (e.g. <span className="text-amber-300">https://abc.trycloudflare.com</span>)</p>
+                            <p>② Open <strong className="text-white">that URL + /health</strong> in a new browser tab</p>
+                            <p>③ Wait until you see <span className="text-emerald-400">{'{"status":"online"}'}</span></p>
+                            <p>④ Come back → retry <strong className="text-white">ping</strong> → <strong className="text-white">Validate Live</strong></p>
+                            <p className="text-gray-500 mt-1">The Vercel proxy now auto-bypasses this for subsequent requests.</p>
                           </>
                         ) : (
                           <>
@@ -1215,7 +2066,7 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
                 <div className="mb-2 text-[10px] text-amber-400 bg-amber-500/8 border border-amber-500/20 rounded-lg p-2">
                   ⚠️ Copy the ENTIRE block below. Do not split into multiple cells.
                 </div>
-                <CodeBlock lang="kaggle_backend_v8.py" code={KAGGLE_CODE_SNIPPET} />
+                <CodeBlock lang="kaggle_backend_v7.py" code={KAGGLE_CODE_SNIPPET} />
               </StepBox>
 
               <StepBox n="3" title="Wait for the public URL in Kaggle output">

@@ -38,14 +38,12 @@ import {
   fetchExpiryDates,
   fetchPositions    as kaggleFetchPositions,
   isKaggleBackend,
-  setTerminalAuthToken,
   type OptionQuote,
 } from './utils/kaggleClient';
 import {
   breezeWs,
   subscribeOptionChain,
   startTickPolling,
-  setWsAuthToken,
   type TickData,
   type WsStatus,
 } from './utils/breezeWs';
@@ -464,10 +462,6 @@ export function App() {
   const handleConnected = useCallback(async (s: BreezeSession) => {
     setSession(s);
     setLoadingMsg('Connected! Initialising live data...');
-
-    // FIX (Bug #2): Restore auth tokens so all subsequent API calls are authenticated
-    setTerminalAuthToken(s.backendAuthToken || undefined);
-    setWsAuthToken(s.backendAuthToken || undefined);
 
     if (!isKaggleBackend(s.proxyBase)) return;
 

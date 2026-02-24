@@ -9,39 +9,17 @@ let TERMINAL_AUTH_TOKEN: string | undefined;
 
 /**
  * Sets the shared-secret used to authenticate to the Python backend.
- * The backend enforces this via `X-Terminal-Auth` header on all `/api/*` routes
- * when AUTH_ENABLED=true (i.e. when TERMINAL_AUTH_TOKEN env var is set in Kaggle).
- *
- * FIX (Bug #2): This was previously dead code — token was set but never used.
- * Now fetchJson includes this header whenever the token is set.
+ * The backend enforces this via `X-Terminal-Auth` header on all `/api/*` routes.
  */
 export function setTerminalAuthToken(token?: string): void {
   TERMINAL_AUTH_TOKEN = token?.trim() || undefined;
 }
 
 function getBase(rawUrl: string): string {
-  // Strip trailing slash only — do NOT strip /api suffix for Vercel proxy paths
-  // e.g. '/api/kaggle' → '/api/kaggle'  (correct; it IS the base)
-  //      'https://xyz.trycloudflare.com/api' → 'https://xyz.trycloudflare.com'
-  //      'https://xyz.trycloudflare.com' → 'https://xyz.trycloudflare.com'
-  if (rawUrl.startsWith('/')) {
-    // Relative Vercel proxy path — use as-is (strip trailing slash only)
-    return rawUrl.replace(/\/$/, '');
-  }
-  // Absolute URL — strip trailing /api and trailing slash
   return rawUrl.replace(/\/api\/?$/, '').replace(/\/$/, '');
 }
-
 function apiUrl(rawUrl: string, path: string): string {
   return `${getBase(rawUrl)}${path.startsWith('/') ? path : '/' + path}`;
-}
-
-/** Human-readable base URL for error messages (always an absolute URL if possible) */
-function displayBase(rawUrl: string): string {
-  if (rawUrl.startsWith('/')) {
-    return `${window.location.origin}${rawUrl}`;
-  }
-  return getBase(rawUrl);
 }
 
 export function isKaggleBackend(proxyBase: string): boolean {
@@ -77,14 +55,6 @@ async function fetchJson<T = unknown>(
     'Accept': 'application/json',
     ...((options.headers as Record<string, string>) || {}),
   };
-
-  // FIX (Bug #2): Forward auth token when set
-  // Required by kaggle_backend.py middleware when AUTH_ENABLED=true
-  if (TERMINAL_AUTH_TOKEN) {
-    headers['x-terminal-auth'] = TERMINAL_AUTH_TOKEN;
-  }
-
-  // Cloudflare interstitial bypass
   if (isCfUrl(url)) headers['bypass-tunnel-reminder'] = 'true';
 
   try {
@@ -96,13 +66,11 @@ async function fetchJson<T = unknown>(
     if (trim.startsWith('<!') || trim.startsWith('<html') ||
         trim.includes('Just a moment') || trim.includes('cloudflare') ||
         trim.includes('cf-browser-verification')) {
-      // displayBase converts /api/kaggle → https://yoursite.com/api/kaggle
-      const base = displayBase(url);
+      const cfBase = getBase(url);
       throw new Error(
         `Cloudflare interstitial detected.\n\n` +
-        `FIX: Open in a NEW browser tab:\n  ${base}/health\n\n` +
-        `Wait for JSON {"status":"online"}, then retry.\n` +
-        `(This unlocks the tunnel for ~30 minutes)`
+        `FIX: Open in a NEW browser tab: ${cfBase}/health\n` +
+        `Wait for JSON {"status":"online"}, then retry.`
       );
     }
 
@@ -215,88 +183,47 @@ export interface HistoricalCandle {
 }
 
 // ── Health check ──────────────────────────────────────────────────────────────
-// FIX (Bug #5): Improved messages — clearly distinguish:
-//   ok:true  + connected:false  = "Backend reachable, click Validate Live to connect Breeze"
-//   ok:true  + connected:true   = "Fully connected to Breeze ICICI"
-//   ok:false                    = "Backend unreachable — check Kaggle cell"
 
 export async function checkBackendHealth(backendUrl: string): Promise<HealthResult> {
-  // Try /health first (most likely); fall back to /ping and root.
-  // Timeout is 10s per attempt so UI feedback is fast.
-  for (const endpoint of ['/health', '/ping', '/']) {
+  for (const endpoint of ['/health', '/ping', '/api/health', '/api/ping', '/']) {
     const url = apiUrl(backendUrl, endpoint);
     try {
       const data = await fetchJson<{
-        status?: string; ok?: boolean; success?: boolean;
-        cf_interstitial?: boolean; error?: string;
-        connected?: boolean; breeze?: boolean; breeze_connected?: boolean; is_connected?: boolean;
-        data?: { connected?: boolean; breeze?: boolean };
-        ws_running?: boolean; rest_calls_min?: number; queue_depth?: number; version?: string;
-      }>(url, { method: 'GET' }, 10_000);
-
-      // If the proxy (or upstream) returned an error JSON, surface it directly.
-      // This happens when: CF interstitial was detected and proxy returned
-      // {ok:false, cf_interstitial:true, error:"..."} as clean JSON.
-      if (data.ok === false || data.success === false) {
-        const msg = data.error || 'Backend returned an error response';
-        // Only stop on CF interstitial — other errors try the next endpoint.
-        if (data.cf_interstitial) {
-          return { ok: false, connected: false, message: msg };
-        }
-        continue;  // try next endpoint
-      }
-
-      // A genuine health response must have status="online" or similar positive fields.
-      const isOnline =
-        data.status === 'online' ||
-        data.status === 'ok' ||
-        typeof data.connected === 'boolean' ||
-        typeof data.breeze === 'boolean';
-
-      if (!isOnline) continue;  // not a real health response, try next
+        status?: string;
+        connected?: boolean;
+        breeze?: boolean;
+        breeze_connected?: boolean;
+        is_connected?: boolean;
+        data?: { connected?: boolean; breeze?: boolean; breeze_connected?: boolean; is_connected?: boolean };
+        ws_running?: boolean;
+        rest_calls_min?: number; queue_depth?: number; version?: string;
+      }>(url, { method: 'GET' }, 15_000);
 
       const breezeConnected =
-        typeof data.connected === 'boolean'        ? data.connected :
-        typeof data.breeze === 'boolean'           ? data.breeze :
+        typeof data.connected === 'boolean' ? data.connected :
+        typeof data.breeze === 'boolean' ? data.breeze :
         typeof data.breeze_connected === 'boolean' ? data.breeze_connected :
-        typeof data.is_connected === 'boolean'     ? data.is_connected :
-        typeof data.data?.connected === 'boolean'  ? data.data.connected :
-        typeof data.data?.breeze === 'boolean'     ? data.data.breeze :
+        typeof data.is_connected === 'boolean' ? data.is_connected :
+        typeof data.data?.connected === 'boolean' ? data.data.connected :
+        typeof data.data?.breeze === 'boolean' ? data.data.breeze :
+        typeof data.data?.breeze_connected === 'boolean' ? data.data.breeze_connected :
+        typeof data.data?.is_connected === 'boolean' ? data.data.is_connected :
         undefined;
 
-      const breezeMsg = breezeConnected === true
-        ? '✓ Breeze ICICI connected'
-        : breezeConnected === false
-          ? 'Backend reachable but Breeze not yet connected — fill credentials & click Validate Live'
-          : 'Backend reachable (Breeze status unknown)';
-
       return {
-        ok: true,
-        connected: breezeConnected === true,
-        wsRunning:    data.ws_running,
-        restCallsMin: data.rest_calls_min,
-        queueDepth:   data.queue_depth,
-        message: `Backend v${data.version ?? '?'} online. ${breezeMsg}`,
+        ok: true, connected: breezeConnected === true,
+        wsRunning: data.ws_running, restCallsMin: data.rest_calls_min,
+        queueDepth: data.queue_depth,
+        message: `Backend v${data.version ?? '?'} online — Breeze: ${breezeConnected ?? 'unknown'}`,
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // Stop immediately on CF or timeout — no point retrying other endpoints
-      if (msg.includes('Cloudflare') || msg.includes('interstitial') || msg.includes('timed out')) {
+      if (msg.includes('Cloudflare') || msg.includes('timed out')) {
         return { ok: false, connected: false, message: msg };
       }
-      // Other errors (network, parse) — try next endpoint
     }
   }
-  return {
-    ok: false,
-    connected: false,
-    message:
-      'Cannot reach backend.\n\n' +
-      'Check:\n' +
-      '• Kaggle cell is still running (may have timed out after ~12h)\n' +
-      '• Tunnel URL is current (copy latest from Kaggle output)\n' +
-      '• For Cloudflare URLs: open the URL in a browser tab first',
-  };
+  return { ok: false, connected: false, message: 'Cannot reach backend — check Kaggle cell is running' };
 }
 
 // ── Connect ───────────────────────────────────────────────────────────────────
@@ -306,10 +233,8 @@ export async function connectToBreeze(params: {
 }): Promise<ConnectResult> {
   const { apiKey, apiSecret, sessionToken, backendUrl } = params;
 
-  // NOTE: We removed the blocking health pre-check here. It was an extra round-trip
-  // that caused the entire connection to fail on transient network issues or when
-  // the CF interstitial was returned (before the proxy fix). The /api/connect
-  // endpoint itself will surface a meaningful error if the backend is down.
+  const health = await checkBackendHealth(backendUrl);
+  if (!health.ok) return { ok: false, reason: `Cannot reach backend.\n\n${health.message}` };
 
   const url  = apiUrl(backendUrl, '/api/connect');
   const body = JSON.stringify({ api_key: apiKey, api_secret: apiSecret, session_token: sessionToken });
