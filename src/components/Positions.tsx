@@ -13,7 +13,7 @@ import {
   TrendingUp, TrendingDown, Clock, CheckCircle, FileText,
   ChevronDown, ChevronRight, Zap, X, RefreshCw,
   DollarSign, BookOpen, List, AlertTriangle, Target,
-  ArrowUpDown, Crosshair, ShieldAlert, Activity,
+  ArrowUpDown, Crosshair, ShieldAlert, Activity, Search, Copy, Check,
   BarChart3, Info, Edit3, Minus, Plus,
 } from 'lucide-react';
 import { Position, SymbolCode, BreezeSession } from '../types/index';
@@ -36,8 +36,9 @@ interface Props {
 }
 
 type Filter    = 'ALL' | 'ACTIVE' | 'DRAFT' | 'CLOSED';
-type SubTab    = 'positions' | 'trade' | 'orders' | 'trades' | 'funds';
+type SubTab    = 'positions' | 'trade' | 'sell' | 'orders' | 'trades' | 'funds';
 type OrderType = 'market' | 'limit';
+type SortDir = 'asc' | 'desc';
 
 function resolvePositions(
   liveFlag: boolean,
@@ -47,6 +48,17 @@ function resolvePositions(
     return livePositions;
   return MOCK_POSITIONS;
 }
+
+const asNumber = (value: unknown): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const extractTimestamp = (row: Record<string, unknown>): string => {
+  const candidates = ['exchange_time', 'trade_time', 'order_time', 'created_at', 'updated_at', 'datetime', 'timestamp'];
+  const raw = candidates.find(k => typeof row[k] === 'string' && String(row[k]).trim().length > 0);
+  return raw ? String(row[raw]) : '—';
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LOT STEPPER — editable lot count with live qty display
@@ -171,6 +183,14 @@ const SquareOffModal: React.FC<{
   );
   const [placing, setPlacing] = useState(false);
   const [results, setResults] = useState<string[]>([]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !placing) onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose, placing]);
 
   // Derived — always recomputed from current lots (never stale)
   const selected    = legs.filter(l => l.selected);
@@ -848,6 +868,11 @@ const FundsDashboard: React.FC<{
     { label: 'Utilized Margin',  key: 'utilized_margin',  color: 'text-amber-400',   bg: 'border-amber-500/20 bg-amber-500/4' },
   ];
 
+  const availableMargin = asNumber((funds as Record<string, unknown>).available_margin);
+  const utilizedMargin = asNumber((funds as Record<string, unknown>).utilized_margin);
+  const totalMargin = Math.max(availableMargin + utilizedMargin, 0);
+  const utilizationPct = totalMargin > 0 ? Math.min(100, (utilizedMargin / totalMargin) * 100) : 0;
+
   return (
     <div className="p-4 space-y-4">
       <div className="flex items-center justify-between">
@@ -859,20 +884,33 @@ const FundsDashboard: React.FC<{
       <div className="grid grid-cols-2 gap-3">
         {items.map(item => {
           const val = (funds as Record<string, unknown>)[item.key];
-          const num = typeof val === 'number' ? val : parseFloat(String(val ?? 0));
+          const num = asNumber(val);
           return (
             <div key={item.key} className={`rounded-2xl border p-4 ${item.bg}`}>
               <div className="text-gray-600 text-[10px] mb-1">{item.label}</div>
               <div className={`font-black text-xl mono ${item.color}`}>
-                ₹{isNaN(num) ? '—' : num.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                ₹{num.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
               </div>
             </div>
           );
         })}
       </div>
-      <div className="bg-[#0e1018] rounded-xl border border-gray-800/40 p-3">
-        <div className="text-gray-700 text-[9px] mb-2 uppercase tracking-wider font-semibold">Raw Response</div>
-        <pre className="text-[10px] text-gray-500 font-mono overflow-x-auto">{JSON.stringify(funds, null, 2)}</pre>
+
+      <div className="rounded-xl border border-gray-700/40 bg-[#0e1018] p-3">
+        <div className="flex items-center justify-between text-[10px] mb-2">
+          <span className="text-gray-500">Margin utilization</span>
+          <span className="text-amber-300 mono font-bold">{utilizationPct.toFixed(1)}%</span>
+        </div>
+        <div className="h-2.5 bg-gray-800/80 rounded-full overflow-hidden">
+          <div
+            className="h-full bg-gradient-to-r from-emerald-500 via-amber-500 to-red-500 transition-all duration-500"
+            style={{ width: `${utilizationPct}%` }}
+          />
+        </div>
+        <div className="mt-2 text-[10px] text-gray-600 flex justify-between">
+          <span>Used: ₹{utilizedMargin.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
+          <span>Total: ₹{totalMargin.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
+        </div>
       </div>
     </div>
   );
@@ -890,6 +928,11 @@ const OrderBookTable: React.FC<{
   onCancel:  (orderId: string, exchange: string) => Promise<void>;
 }> = ({ orders, loading, canFetch, onRefresh, onCancel }) => {
   const [cancelling, setCancelling] = useState<string | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<OrderBookRow | null>(null);
+  const [query, setQuery] = useState('');
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [sortBy, setSortBy] = useState<'timestamp' | 'quantity' | 'price' | 'status'>('timestamp');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
 
   if (!canFetch) return (
     <div className="text-center py-12 text-gray-700 px-4">
@@ -899,14 +942,6 @@ const OrderBookTable: React.FC<{
   );
   if (loading) return <div className="flex items-center justify-center h-40"><RefreshCw size={20} className="text-blue-400 animate-spin" /></div>;
 
-  const handleCancel = async (row: OrderBookRow) => {
-    if (!window.confirm(`Cancel order ${String(row.order_id).slice(0, 12)}?`)) return;
-    setCancelling(String(row.order_id));
-    await onCancel(String(row.order_id), String(row.exchange_code || 'NFO'));
-    setCancelling(null);
-    onRefresh();
-  };
-
   const statusColor = (s: string) => {
     const l = s.toLowerCase();
     if (l.includes('complet')) return 'text-emerald-400';
@@ -914,6 +949,48 @@ const OrderBookTable: React.FC<{
     if (l.includes('reject'))  return 'text-red-400';
     if (l.includes('open') || l.includes('pend')) return 'text-amber-400';
     return 'text-gray-400';
+  };
+
+  const filtered = orders.filter(row => {
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    return [row.order_id, row.stock_code, row.status, row.action, row.right, row.strike_price]
+      .some(v => String(v ?? '').toLowerCase().includes(q));
+  });
+
+  const sorted = [...filtered].sort((a, b) => {
+    const tsA = extractTimestamp(a as Record<string, unknown>);
+    const tsB = extractTimestamp(b as Record<string, unknown>);
+    let cmp = 0;
+    if (sortBy === 'timestamp') cmp = tsA.localeCompare(tsB);
+    if (sortBy === 'quantity') cmp = asNumber(a.quantity) - asNumber(b.quantity);
+    if (sortBy === 'price') cmp = asNumber(a.price) - asNumber(b.price);
+    if (sortBy === 'status') cmp = String(a.status ?? '').localeCompare(String(b.status ?? ''));
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+
+  const toggleSort = (field: 'timestamp' | 'quantity' | 'price' | 'status') => {
+    if (sortBy === field) setSortDir(prev => (prev === 'asc' ? 'desc' : 'asc'));
+    else {
+      setSortBy(field);
+      setSortDir(field === 'timestamp' ? 'desc' : 'asc');
+    }
+  };
+
+  const handleCopy = async (orderId: string) => {
+    try {
+      await navigator.clipboard.writeText(orderId);
+      setCopiedId(orderId);
+      window.setTimeout(() => setCopiedId(null), 1200);
+    } catch {}
+  };
+
+  const executeCancel = async (row: OrderBookRow) => {
+    setCancelling(String(row.order_id));
+    await onCancel(String(row.order_id), String(row.exchange_code || 'NFO'));
+    setCancelling(null);
+    setCancelTarget(null);
+    onRefresh();
   };
 
   if (orders.length === 0) return (
@@ -926,9 +1003,15 @@ const OrderBookTable: React.FC<{
 
   return (
     <div>
-      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800/40">
-        <span className="text-gray-600 text-[10px]">{orders.length} orders today</span>
-        <button onClick={onRefresh} className="p-1 text-gray-600 hover:text-gray-300 rounded-lg"><RefreshCw size={11} /></button>
+      <div className="flex items-center justify-between gap-2 px-4 py-2 border-b border-gray-800/40">
+        <span className="text-gray-600 text-[10px]">{sorted.length}/{orders.length} orders</span>
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search size={11} className="absolute left-2 top-1.5 text-gray-600" />
+            <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search orders" className="pl-6 pr-2 py-1 bg-[#0e1018] border border-gray-700/40 rounded-lg text-[10px] text-white outline-none" />
+          </div>
+          <button onClick={onRefresh} className="p-1 text-gray-600 hover:text-gray-300 rounded-lg"><RefreshCw size={11} /></button>
+        </div>
       </div>
       <div className="overflow-auto">
         <table className="w-full text-[10px]">
@@ -936,26 +1019,31 @@ const OrderBookTable: React.FC<{
             <tr className="border-b border-gray-800/50 text-gray-600 text-[9px]">
               <th className="px-3 py-2 text-left font-semibold">Order ID</th>
               <th className="px-3 py-2 text-left font-semibold">Instrument</th>
+              <th className="px-3 py-2 text-left font-semibold cursor-pointer" onClick={() => toggleSort('timestamp')}>Time</th>
               <th className="px-3 py-2 text-center font-semibold">B/S</th>
-              <th className="px-3 py-2 text-right font-semibold">Qty</th>
-              <th className="px-3 py-2 text-right font-semibold">Price</th>
+              <th className="px-3 py-2 text-right font-semibold cursor-pointer" onClick={() => toggleSort('quantity')}>Qty</th>
+              <th className="px-3 py-2 text-right font-semibold cursor-pointer" onClick={() => toggleSort('price')}>Price</th>
               <th className="px-3 py-2 text-center font-semibold">Type</th>
-              <th className="px-3 py-2 text-center font-semibold">Status</th>
+              <th className="px-3 py-2 text-center font-semibold cursor-pointer" onClick={() => toggleSort('status')}>Status</th>
               <th className="px-3 py-2 text-center font-semibold">Action</th>
             </tr>
           </thead>
           <tbody>
-            {orders.map((row, i) => {
+            {sorted.map((row, i) => {
               const isBuy     = String(row.action || '').toLowerCase() === 'buy';
               const statusStr = String(row.status || '').toLowerCase();
               const isPending = statusStr.includes('open') || statusStr.includes('pend');
+              const rowId = String(row.order_id || '');
               return (
-                <tr key={String(row.order_id) + i} className="border-b border-gray-800/20 hover:bg-gray-800/10 transition-colors">
-                  <td className="px-3 py-2 mono text-gray-500 text-[9px]">{String(row.order_id || '').slice(0, 12)}...</td>
+                <tr key={rowId + i} className="border-b border-gray-800/20 hover:bg-gray-800/10 transition-colors">
+                  <td className="px-3 py-2 mono text-gray-500 text-[9px]">
+                    <button onClick={() => handleCopy(rowId)} className="inline-flex items-center gap-1 hover:text-white">{rowId.slice(0, 12)}...{copiedId === rowId ? <Check size={10} className="text-emerald-400" /> : <Copy size={10} />}</button>
+                  </td>
                   <td className="px-3 py-2 mono">
                     <span className="text-white font-semibold">{String(row.stock_code || '')}</span>
                     {row.strike_price && <span className="text-gray-600 ml-1">{String(row.strike_price)} {String(row.right || '').toUpperCase()}</span>}
                   </td>
+                  <td className="px-3 py-2 text-gray-500">{extractTimestamp(row as Record<string, unknown>)}</td>
                   <td className="px-3 py-2 text-center">
                     <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded-md ${isBuy ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'}`}>
                       {String(row.action || '').toUpperCase()}
@@ -970,7 +1058,7 @@ const OrderBookTable: React.FC<{
                   <td className="px-3 py-2 text-center">
                     {isPending && (
                       <button
-                        onClick={() => handleCancel(row)}
+                        onClick={() => setCancelTarget(row)}
                         disabled={cancelling === String(row.order_id)}
                         className="px-2 py-0.5 bg-red-500/15 hover:bg-red-500/25 text-red-400 rounded-lg text-[9px] font-semibold disabled:opacity-40"
                       >
@@ -984,6 +1072,16 @@ const OrderBookTable: React.FC<{
           </tbody>
         </table>
       </div>
+
+      {cancelTarget && (
+        <div className="m-3 rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-[11px]">
+          <p className="text-red-200">Cancel order <span className="mono">{String(cancelTarget.order_id).slice(0, 16)}...</span>?</p>
+          <div className="mt-2 flex gap-2">
+            <button onClick={() => setCancelTarget(null)} className="px-2 py-1 bg-gray-700/50 rounded-lg text-gray-300">Keep</button>
+            <button onClick={() => executeCancel(cancelTarget)} className="px-2 py-1 bg-red-600 rounded-lg text-white">Confirm cancel</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -998,6 +1096,10 @@ const TradeBookTable: React.FC<{
   canFetch:  boolean;
   onRefresh: () => void;
 }> = ({ trades, loading, canFetch, onRefresh }) => {
+  const [query, setQuery] = useState('');
+  const [sortBy, setSortBy] = useState<'timestamp' | 'quantity' | 'price'>('timestamp');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
+
   if (!canFetch) return (
     <div className="text-center py-12 text-gray-700 px-4">
       <List size={32} className="mx-auto mb-2 opacity-15" />
@@ -1013,25 +1115,57 @@ const TradeBookTable: React.FC<{
     </div>
   );
 
+  const filtered = trades.filter(row => {
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    return [row.order_id, row.stock_code, row.action, row.right, row.strike_price]
+      .some(v => String(v ?? '').toLowerCase().includes(q));
+  });
+
+  const sorted = [...filtered].sort((a, b) => {
+    const tsA = extractTimestamp(a as Record<string, unknown>);
+    const tsB = extractTimestamp(b as Record<string, unknown>);
+    let cmp = 0;
+    if (sortBy === 'timestamp') cmp = tsA.localeCompare(tsB);
+    if (sortBy === 'quantity') cmp = asNumber(a.quantity) - asNumber(b.quantity);
+    if (sortBy === 'price') cmp = asNumber(a.trade_price ?? a.price) - asNumber(b.trade_price ?? b.price);
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+
+  const toggleSort = (field: 'timestamp' | 'quantity' | 'price') => {
+    if (sortBy === field) setSortDir(prev => (prev === 'asc' ? 'desc' : 'asc'));
+    else {
+      setSortBy(field);
+      setSortDir(field === 'timestamp' ? 'desc' : 'asc');
+    }
+  };
+
   return (
     <div>
-      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800/40">
-        <span className="text-gray-600 text-[10px]">{trades.length} trades today</span>
-        <button onClick={onRefresh} className="p-1 text-gray-600 hover:text-gray-300 rounded-lg"><RefreshCw size={11} /></button>
+      <div className="flex items-center justify-between gap-2 px-4 py-2 border-b border-gray-800/40">
+        <span className="text-gray-600 text-[10px]">{sorted.length}/{trades.length} trades</span>
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search size={11} className="absolute left-2 top-1.5 text-gray-600" />
+            <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search trades" className="pl-6 pr-2 py-1 bg-[#0e1018] border border-gray-700/40 rounded-lg text-[10px] text-white outline-none" />
+          </div>
+          <button onClick={onRefresh} className="p-1 text-gray-600 hover:text-gray-300 rounded-lg"><RefreshCw size={11} /></button>
+        </div>
       </div>
       <div className="overflow-auto">
         <table className="w-full text-[10px]">
           <thead className="bg-[#0e1018] sticky top-0">
             <tr className="border-b border-gray-800/50 text-gray-600 text-[9px]">
               <th className="px-3 py-2 text-left font-semibold">Instrument</th>
+              <th className="px-3 py-2 text-left font-semibold cursor-pointer" onClick={() => toggleSort('timestamp')}>Time</th>
               <th className="px-3 py-2 text-center font-semibold">B/S</th>
-              <th className="px-3 py-2 text-right font-semibold">Qty</th>
-              <th className="px-3 py-2 text-right font-semibold">Trade Price</th>
+              <th className="px-3 py-2 text-right font-semibold cursor-pointer" onClick={() => toggleSort('quantity')}>Qty</th>
+              <th className="px-3 py-2 text-right font-semibold cursor-pointer" onClick={() => toggleSort('price')}>Trade Price</th>
               <th className="px-3 py-2 text-right font-semibold">Expiry</th>
             </tr>
           </thead>
           <tbody>
-            {trades.map((row, i) => {
+            {sorted.map((row, i) => {
               const isBuy = String(row.action || '').toLowerCase() === 'buy';
               return (
                 <tr key={String(row.order_id) + i} className="border-b border-gray-800/20 hover:bg-gray-800/10">
@@ -1039,6 +1173,7 @@ const TradeBookTable: React.FC<{
                     <span className="text-white font-semibold">{String(row.stock_code || '')}</span>
                     {row.strike_price && <span className="text-gray-600 ml-1">{String(row.strike_price)} {String(row.right || '').toUpperCase()}</span>}
                   </td>
+                  <td className="px-3 py-2 text-gray-500">{extractTimestamp(row as Record<string, unknown>)}</td>
                   <td className="px-3 py-2 text-center">
                     <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded-md ${isBuy ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'}`}>
                       {String(row.action || '').toUpperCase()}
@@ -1124,7 +1259,7 @@ const PositionCard: React.FC<{
           {pos.status === 'ACTIVE' && (
             <button
               onClick={() => {
-                if (!canFetch) { alert('Connect to Kaggle backend first to place live orders.'); return; }
+                if (!canFetch) return;
                 onSquareOff?.(pos);
               }}
               className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[9px] font-bold transition-all border ${
@@ -1212,8 +1347,13 @@ export const Positions: React.FC<Props> = ({
   const [funds,    setFunds]    = useState<FundsData | null>(null);
   const [orders,   setOrders]   = useState<OrderBookRow[]>([]);
   const [trades,   setTrades]   = useState<TradeBookRow[]>([]);
-  const [loading,  setLoading]  = useState(false);
+  const [fundsLoading,  setFundsLoading]  = useState(false);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+  const [tradesLoading, setTradesLoading] = useState(false);
   const [error,    setError]    = useState<string | null>(null);
+  const [toast,    setToast]    = useState<string | null>(null);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [refreshTick, setRefreshTick] = useState(20);
   const [sqOffPos, setSqOffPos] = useState<Position | null>(null);
 
   const positions = resolvePositions(liveFlag, livePositions);
@@ -1221,38 +1361,47 @@ export const Positions: React.FC<Props> = ({
   const totalMtm  = positions.filter(p => p.status === 'ACTIVE').reduce((s, p) => s + p.mtmPnl, 0);
   const active    = positions.filter(p => p.status === 'ACTIVE').length;
 
-  const firstActive = positions.find(p => p.status === 'ACTIVE');
-  const tradeSym    = (firstActive?.symbol as SymbolCode) ?? 'NIFTY';
-  const tradeExpiry = firstActive?.expiry ?? '';
+  const symbolChoices = Array.from(new Set(positions.map(p => p.symbol as SymbolCode)));
+  const expiryChoices = Array.from(new Set(positions.map(p => p.expiry))).filter(Boolean);
+  const [tradeSym, setTradeSym] = useState<SymbolCode>((symbolChoices[0] ?? 'NIFTY') as SymbolCode);
+  const [tradeExpiry, setTradeExpiry] = useState<string>(expiryChoices[0] ?? '');
+
+  useEffect(() => {
+    if (!symbolChoices.includes(tradeSym)) setTradeSym((symbolChoices[0] ?? 'NIFTY') as SymbolCode);
+  }, [symbolChoices, tradeSym]);
+
+  useEffect(() => {
+    if (!expiryChoices.includes(tradeExpiry)) setTradeExpiry(expiryChoices[0] ?? '');
+  }, [expiryChoices, tradeExpiry]);
 
   const loadFunds  = useCallback(async () => {
     if (!canFetch) return;
-    setLoading(true); setError(null);
+    setFundsLoading(true); setError(null);
     try {
       const r = await fetchFunds(backendUrl);
       if (r.ok) setFunds(r.data ?? null); else setError(r.error ?? 'Failed to fetch funds');
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setLoading(false); }
+    finally { setFundsLoading(false); }
   }, [canFetch, backendUrl]);
 
   const loadOrders = useCallback(async () => {
     if (!canFetch) return;
-    setLoading(true); setError(null);
+    setOrdersLoading(true); setError(null);
     try {
       const r = await fetchOrderBook(backendUrl);
       if (r.ok) setOrders(r.data); else setError(r.error ?? 'Failed');
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setLoading(false); }
+    finally { setOrdersLoading(false); }
   }, [canFetch, backendUrl]);
 
   const loadTrades = useCallback(async () => {
     if (!canFetch) return;
-    setLoading(true); setError(null);
+    setTradesLoading(true); setError(null);
     try {
       const r = await fetchTradeBook(backendUrl);
       if (r.ok) setTrades(r.data); else setError(r.error ?? 'Failed');
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setLoading(false); }
+    finally { setTradesLoading(false); }
   }, [canFetch, backendUrl]);
 
   useEffect(() => {
@@ -1261,17 +1410,45 @@ export const Positions: React.FC<Props> = ({
     if (subTab === 'trades') loadTrades();
   }, [subTab, loadFunds, loadOrders, loadTrades]);
 
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 2200);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  useEffect(() => {
+    if (!canFetch || !autoRefresh || !['orders', 'trades', 'funds'].includes(subTab)) return;
+    const timer = window.setInterval(() => {
+      setRefreshTick(prev => {
+        if (prev <= 1) {
+          if (subTab === 'orders') loadOrders();
+          if (subTab === 'trades') loadTrades();
+          if (subTab === 'funds') loadFunds();
+          return 20;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [canFetch, autoRefresh, subTab, loadOrders, loadTrades, loadFunds]);
+
+  useEffect(() => {
+    setRefreshTick(20);
+  }, [subTab, autoRefresh]);
+
   const handleCancel = useCallback(async (orderId: string, exchange: string) => {
-    if (!canFetch) { alert('Connect Kaggle backend to cancel orders.'); return; }
+    if (!canFetch) { setError('Connect Kaggle backend to cancel orders.'); return; }
     const r = await cancelOrder(backendUrl, orderId, exchange);
-    if (!r.ok) alert(`Cancel failed: ${r.error ?? 'Unknown error'}`);
+    if (!r.ok) setError(`Cancel failed: ${r.error ?? 'Unknown error'}`);
+    else setToast(`Order ${orderId.slice(0, 10)}... cancelled`);
   }, [canFetch, backendUrl]);
 
-  const SUB_TABS: { id: SubTab; label: string; icon: React.ReactNode }[] = [
-    { id: 'positions', label: 'Positions',     icon: <BarChart3 size={10} /> },
+  const SUB_TABS: { id: SubTab; label: string; icon: React.ReactNode; badge?: number }[] = [
+    { id: 'positions', label: 'Positions',     icon: <BarChart3 size={10} />, badge: filtered.length },
     { id: 'trade',     label: 'Trade Options', icon: <Activity size={10} /> },
-    { id: 'orders',    label: 'Order Book',    icon: <BookOpen size={10} /> },
-    { id: 'trades',    label: 'Trade Book',    icon: <List size={10} /> },
+    { id: 'sell',      label: 'Sell Orders',   icon: <TrendingDown size={10} />, badge: orders.filter(o => String(o.action || '').toLowerCase() === 'sell').length },
+    { id: 'orders',    label: 'Order Book',    icon: <BookOpen size={10} />, badge: orders.length },
+    { id: 'trades',    label: 'Trade Book',    icon: <List size={10} />, badge: trades.length },
     { id: 'funds',     label: 'Funds',         icon: <DollarSign size={10} /> },
   ];
 
@@ -1304,22 +1481,37 @@ export const Positions: React.FC<Props> = ({
                   : 'text-gray-600 hover:text-white hover:bg-gray-700/40'
               }`}>
               {t.icon}{t.label}
+              {typeof t.badge === 'number' && (
+                <span className="ml-1 px-1.5 py-0.5 rounded-full bg-gray-800/80 text-[9px] text-gray-300">{t.badge}</span>
+              )}
               {t.id === 'trade' && !canFetch && (
                 <span className="text-[8px] text-gray-600 ml-0.5">·needs backend</span>
               )}
             </button>
           ))}
 
-          <div className="ml-auto text-[9px]">
+          <div className="ml-auto flex items-center gap-2 text-[9px]">
+            {['orders', 'trades', 'funds'].includes(subTab) && canFetch && (
+              <button onClick={() => setAutoRefresh(v => !v)} className="px-2 py-1 rounded-lg border border-gray-700/40 text-gray-400 hover:text-white">
+                {autoRefresh ? `Auto ${refreshTick}s` : 'Auto off'}
+              </button>
+            )}
             {canFetch
               ? <span className="text-emerald-400 flex items-center gap-1">
                   <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full pulse-dot" />LIVE · Breeze API
                 </span>
               : liveFlag
-                ? <span className="text-amber-500/70">Connected · loading...</span>
+                ? <span className="text-amber-500/70">Connected · awaiting live validation</span>
                 : <span className="text-gray-700">Demo · connect Kaggle for live data</span>}
           </div>
         </div>
+
+        {toast && (
+          <div className="flex items-center gap-2 p-2.5 mb-3 bg-emerald-500/8 border border-emerald-500/20 rounded-xl text-[11px] text-emerald-300">
+            <CheckCircle size={12} className="flex-shrink-0" />
+            <span>{toast}</span>
+          </div>
+        )}
 
         {error && (
           <div className="flex items-center gap-2 p-2.5 mb-3 bg-red-500/8 border border-red-500/20 rounded-xl text-[11px] text-red-300">
@@ -1389,12 +1581,24 @@ export const Positions: React.FC<Props> = ({
       {/* ── Trade Options tab ── */}
       {subTab === 'trade' && (
         canFetch ? (
-          <TradeOptionsPanel
-            backendUrl={backendUrl}
-            symbol={tradeSym}
-            expiry={tradeExpiry}
-            onDone={() => { if (onRefreshPositions) onRefreshPositions(); }}
-          />
+          <div className="space-y-3">
+            <div className="mx-4 rounded-2xl border border-gray-700/30 bg-[#1a1d2e] p-3 flex items-center gap-3">
+              <label className="text-[10px] text-gray-500">Symbol</label>
+              <select value={tradeSym} onChange={e => setTradeSym(e.target.value as SymbolCode)} className="bg-[#0e1018] border border-gray-700/50 rounded-lg px-2 py-1 text-[11px] text-white">
+                {(symbolChoices.length ? symbolChoices : ['NIFTY']).map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+              <label className="text-[10px] text-gray-500">Expiry</label>
+              <select value={tradeExpiry} onChange={e => setTradeExpiry(e.target.value)} className="bg-[#0e1018] border border-gray-700/50 rounded-lg px-2 py-1 text-[11px] text-white">
+                {(expiryChoices.length ? expiryChoices : ['']).map(ex => <option key={ex || 'none'} value={ex}>{ex || 'Select expiry'}</option>)}
+              </select>
+            </div>
+            <TradeOptionsPanel
+              backendUrl={backendUrl}
+              symbol={tradeSym}
+              expiry={tradeExpiry}
+              onDone={() => { if (onRefreshPositions) onRefreshPositions(); }}
+            />
+          </div>
         ) : (
           <div className="text-center py-16 text-gray-700 px-4">
             <Activity size={36} className="mx-auto mb-3 opacity-15" />
@@ -1404,24 +1608,37 @@ export const Positions: React.FC<Props> = ({
         )
       )}
 
+      {/* ── Sell Orders tab ── */}
+      {subTab === 'sell' && (
+        <div className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden">
+          <OrderBookTable
+            orders={orders.filter(o => String(o.action || '').toLowerCase() === 'sell')}
+            loading={ordersLoading}
+            canFetch={canFetch}
+            onRefresh={loadOrders}
+            onCancel={handleCancel}
+          />
+        </div>
+      )}
+
       {/* ── Orders tab ── */}
       {subTab === 'orders' && (
         <div className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden">
-          <OrderBookTable orders={orders} loading={loading} canFetch={canFetch} onRefresh={loadOrders} onCancel={handleCancel} />
+          <OrderBookTable orders={orders} loading={ordersLoading} canFetch={canFetch} onRefresh={loadOrders} onCancel={handleCancel} />
         </div>
       )}
 
       {/* ── Trades tab ── */}
       {subTab === 'trades' && (
         <div className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden">
-          <TradeBookTable trades={trades} loading={loading} canFetch={canFetch} onRefresh={loadTrades} />
+          <TradeBookTable trades={trades} loading={tradesLoading} canFetch={canFetch} onRefresh={loadTrades} />
         </div>
       )}
 
       {/* ── Funds tab ── */}
       {subTab === 'funds' && (
         <div className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden">
-          <FundsDashboard funds={funds} loading={loading} canFetch={canFetch} onRefresh={loadFunds} />
+          <FundsDashboard funds={funds} loading={fundsLoading} canFetch={canFetch} onRefresh={loadFunds} />
         </div>
       )}
 
