@@ -132,8 +132,6 @@ class RateLimiter:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TickStore
-# Thread-safe store updated by WebSocket on_ticks callback
-# Versioned so frontend only gets payloads when data actually changes
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TickStore:
@@ -193,12 +191,6 @@ class TickStore:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BreezeEngine
-# Wraps the official breeze-connect SDK with:
-#   - session management
-#   - REST rate limiting
-#   - WebSocket streaming + TickStore
-#   - order management (place, cancel, modify, square-off)
-#   - portfolio: positions, holdings, funds, orders, trades
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BreezeEngine:
@@ -224,7 +216,6 @@ class BreezeEngine:
         self.api_secret = api_secret
         log.info(f"[Engine] connect — key:{api_key[:8]}... token:{session_token[:8]}...")
         b = BreezeConnect(api_key=api_key)
-        # Official SDK handles /customerdetails with correct checksum internally
         b.generate_session(api_secret=api_secret, session_token=session_token)
         self.breeze      = b
         self.session_key = b.session_key
@@ -253,18 +244,17 @@ class BreezeEngine:
 
     def disconnect(self) -> None:
         self._stop_ws()
-        self.breeze = None
+        self.breeze      = None
         self.session_key = ""
-        self.connected = False
+        self.connected   = False
         self.subscribed.clear()
         self.tick_store.clear()
         log.info("[Engine] disconnected")
 
-    # ── Checksum utility ──────────────────────────────────────────────────────
+    # ── Checksum ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def generate_checksum(timestamp: str, payload: dict, secret: str) -> str:
-        """SHA256(timestamp + json.dumps(payload) + secret) — matches SDK exactly."""
         body_str = json.dumps(payload)
         return hashlib.sha256((timestamp + body_str + secret).encode("utf-8")).hexdigest()
 
@@ -272,18 +262,13 @@ class BreezeEngine:
 
     @staticmethod
     def get_weekly_expiries(stock_code: str, count: int = 5) -> List[dict]:
-        """
-        NIFTY  → Tuesday  (weekday 1, 0=Mon … 6=Sun)
-        SENSEX → Thursday (weekday 3)
-        """
         is_sensex  = "SENSEX" in stock_code.upper() or "BSESEN" in stock_code.upper()
-        target_day = 3 if is_sensex else 1   # Thu or Tue
+        target_day = 3 if is_sensex else 1
         today      = datetime.now().date()
         results    = []
         for i in range(60):
             d = today + timedelta(days=i)
             if d.weekday() == target_day:
-                # Skip today if market already closed (10:00 UTC ≈ 15:30 IST)
                 if i == 0 and datetime.utcnow().hour >= 10:
                     continue
                 results.append({
@@ -298,7 +283,6 @@ class BreezeEngine:
         return results
 
     # ── REST: Option Chain ────────────────────────────────────────────────────
-    # Called ONCE per expiry change — NEVER in any loop
 
     def fetch_option_chain(
         self,
@@ -327,14 +311,12 @@ class BreezeEngine:
         result = self.rate_limiter.enqueue(_call)
         rows   = result.get("Success") if isinstance(result, dict) else []
 
-        # Seed TickStore with REST snapshot → UI loads instantly
         if rows:
             suffix = "CE" if right_norm == "Call" else "PE"
             for row in rows:
                 try:
                     strike = str(int(float(
-                        row.get("strike_price") or
-                        row.get("strike-price") or 0
+                        row.get("strike_price") or row.get("strike-price") or 0
                     )))
                     key = f"{stock_code}:{strike}:{suffix}"
                     self.tick_store.update(key, {
@@ -375,7 +357,7 @@ class BreezeEngine:
 
         return self.rate_limiter.enqueue(_call)
 
-    # ── REST: Order Management ────────────────────────────────────────────────
+    # ── REST: Orders ──────────────────────────────────────────────────────────
 
     def place_order(self, leg: dict) -> dict:
         if not self.connected:
@@ -405,7 +387,6 @@ class BreezeEngine:
         return self.rate_limiter.enqueue(_call)
 
     def place_strategy_order(self, legs: List[dict]) -> List[dict]:
-        """Place multiple legs concurrently — RateLimiter serialises API calls."""
         if not self.connected:
             raise RuntimeError("Not connected")
 
@@ -415,8 +396,8 @@ class BreezeEngine:
 
         def place_one(leg: dict, idx: int):
             try:
-                r  = self.place_order(leg)
-                ok = isinstance(r, dict) and r.get("Status") == 200
+                r   = self.place_order(leg)
+                ok  = isinstance(r, dict) and r.get("Status") == 200
                 oid = (r.get("Success") or {}).get("order_id", "") if ok else ""
                 with results_lock:
                     results.append({
@@ -442,9 +423,9 @@ class BreezeEngine:
         return results
 
     def square_off_position(self, leg: dict) -> dict:
-        """Exit a position by placing the opposite action."""
         original = (leg.get("action") or "buy").lower()
-        exit_leg = {**leg, "action": "sell" if original == "buy" else "buy",
+        exit_leg = {**leg,
+                    "action":      "sell" if original == "buy" else "buy",
                     "user_remark": "SquareOff_OptionsTerminal"}
         return self.place_order(exit_leg)
 
@@ -484,7 +465,7 @@ class BreezeEngine:
 
         return self.rate_limiter.enqueue(_call)
 
-    # ── REST: Books ───────────────────────────────────────────────────────────
+    # ── REST: Books & Portfolio ───────────────────────────────────────────────
 
     def get_order_book(self) -> dict:
         if not self.connected:
@@ -507,8 +488,6 @@ class BreezeEngine:
             from_date=now.strftime("%Y-%m-%dT00:00:00.000Z"),
             to_date=now.strftime("%Y-%m-%dT23:59:59.000Z"),
         )
-
-    # ── REST: Portfolio ───────────────────────────────────────────────────────
 
     def get_positions(self) -> dict:
         if not self.connected:
@@ -612,7 +591,6 @@ class BreezeEngine:
 
             self._ws_thread = threading.Thread(target=_run, daemon=True, name="BreezeWS")
             self._ws_thread.start()
-            # Wait up to 15s for WS to establish
             deadline = time.time() + 15
             while not self.ws_running and time.time() < deadline:
                 time.sleep(0.5)
@@ -698,18 +676,11 @@ class BreezeEngine:
 # ── Singleton ──────────────────────────────────────────────────────────────────
 engine = BreezeEngine()
 
-# ── Backend auth token (optional — protects public tunnels) ──────────────────
-# FIX (Bug #1): Auth is now OPTIONAL.
-#   • If TERMINAL_AUTH_TOKEN env var is set → enforce it (good for production)
-#   • If not set → auth is DISABLED, all requests pass through
-#
-# To enable: in Kaggle notebook, add a cell BEFORE this one:
-#   import os; os.environ["TERMINAL_AUTH_TOKEN"] = "my-secret-token"
-# Then set the same value as KAGGLE_TERMINAL_AUTH in Vercel env vars.
-#
-# Without auth (default): tunnel URL alone acts as the secret.
-BACKEND_AUTH_TOKEN = os.environ.get("TERMINAL_AUTH_TOKEN") or ""
-AUTH_ENABLED = bool(BACKEND_AUTH_TOKEN)
+# ── Auth configuration ────────────────────────────────────────────────────────
+# Auth is OPTIONAL. If TERMINAL_AUTH_TOKEN env var is set → enforced.
+# Default (no env var) → open, tunnel URL is the only "secret".
+BACKEND_AUTH_TOKEN = os.environ.get("TERMINAL_AUTH_TOKEN", "")
+AUTH_ENABLED       = bool(BACKEND_AUTH_TOKEN)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -730,16 +701,17 @@ app.add_middleware(
 
 
 def _is_authed(request: Request) -> bool:
-    # FIX (Bug #1): If auth is not configured, allow everything
     if not AUTH_ENABLED:
         return True
-    token = request.headers.get("x-terminal-auth") or request.headers.get("X-Terminal-Auth") or ""
+    token = (
+        request.headers.get("x-terminal-auth") or
+        request.headers.get("X-Terminal-Auth") or ""
+    )
     return token == BACKEND_AUTH_TOKEN
 
 
 @app.middleware("http")
 async def cors_everywhere(request: Request, call_next):
-    # CORS preflight
     if request.method == "OPTIONS":
         return Response(
             status_code=200,
@@ -751,17 +723,11 @@ async def cors_everywhere(request: Request, call_next):
             },
         )
 
-    # Protect ALL /api/* endpoints with a shared-secret header.
-    # (Tunnel URLs are public; without this, anyone can place real orders.)
-    if request.url.path.startswith("/api/"):
-        if not _is_authed(request):
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "success": False,
-                    "error": "Unauthorized. Missing/invalid X-Terminal-Auth header.",
-                },
-            )
+    if request.url.path.startswith("/api/") and not _is_authed(request):
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "error": "Unauthorized — missing/invalid X-Terminal-Auth"},
+        )
 
     response = await call_next(request)
     response.headers["Access-Control-Allow-Origin"]  = "*"
@@ -784,32 +750,19 @@ async def options_handler(path: str):
 # ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/")
-async def root():
-    return {
-        "status":          "online",
-        "connected":       engine.connected,
-        "ws_running":      engine.ws_running,
-        "subscriptions":   len(engine.subscribed),
-        "tick_count":      len(engine.tick_store.get_all()["ticks"]),
-        "rest_calls_min":  engine.rate_limiter.calls_last_minute,
-        "queue_depth":     engine.rate_limiter.queue_depth,
-        "version":         "7.0",
-        "timestamp":       datetime.utcnow().isoformat() + "Z",
-    }
-
-
 @app.get("/health")
-async def health():
+async def health(request: Request):
     return {
-        "status":          "online",
-        "connected":       engine.connected,
-        "ws_running":      engine.ws_running,
-        "subscriptions":   len(engine.subscribed),
-        "tick_count":      len(engine.tick_store.get_all()["ticks"]),
-        "rest_calls_min":  engine.rate_limiter.calls_last_minute,
-        "queue_depth":     engine.rate_limiter.queue_depth,
-        "version":         "7.0",
-        "timestamp":       datetime.utcnow().isoformat() + "Z",
+        "status":         "online",
+        "connected":      engine.connected,
+        "ws_running":     engine.ws_running,
+        "subscriptions":  len(engine.subscribed),
+        "tick_count":     len(engine.tick_store.get_all()["ticks"]),
+        "rest_calls_min": engine.rate_limiter.calls_last_minute,
+        "queue_depth":    engine.rate_limiter.queue_depth,
+        "auth_enabled":   AUTH_ENABLED,
+        "version":        "7.0",
+        "timestamp":      datetime.utcnow().isoformat() + "Z",
     }
 
 
@@ -849,7 +802,7 @@ async def api_connect(request: Request):
     except Exception as exc:
         msg  = str(exc)
         hint = (
-            " → Token stale, get a fresh ?apisession= today."
+            " → Token stale — get a fresh ?apisession= today."
             if "null" in msg.lower()
             else " → Check API Key/Secret."
             if "key" in msg.lower()
@@ -878,7 +831,7 @@ async def api_expiries(
     return {"success": True, "stock_code": stock_code, "expiries": expiries}
 
 
-# ── Option Chain (REST snapshot — called ONCE per expiry) ──────────────────────
+# ── Option Chain ──────────────────────────────────────────────────────────────
 
 @app.get("/api/optionchain")
 async def api_optionchain(
@@ -889,7 +842,7 @@ async def api_optionchain(
     strike_price:  str           = Query(""),
 ):
     if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected. POST /api/connect first.")
+        raise HTTPException(status_code=401, detail="Not connected — POST /api/connect first")
 
     right_norm = "Call" if (right or "Call").lower().startswith("c") else "Put"
     try:
@@ -960,12 +913,12 @@ async def api_ws_subscribe(request: Request):
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
-# ── WebSocket streaming (frontend connects here) ───────────────────────────────
+# ── WebSocket tick stream (frontend connects here) ────────────────────────────
 
 @app.websocket("/ws/ticks")
 async def ws_ticks(websocket: WebSocket):
     await websocket.accept()
-    log.info(f"[WS endpoint] frontend connected: {websocket.client}")
+    log.info(f"[WS] frontend connected: {websocket.client}")
     last_version      = -1
     heartbeat_counter = 0
     try:
@@ -992,9 +945,9 @@ async def ws_ticks(websocket: WebSocket):
                 "ws_live": engine.ws_running,
             })
     except WebSocketDisconnect:
-        log.info("[WS endpoint] frontend disconnected")
+        log.info("[WS] frontend disconnected")
     except Exception as exc:
-        log.warning(f"[WS endpoint] error: {exc}")
+        log.warning(f"[WS] error: {exc}")
 
 
 # ── Tick REST fallback ─────────────────────────────────────────────────────────
@@ -1062,10 +1015,6 @@ async def api_strategy_execute(request: Request):
 
 @app.post("/api/squareoff")
 async def api_squareoff(request: Request):
-    """
-    Square off (exit) a position.
-    Send the same body as /api/order — backend reverses the action automatically.
-    """
     if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
@@ -1138,7 +1087,7 @@ async def api_modify_order(request: Request):
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
-# ── Order Book / Trade Book ────────────────────────────────────────────────────
+# ── Books ──────────────────────────────────────────────────────────────────────
 
 @app.get("/api/orders")
 async def api_order_book():
@@ -1162,7 +1111,7 @@ async def api_trade_book():
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
-# ── Positions / Holdings ───────────────────────────────────────────────────────
+# ── Positions / Funds ──────────────────────────────────────────────────────────
 
 @app.get("/api/positions")
 async def api_positions():
@@ -1175,8 +1124,6 @@ async def api_positions():
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
-# ── Funds ──────────────────────────────────────────────────────────────────────
-
 @app.get("/api/funds")
 async def api_funds():
     if not engine.connected:
@@ -1188,7 +1135,7 @@ async def api_funds():
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
-# ── Historical Data ────────────────────────────────────────────────────────────
+# ── Historical ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/historical")
 async def api_historical(
@@ -1215,7 +1162,7 @@ async def api_historical(
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
-# ── Rate limit status ──────────────────────────────────────────────────────────
+# ── Rate limit / Checksum ──────────────────────────────────────────────────────
 
 @app.get("/api/ratelimit")
 async def api_ratelimit():
@@ -1226,8 +1173,6 @@ async def api_ratelimit():
         "queue_depth":       engine.rate_limiter.queue_depth,
     }
 
-
-# ── Checksum verify ────────────────────────────────────────────────────────────
 
 @app.post("/api/checksum")
 async def api_checksum(request: Request):
@@ -1276,26 +1221,24 @@ def try_localhost_run() -> Optional[str]:
     if not shutil.which("ssh"):
         return None
     try:
-        print("  Trying localhost.run (SSH)...")
         log_path = "/tmp/lhr.log"
-        with open(log_path, "w") as lf:
-            subprocess.Popen(
-                ["ssh", "-R", "80:localhost:8000",
-                 "-o", "StrictHostKeyChecking=no",
-                 "-o", "ServerAliveInterval=30",
-                 "-o", "ConnectTimeout=15",
-                 "nokey@localhost.run"],
-                stdout=lf, stderr=subprocess.STDOUT,
-            )
-        pat = re.compile(r"https://[a-z0-9\-]+\.lhr\.life")
+        open(log_path, "w").close()
+        subprocess.Popen(
+            ["ssh", "-R", "80:localhost:8000",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "ServerAliveInterval=30",
+             "-o", "ConnectTimeout=15",
+             "nokey@localhost.run"],
+            stdout=open(log_path, "a"), stderr=subprocess.STDOUT,
+        )
+        pat      = re.compile(r"https://[a-z0-9\-]+\.lhr\.life")
         deadline = time.time() + 40
         while time.time() < deadline:
             time.sleep(2)
             try:
-                with open(log_path) as f:
-                    m = pat.search(f.read())
-                    if m:
-                        return m.group(0)
+                m = pat.search(open(log_path).read())
+                if m:
+                    return m.group(0)
             except Exception:
                 pass
     except Exception:
@@ -1307,26 +1250,24 @@ def try_serveo() -> Optional[str]:
     if not shutil.which("ssh"):
         return None
     try:
-        print("  Trying serveo.net (SSH)...")
         log_path = "/tmp/serveo.log"
-        with open(log_path, "w") as lf:
-            subprocess.Popen(
-                ["ssh", "-R", "80:localhost:8000",
-                 "-o", "StrictHostKeyChecking=no",
-                 "-o", "ServerAliveInterval=30",
-                 "-o", "ConnectTimeout=15",
-                 "serveo.net"],
-                stdout=lf, stderr=subprocess.STDOUT,
-            )
-        pat = re.compile(r"https://[a-z0-9]+\.serveo\.net")
+        open(log_path, "w").close()
+        subprocess.Popen(
+            ["ssh", "-R", "80:localhost:8000",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "ServerAliveInterval=30",
+             "-o", "ConnectTimeout=15",
+             "serveo.net"],
+            stdout=open(log_path, "a"), stderr=subprocess.STDOUT,
+        )
+        pat      = re.compile(r"https://[a-z0-9]+\.serveo\.net")
         deadline = time.time() + 40
         while time.time() < deadline:
             time.sleep(2)
             try:
-                with open(log_path) as f:
-                    m = pat.search(f.read())
-                    if m:
-                        return m.group(0)
+                m = pat.search(open(log_path).read())
+                if m:
+                    return m.group(0)
             except Exception:
                 pass
     except Exception:
@@ -1344,58 +1285,54 @@ def try_cloudflare() -> Optional[str]:
                 cf,
             )
             os.chmod(cf, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
-            print("  cloudflared downloaded")
+            print("  cloudflared ready")
         except Exception as exc:
             print(f"  cloudflared download failed: {exc}")
             return None
 
     log_path = "/tmp/cf.log"
-    # Clear log before starting
     open(log_path, "w").close()
-
     try:
-        with open(log_path, "a") as lf:
-            subprocess.Popen(
-                [cf, "tunnel", "--url", "http://localhost:8000", "--no-autoupdate"],
-                stdout=lf,
-                stderr=subprocess.STDOUT,
-            )
-        pat = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+        subprocess.Popen(
+            [cf, "tunnel", "--url", "http://localhost:8000", "--no-autoupdate"],
+            stdout=open(log_path, "a"), stderr=subprocess.STDOUT,
+        )
+        pat      = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
         deadline = time.time() + 90
         while time.time() < deadline:
             time.sleep(3)
             try:
-                with open(log_path) as f:
-                    urls = pat.findall(f.read())
-                    if urls:
-                        return urls[-1]
+                urls = pat.findall(open(log_path).read())
+                if urls:
+                    return urls[-1]
             except Exception:
                 pass
     except Exception as exc:
         print(f"  Cloudflare error: {exc}")
-
     return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN — start FastAPI + tunnel
+# MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # FIX: SEP defined at the top of main() so all print() calls below can use it
+    SEP = "=" * 68
+
     print(f"\n{SEP}")
     print("  ICICI BREEZE BACKEND v7 — BreezeEngine")
     print(SEP)
     print()
+
     if AUTH_ENABLED:
-        print("  ⚠️  BACKEND AUTH IS ENABLED")
-        print(f"  Auth token: {BACKEND_AUTH_TOKEN}")
-        print("  → Set KAGGLE_TERMINAL_AUTH=" + BACKEND_AUTH_TOKEN + " in Vercel env vars")
-        print("  → Or set TERMINAL_AUTH_TOKEN env var before running this cell to customise")
+        print("  ⚠️  AUTH ENABLED — X-Terminal-Auth header required")
+        print(f"  Token: {BACKEND_AUTH_TOKEN}")
         print()
     else:
-        print("  🔓 Auth is DISABLED (default). Anyone with the tunnel URL can connect.")
-        print("  To enable: set TERMINAL_AUTH_TOKEN env var before running this cell.")
+        print("  🔓 Auth DISABLED (default) — set TERMINAL_AUTH_TOKEN env var to enable")
         print()
+
     print("  Endpoints:")
     print("    POST  /api/connect          authenticate (generate_session)")
     print("    GET   /api/expiries         weekly expiry dates")
@@ -1412,91 +1349,93 @@ def main():
     print("    GET   /api/funds            available margin / funds")
     print("    GET   /api/historical       OHLCV candle data")
     print("    GET   /api/ratelimit        rate limiter status")
-    print("    POST  /api/checksum         checksum verification utility")
     print("    GET   /health  /ping  /     health check")
     print()
 
     print("Starting FastAPI on port 8000...")
     start_uvicorn_thread()
     if wait_for_port(8000, 15):
-        print("FastAPI running on http://localhost:8000\n")
+        print("FastAPI running ✓\n")
     else:
-        print("WARNING: FastAPI may not have started\n")
+        print("WARNING: FastAPI may not have started — check for port conflicts\n")
 
-    print("Finding public tunnel (trying 3 providers)...")
-
+    print("Finding public tunnel (3 providers tried in order)...\n")
     public_url = None
+
     for fn, name in [
-        (try_localhost_run, "localhost.run"),
-        (try_serveo,        "serveo.net"),
-        (try_cloudflare,    "Cloudflare"),
+        (try_localhost_run, "localhost.run (SSH — no interstitial)"),
+        (try_serveo,        "serveo.net    (SSH — no interstitial)"),
+        (try_cloudflare,    "Cloudflare    (has browser interstitial)"),
     ]:
-        print(f"\n  {name}...")
+        print(f"  Trying {name}...")
         url = fn()
         if url:
             public_url = url
-            print(f"  OK: {url}")
+            print(f"  ✓ {url}\n")
             break
-        print(f"  {name} unavailable, trying next...")
+        print("  ✗ unavailable, trying next...\n")
 
-    print(f"\n{SEP}")
+    print(SEP)
 
     if public_url:
         is_cf = "trycloudflare" in public_url
-        print("  BACKEND IS LIVE!")
+        print("  ✅  BACKEND IS LIVE!")
         print(SEP)
         print()
-        print(f"  Public URL:  {public_url}")
+        print(f"  URL ▶  {public_url}")
         print()
-        print("  " + "-" * 64)
-        print("  COPY THIS URL into Arena app Connect Broker field:")
+        print("  ─" * 34)
+        print("  COPY THIS → paste into Arena → Connect Broker field")
         print(f"  {public_url}")
-        print("  " + "-" * 64)
+        print("  ─" * 34)
         print()
         print(f"  Health:    {public_url}/health")
-        print(f"  WebSocket: {public_url.replace('https', 'wss')}/ws/ticks")
-        print(f"  Connect:   {public_url}/api/connect   (POST)")
-        print(f"  Chain:     {public_url}/api/optionchain?stock_code=NIFTY&exchange_code=NFO&expiry_date=01-Jul-2025&right=Call")
+        print(f"  WS Ticks:  {public_url.replace('https', 'wss')}/ws/ticks")
+        print(f"  Connect:   {public_url}/api/connect  (POST)")
 
         if is_cf:
             print()
-            print("  NOTE (Cloudflare only): If Arena shows 'Failed to fetch':")
-            print(f"    Open in a browser tab: {public_url}/health")
-            print("    You should see {\"status\":\"online\"}")
-            print("    Then retry in Arena.")
+            print("  ⚠️  Cloudflare URL — if Arena shows 'Failed to fetch':")
+            print(f"       1. Open in a NEW browser tab:  {public_url}/health")
+            print('       2. Wait for {\"status\":\"online\"}')
+            print("       3. Close tab → retry in Arena")
     else:
-        print("  WARNING: No public tunnel found.")
-        print("  Make sure Kaggle Internet is ON and re-run this cell.")
+        print("  ❌  No public tunnel found.")
+        print("      Make sure Kaggle Internet is ON (Settings → Internet → ON)")
+        print("      Then re-run this cell.")
 
+    print()
     print(SEP)
     print()
-    print("Steps:")
+    print("  Steps:")
     print("  1. Copy URL above")
-    print("  2. Arena app -> Connect Broker -> paste URL")
+    print("  2. Arena → Connect Broker → paste URL")
     print("  3. Enter API Key, API Secret, today's Session Token")
-    print("  4. Click Validate Live -> Connected via BreezeEngine v7!")
+    print("  4. Click Validate Live → should show 'Connected via BreezeEngine v7'")
     print()
-    print("Daily Session Token:")
-    print("  https://api.icicidirect.com/apiuser/login?api_key=YOUR_KEY")
-    print("  Login -> copy ?apisession=XXXXX from redirect URL")
+    print("  Daily Session Token:")
+    print("    https://api.icicidirect.com/apiuser/login?api_key=YOUR_KEY")
+    print("    Login → copy ?apisession=XXXXX from the redirect URL")
+    print()
     print(SEP)
     print()
-    print("Backend running. Keep cell alive. Press the Stop button to quit.\n")
+    print("  Backend running. Keep this cell alive.")
+    print("  Press the Kaggle ■ Stop button to quit.\n")
 
     try:
         beat = 0
         while True:
             time.sleep(30)
             beat += 1
-            if beat % 4 == 0:
+            if beat % 2 == 0:   # heartbeat every 60s
                 ts = datetime.utcnow().strftime("%H:%M:%S")
                 print(
-                    f"  heartbeat {ts} UTC"
-                    f" | connected={engine.connected}"
-                    f" | ws={engine.ws_running}"
-                    f" | subs={len(engine.subscribed)}"
-                    f" | REST/min={engine.rate_limiter.calls_last_minute}"
-                    f" | ticks={engine.tick_store.get_version()}"
+                    f"  [{ts} UTC]"
+                    f"  connected={engine.connected}"
+                    f"  ws={engine.ws_running}"
+                    f"  subs={len(engine.subscribed)}"
+                    f"  REST/min={engine.rate_limiter.calls_last_minute}"
+                    f"  ticks={engine.tick_store.get_version()}"
                 )
     except KeyboardInterrupt:
         print("\nShutting down...")
