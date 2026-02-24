@@ -1,23 +1,31 @@
 // ════════════════════════════════════════════════════════════════════════════
-// POSITIONS PANEL v9 — Final Production Build
+// POSITIONS PANEL v10 — Debug & Integration Fix Pass
 //
-// CHANGES FROM v8:
+// CHANGES FROM v9:
 // ────────────────
-// [CRITICAL FIX] toggleSort stale closure: separated sortBy/sortDir updates
-// [CRITICAL FIX] SquareOffModal escape bubbling: stopPropagation on inner container
-// [CRITICAL FIX] usePagination infinite loop guard: consolidated clamp logic
-// [FIX] Removed dead imports (FilterIcon unused)
-// [FIX] SkeletonCard now rendered during positions refresh
-// [FIX] StaleBadge state naming lint compliance
-// [FIX] handleBatchCancel snapshots orders to avoid stale closure
-// [FIX] Tab state preserved via CSS display toggle (search/sort/page survive tab switch)
-// [ENHANCE] Keyboard shortcuts: Ctrl+1–6 for tab switching
-// [ENHANCE] P&L percentage display on position cards
-// [ENHANCE] CSV export for Order Book & Trade Book
-// [ENHANCE] Summary card value transition animation
-// [ENHANCE] Positions loading skeleton during refresh
-// [ENHANCE] Retry with exponential backoff on API failures
-// [ENHANCE] Accessible skip-to-content link
+// [CRITICAL FIX] useAutoRefresh: callback was invoked inside a React state-
+//   updater function (setTick). React 19 + StrictMode double-invokes state
+//   updater functions to detect impurity, causing every auto-refresh to fire
+//   the API callback TWICE. Fixed by using a ref (tickRef) for the countdown
+//   and invoking cbRef.current() directly in the setInterval handler.
+//
+// [HIGH FIX] Tab state preservation — v9 promised CSS display toggle in the
+//   changelog but implemented conditional rendering instead, causing
+//   OrderBookTable/TradeBookTable/FundsDashboard to unmount on every tab
+//   switch (losing internal search query, sort order, and pagination).
+//   Fixed: sell/orders/trades/funds tabs now use style={{ display }} toggle.
+//
+// [MEDIUM FIX] SquareOffModal: validateLimitPrice was called 3-4× per leg
+//   per render (className, aria-invalid, condition, error text). Extracted
+//   to a per-render local variable via IIFE.
+//
+// [MEDIUM FIX] SquareOffModal progress indicator: step index was recomputed
+//   inside every .map() iteration (allocating a new array + linear search).
+//   Hoisted to a single IIFE outside the map loop.
+//
+// [MINOR FIX] TradeOptionsPanel onDone now also calls loadOrders() so a
+//   newly placed order immediately appears in Orders/Sell tabs without
+//   requiring manual tab navigation.
 // ════════════════════════════════════════════════════════════════════════════
 
 import React, {
@@ -276,6 +284,10 @@ function useAutoRefresh(
   const [tick, setTick] = useState(intervalSec);
   const cbRef = useRef(callback);
   const visRef = useRef(true);
+  // FIX (React 19 StrictMode): Use a ref for the actual countdown so the
+  // callback is never invoked inside a state-updater function (which React may
+  // call twice in development to detect side-effects, causing double API calls).
+  const tickRef = useRef(intervalSec);
 
   useEffect(() => {
     cbRef.current = callback;
@@ -291,18 +303,24 @@ function useAutoRefresh(
 
   useEffect(() => {
     if (!enabled) {
+      tickRef.current = intervalSec;
       setTick(intervalSec);
       return;
     }
+    // Reset counter when (re-)enabled so we always wait a full interval.
+    tickRef.current = intervalSec;
+    setTick(intervalSec);
     const id = window.setInterval(() => {
       if (!visRef.current) return;
-      setTick(prev => {
-        if (prev <= 1) {
-          cbRef.current();
-          return intervalSec;
-        }
-        return prev - 1;
-      });
+      tickRef.current -= 1;
+      if (tickRef.current <= 0) {
+        // Safe: callback invoked in the interval handler, not inside a
+        // React state-updater, so it runs exactly once per interval.
+        cbRef.current();
+        tickRef.current = intervalSec;
+      }
+      // Push the display value to React state — purely for UI.
+      setTick(tickRef.current);
     }, 1000);
     return () => window.clearInterval(id);
   }, [enabled, intervalSec]);
@@ -1206,14 +1224,12 @@ const SquareOffModal: FC<{
             className="flex items-center gap-1 text-[9px] font-semibold flex-shrink-0"
             aria-label="Progress"
           >
-            {(['configure', 'confirm', 'done'] as const).map(
-              (s, i) => {
-                const si = [
-                  'configure',
-                  'confirm',
-                  'done',
-                ].indexOf(step);
-                return (
+            {(() => {
+              // FIX: compute step index once, outside .map(), so we don't
+              // allocate a new array + do a linear search on every iteration.
+              const STEP_ORDER = ['configure', 'confirm', 'done'] as const;
+              const si = STEP_ORDER.indexOf(step);
+              return STEP_ORDER.map((s, i) => (
                   <React.Fragment key={s}>
                     <span
                       className={`px-2 py-0.5 rounded-full border ${
@@ -1239,9 +1255,8 @@ const SquareOffModal: FC<{
                       </span>
                     )}
                   </React.Fragment>
-                );
-              },
-            )}
+              ));
+            })()}
           </nav>
 
           <button
@@ -1600,7 +1615,10 @@ const SquareOffModal: FC<{
                                 ))}
                               </div>
 
-                              {leg.orderType === 'limit' && (
+                              {leg.orderType === 'limit' && (() => {
+                                // FIX: compute once, not 3-4× per render
+                                const limitPriceErr = validateLimitPrice(leg.limitPrice);
+                                return (
                                 <div className="flex items-center gap-2 flex-1">
                                   <span className="text-gray-500 text-[10px] flex-shrink-0">
                                     ₹
@@ -1617,30 +1635,21 @@ const SquareOffModal: FC<{
                                     step="0.05"
                                     min="0.05"
                                     className={`w-28 bg-[#0a0c15] border focus:border-blue-400 text-white text-sm rounded-xl px-3 py-1.5 mono outline-none text-right transition-colors ${
-                                      validateLimitPrice(
-                                        leg.limitPrice,
-                                      )
+                                      limitPriceErr
                                         ? 'border-red-500/50'
                                         : 'border-blue-500/50'
                                     }`}
                                     aria-label="Limit price"
-                                    aria-invalid={
-                                      !!validateLimitPrice(
-                                        leg.limitPrice,
-                                      )
-                                    }
+                                    aria-invalid={!!limitPriceErr}
                                   />
-                                  {validateLimitPrice(
-                                    leg.limitPrice,
-                                  ) && (
+                                  {limitPriceErr && (
                                     <span className="text-red-400 text-[9px]">
-                                      {validateLimitPrice(
-                                        leg.limitPrice,
-                                      )}
+                                      {limitPriceErr}
                                     </span>
                                   )}
                                 </div>
-                              )}
+                                );
+                              })()}
                             </div>
                           </div>
                         </>
@@ -4505,6 +4514,9 @@ const PositionsInner: FC<Props> = ({
                 expiry={tradeExpiry}
                 onDone={() => {
                   onRefreshPositions?.();
+                  // FIX: also reload order book so new order appears
+                  // in Orders/Sell tabs without requiring manual navigation.
+                  loadOrders();
                   addToast(
                     'Order placed successfully',
                     'success',
@@ -4522,90 +4534,89 @@ const PositionsInner: FC<Props> = ({
         </div>
       )}
 
-      {/* ═══ SELL ORDERS TAB ═══ */}
-      {subTab === 'sell' && (
-        <div
-          className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden"
-          role="tabpanel"
-          id="tabpanel-sell"
-        >
-          <div className="px-4 py-2 border-b border-gray-800/40 flex items-center gap-2">
-            <TrendingDown
-              size={12}
-              className="text-red-400"
-            />
-            <span className="text-white text-[11px] font-semibold">
-              Sell Orders Only
-            </span>
-            <span className="text-gray-600 text-[10px]">
-              — filtered view
-            </span>
-          </div>
-          <OrderBookTable
-            orders={sellOrders}
-            loading={ordersLoading}
-            canFetch={canFetch}
-            onRefresh={loadOrders}
-            onCancel={handleCancel}
-            lastRefresh={lastRefresh['sell'] ?? null}
+      {/* ═══ SELL ORDERS TAB ═══
+            FIX: Use style display toggle (not conditional render) so
+            OrderBookTable's internal search/sort/pagination state survives
+            tab switches — as promised in the v9 changelog. */}
+      <div
+        className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden"
+        role="tabpanel"
+        id="tabpanel-sell"
+        style={{ display: subTab === 'sell' ? '' : 'none' }}
+      >
+        <div className="px-4 py-2 border-b border-gray-800/40 flex items-center gap-2">
+          <TrendingDown
+            size={12}
+            className="text-red-400"
           />
+          <span className="text-white text-[11px] font-semibold">
+            Sell Orders Only
+          </span>
+          <span className="text-gray-600 text-[10px]">
+            — filtered view
+          </span>
         </div>
-      )}
+        <OrderBookTable
+          orders={sellOrders}
+          loading={ordersLoading}
+          canFetch={canFetch}
+          onRefresh={loadOrders}
+          onCancel={handleCancel}
+          lastRefresh={lastRefresh['sell'] ?? null}
+        />
+      </div>
 
       {/* ═══ ORDER BOOK TAB ═══ */}
-      {subTab === 'orders' && (
-        <div
-          className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden"
-          role="tabpanel"
-          id="tabpanel-orders"
-        >
-          <OrderBookTable
-            orders={orders}
-            loading={ordersLoading}
-            canFetch={canFetch}
-            onRefresh={loadOrders}
-            onCancel={handleCancel}
-            lastRefresh={lastRefresh['orders'] ?? null}
-            onBatchCancel={() =>
-              setShowBatchCancelConfirm(true)
-            }
-          />
-        </div>
-      )}
+      <div
+        className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden"
+        role="tabpanel"
+        id="tabpanel-orders"
+        style={{ display: subTab === 'orders' ? '' : 'none' }}
+      >
+        <OrderBookTable
+          orders={orders}
+          loading={ordersLoading}
+          canFetch={canFetch}
+          onRefresh={loadOrders}
+          onCancel={handleCancel}
+          lastRefresh={lastRefresh['orders'] ?? null}
+          onBatchCancel={() =>
+            setShowBatchCancelConfirm(true)
+          }
+        />
+      </div>
 
       {/* ═══ TRADE BOOK TAB ═══ */}
-      {subTab === 'trades' && (
-        <div
-          className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden"
-          role="tabpanel"
-          id="tabpanel-trades"
-        >
-          <TradeBookTable
-            trades={trades}
-            loading={tradesLoading}
-            canFetch={canFetch}
-            onRefresh={loadTrades}
-            lastRefresh={lastRefresh['trades'] ?? null}
-          />
-        </div>
-      )}
+      <div
+        className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden"
+        role="tabpanel"
+        id="tabpanel-trades"
+        style={{ display: subTab === 'trades' ? '' : 'none' }}
+      >
+        <TradeBookTable
+          trades={trades}
+          loading={tradesLoading}
+          canFetch={canFetch}
+          onRefresh={loadTrades}
+          lastRefresh={lastRefresh['trades'] ?? null}
+        />
+      </div>
 
       {/* ═══ FUNDS TAB ═══ */}
-      {subTab === 'funds' && (
-        <div
-          className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden"
-          role="tabpanel"
-          id="tabpanel-funds"
-        >
-          <FundsDashboard
-            funds={funds}
-            loading={fundsLoading}
-            canFetch={canFetch}
-            onRefresh={loadFunds}
-            lastRefresh={lastRefresh['funds'] ?? null}
-          />
-        </div>
-      )}
+      <div
+        className="bg-[#1a1d2e] mx-4 rounded-2xl border border-gray-700/30 overflow-hidden"
+        role="tabpanel"
+        id="tabpanel-funds"
+        style={{ display: subTab === 'funds' ? '' : 'none' }}
+      >
+        <FundsDashboard
+          funds={funds}
+          loading={fundsLoading}
+          canFetch={canFetch}
+          onRefresh={loadFunds}
+          lastRefresh={lastRefresh['funds'] ?? null}
+        />
+      </div>
 
       <div className="h-6" />
 
