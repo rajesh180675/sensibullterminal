@@ -4058,14 +4058,26 @@ const PositionsInner: FC<Props> = ({
   );
 
   // ── Sell orders ──
-  const sellOrders = useMemo(
-    () =>
-      orders.filter(
-        o =>
-          String(o.action || '').toLowerCase() === 'sell',
-      ),
-    [orders],
-  );
+  const sellOrders = useMemo(() => {
+    const filtered: OrderBookRow[] = [];
+    for (const order of orders) {
+      if (
+        String(order.action || '').toLowerCase() ===
+        'sell'
+      ) {
+        filtered.push(order);
+      }
+    }
+    return filtered.sort(
+      (a, b) =>
+        parseTimestamp(
+          extractTimestamp(a as Record<string, unknown>),
+        ) -
+        parseTimestamp(
+          extractTimestamp(b as Record<string, unknown>),
+        ),
+    );
+  }, [orders]);
   const sellOrderCount = sellOrders.length;
 
   // ── Sub-tab config ──

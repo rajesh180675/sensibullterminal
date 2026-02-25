@@ -7,7 +7,7 @@
 // strip and spot display never re-rendered when live prices arrived.
 // ================================================================
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   TrendingUp, TrendingDown, Activity, Wifi, WifiOff,
   ChevronDown, Bell, Settings, Zap,
@@ -43,6 +43,7 @@ export const TopBar: React.FC<Props> = ({
   isLive, loadingMsg, spotPrice, liveIndices,
 }) => {
   const [showDD, setShowDD] = useState(false);
+  const hideDropdownTimeoutRef = useRef<number | null>(null);
   const cfg         = SYMBOL_CONFIG[selectedSymbol];
 
   // BUG 7 FIX: prefer prop over stale module-level constant
@@ -55,6 +56,14 @@ export const TopBar: React.FC<Props> = ({
     ? [...liveIndices, ...liveIndices]
     : [];   // empty until first live update — cleaner than showing stale values
 
+  useEffect(() => {
+    return () => {
+      if (hideDropdownTimeoutRef.current !== null) {
+        window.clearTimeout(hideDropdownTimeoutRef.current);
+      }
+    };
+  }, []);
+
   return (
     <header className="bg-[#13161f] border-b border-gray-800/60 flex-shrink-0 select-none">
 
@@ -62,7 +71,7 @@ export const TopBar: React.FC<Props> = ({
       <div className="bg-[#0a0c15] border-b border-gray-800/70 overflow-hidden h-[22px] flex items-center">
         <div className="ticker-track">
           {doubled.map((idx, i) => (
-            <span key={i} className="flex items-center gap-1.5 px-4 text-[10px] whitespace-nowrap">
+            <span key={`${idx.label}-${Math.floor(i / Math.max(1, (liveIndices?.length ?? 1)))}`} className="flex items-center gap-1.5 px-4 text-[10px] whitespace-nowrap">
               <span className="text-gray-600 font-medium">{idx.label}</span>
               <span className="text-gray-300 font-bold mono">
                 {idx.value.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
@@ -96,9 +105,14 @@ export const TopBar: React.FC<Props> = ({
 
         {/* Symbol dropdown */}
         <div className="relative flex-shrink-0">
-          <button
+            <button
             onClick={() => setShowDD(v => !v)}
-            onBlur={() => setTimeout(() => setShowDD(false), 200)}
+            onBlur={() => {
+              if (hideDropdownTimeoutRef.current !== null) {
+                window.clearTimeout(hideDropdownTimeoutRef.current);
+              }
+              hideDropdownTimeoutRef.current = window.setTimeout(() => setShowDD(false), 200);
+            }}
             className="flex items-center gap-2.5 bg-[#1e2135] hover:bg-[#252840] border border-gray-700/40 rounded-xl px-3 py-1.5 transition-colors"
           >
             <div className="text-left">
