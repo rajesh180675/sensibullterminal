@@ -389,22 +389,56 @@ export async function placeOrder(backendUrl: string, params: {
   price?: string; validity?: string; stoploss?: string;
   expiryDate: string; right: 'call' | 'put'; strikePrice: string;
 }): Promise<OrderResult> {
-  const url = apiUrl(backendUrl, '/api/order');
+  const legPayload = {
+    stock_code: params.stockCode,
+    exchange_code: params.exchangeCode,
+    product: params.product || 'options',
+    action: params.action.toLowerCase(),
+    order_type: params.orderType || 'market',
+    quantity: params.quantity,
+    price: params.price || '0',
+    validity: params.validity || 'day',
+    stoploss: params.stoploss || '0',
+    expiry_date: params.expiryDate,
+    right: params.right,
+    strike_price: params.strikePrice,
+  };
+
   try {
-    const data = await fetchJson<{ success: boolean; order_id?: string; orderId?: string; error?: string }>(url, {
+    // Primary route: /api/order (new backend contract)
+    const directUrl = apiUrl(backendUrl, '/api/order');
+    const data = await fetchJson<{ success: boolean; order_id?: string; orderId?: string; error?: string }>(directUrl, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        stock_code: params.stockCode, exchange_code: params.exchangeCode,
-        product: params.product || 'options', action: params.action.toLowerCase(),
-        order_type: params.orderType || 'market', quantity: params.quantity,
-        price: params.price || '0', validity: params.validity || 'day',
-        stoploss: params.stoploss || '0', expiry_date: params.expiryDate,
-        right: params.right, strike_price: params.strikePrice,
-      }),
+      body: JSON.stringify(legPayload),
     });
-    return data.success
-      ? { ok: true, orderId: data.order_id || data.orderId }
-      : { ok: false, error: data.error || 'Order failed' };
+    if (data.success) {
+      return { ok: true, orderId: data.order_id || data.orderId };
+    }
+
+    // Fallback route: /api/strategy/execute (legacy/alternate backend contract)
+    const fallbackUrl = apiUrl(backendUrl, '/api/strategy/execute');
+    const fallback = await fetchJson<{
+      success: boolean;
+      error?: string;
+      results?: Array<{ success: boolean; order_id?: string; orderId?: string; error?: string }>;
+    }>(fallbackUrl, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ legs: [legPayload] }),
+    });
+
+    const first = fallback.results?.[0];
+    if (fallback.success && first?.success) {
+      return { ok: true, orderId: first.order_id || first.orderId };
+    }
+
+    return {
+      ok: false,
+      error:
+        first?.error ||
+        fallback.error ||
+        data.error ||
+        'Order failed',
+    };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
@@ -585,4 +619,3 @@ export async function fetchSpotPrice(
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
-
