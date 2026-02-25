@@ -544,3 +544,45 @@ export async function fetchHistorical(
     return { ok: false, data: [], error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+// ── Spot Price ────────────────────────────────────────────────────────────────
+// FIX: New function to fetch the actual index spot price from the backend.
+// This replaces the broken put-call parity derivation that was seeded from
+// a stale hardcoded SPOT_PRICES value.
+//
+// Exchange codes for NSE/BSE cash (index) market — NOT the derivatives exchange:
+//   NIFTY  → stock_code="NIFTY",  exchange_code="NSE" (not NFO)
+//   SENSEX → stock_code="SENSEX", exchange_code="BSE" (not BFO)
+
+// Mapping from SymbolCode to the Breeze cash-market identifiers
+const SPOT_FETCH_CONFIG: Record<string, { stockCode: string; exchangeCode: string }> = {
+  NIFTY:  { stockCode: 'NIFTY',  exchangeCode: 'NSE' },
+  BSESEN: { stockCode: 'SENSEX', exchangeCode: 'BSE' },
+};
+
+export async function fetchSpotPrice(
+  backendUrl: string,
+  symCode: string,
+): Promise<{ ok: boolean; spot?: number; source?: string; error?: string }> {
+  const cfg = SPOT_FETCH_CONFIG[symCode] ?? { stockCode: symCode, exchangeCode: 'NSE' };
+  const qs  = new URLSearchParams({
+    stock_code:    cfg.stockCode,
+    exchange_code: cfg.exchangeCode,
+  });
+  const url = apiUrl(backendUrl, `/api/spot?${qs}`);
+  try {
+    const data = await fetchJson<{
+      success: boolean;
+      spot?:   number;
+      source?: string;
+      error?:  string;
+    }>(url, {}, 8_000);   // 8s timeout — spot fetch is quick
+    if (data.success && data.spot && data.spot > 0) {
+      return { ok: true, spot: data.spot, source: data.source };
+    }
+    return { ok: false, error: data.error ?? 'No spot data returned' };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+

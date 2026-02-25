@@ -40,11 +40,17 @@ export interface TickData {
 }
 
 export interface TickUpdate {
-  type:    'tick_update' | 'heartbeat';
-  version: number;
-  ticks:   TickData[];
-  ts:      number;
-  ws_live: boolean;
+  type:         'tick_update' | 'heartbeat';
+  version:      number;
+  ticks:        TickData[];
+  ts:           number;
+  ws_live:      boolean;
+  /**
+   * FIX: Live index spot prices captured from WS tick's index_close_price field.
+   * Keys are Breeze stock_code values (e.g. "NIFTY", "BSESEN").
+   * This is the most reliable spot source — use before put-call parity derivation.
+   */
+  spot_prices?: Record<string, number>;
 }
 
 export type TickCallback    = (update: TickUpdate) => void;
@@ -298,20 +304,22 @@ export function startTickPolling(
     try {
       const res  = await fetch(`${base}/api/ticks?since_version=${lastVersion}`);
       const data = await res.json() as {
-        changed:  boolean;
-        version:  number;
-        ticks?:   TickData[];
-        ws_live?: boolean;
+        changed:      boolean;
+        version:      number;
+        ticks?:       TickData[];
+        ws_live?:     boolean;
+        spot_prices?: Record<string, number>;
       };
 
       if (data.changed && data.ticks) {
         lastVersion = data.version;
         onTick({
-          type:    'tick_update',
-          version: data.version,
-          ticks:   data.ticks,
-          ts:      Date.now() / 1000,
-          ws_live: data.ws_live ?? false,
+          type:        'tick_update',
+          version:     data.version,
+          ticks:       data.ticks,
+          ts:          Date.now() / 1000,
+          ws_live:     data.ws_live ?? false,
+          spot_prices: data.spot_prices,
         });
       }
     } catch { /* silent — network may be briefly unavailable */ }

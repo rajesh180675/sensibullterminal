@@ -169,6 +169,9 @@ class TickStore:
                 if len(parts) < 3:
                     continue
                 stock, strike_str, right = parts[0], parts[1], parts[2]
+                # Skip spot price pseudo-entries
+                if right == "SPOT":
+                    continue
                 try:
                     strike = int(float(strike_str))
                 except Exception:
@@ -187,6 +190,19 @@ class TickStore:
                     "last_updated": tick.get("_ts", 0),
                 })
             return rows
+
+    def get_spot_prices(self) -> Dict[str, float]:
+        """Return dict of {stock_code: spot_price} captured from option tick underlying values."""
+        with self._lock:
+            result = {}
+            for key, tick in self._ticks.items():
+                parts = key.split(":")
+                if len(parts) == 2 and parts[1] == "SPOT":
+                    stock = parts[0]
+                    ltp = tick.get("ltp", 0)
+                    if ltp > 0:
+                        result[stock] = ltp
+            return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -568,6 +584,31 @@ class BreezeEngine:
                     "feed_time":  str(tick.get("exchange_feed_time")  or ""),
                 })
                 log.debug(f"[WS tick] {key} ltp={tick.get('last_traded_price', 0)}")
+
+                # ── FIX: Capture underlying index spot price from option tick ──
+                # Breeze includes the index value in each option feed tick under
+                # several possible field names depending on SDK version.
+                # This is the MOST RELIABLE live spot source — capture it.
+                underlying = 0.0
+                for field in ("index_close_price", "UnderlyingValue", "underlying_value",
+                              "close_price", "index_price", "underlying_spot_price"):
+                    v = tick.get(field)
+                    if v:
+                        try:
+                            underlying = float(v)
+                        except (ValueError, TypeError):
+                            pass
+                        if underlying > 0:
+                            break
+                if underlying > 1000:  # sanity: NIFTY > 1000, SENSEX > 10000
+                    spot_key = f"{stock}:SPOT"
+                    self.tick_store.update(spot_key, {
+                        "ltp":      underlying,
+                        "is_spot":  True,
+                        "source":   "ws_tick",
+                    })
+                    log.debug(f"[WS spot] {stock} underlying={underlying}")
+
             except Exception as exc:
                 log.warning(f"[WS] parse error: {exc}")
 
@@ -831,6 +872,77 @@ async def api_expiries(
     return {"success": True, "stock_code": stock_code, "expiries": expiries}
 
 
+
+# ── Live Spot Price ─────────────────────────────────────────────────────────────
+# FIX: New endpoint to fetch the actual NIFTY/SENSEX index spot price directly
+# from Breeze, bypassing the inaccurate put-call parity derivation in the frontend.
+# NIFTY index: stock_code="NIFTY", exchange_code="NSE" (NSE cash market)
+# SENSEX index: stock_code="SENSEX", exchange_code="BSE" (BSE cash market)
+
+@app.get("/api/spot")
+async def api_spot(
+    stock_code:    str = Query("NIFTY"),
+    exchange_code: str = Query("NSE"),
+):
+    """
+    Fetch live index spot price directly from Breeze.
+    For NIFTY: stock_code=NIFTY, exchange_code=NSE
+    For SENSEX: stock_code=SENSEX, exchange_code=BSE
+
+    Priority 1: Return cached value from WS tick (index_close_price field).
+    Priority 2: Call get_quotes() as REST fallback (costs 1 rate-limiter slot).
+    """
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected — POST /api/connect first")
+
+    # Priority 1: Try tick store (populated from index_close_price in WS ticks)
+    spot_prices = engine.tick_store.get_spot_prices()
+    cached = spot_prices.get(stock_code.upper())
+    if cached and cached > 1000:
+        return {"success": True, "spot": cached, "source": "ws_tick",
+                "stock_code": stock_code, "exchange_code": exchange_code}
+
+    # Priority 2: REST call to Breeze get_quotes
+    try:
+        def _call():
+            return engine.breeze.get_quotes(
+                stock_code=stock_code,
+                exchange_code=exchange_code,
+                expiry_date="",
+                right="",
+                strike_price="",
+            )
+        result = engine.rate_limiter.enqueue(_call)
+        rows = []
+        if isinstance(result, dict):
+            rows = result.get("Success", []) or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows:
+            ltp = 0.0
+            for field in ("ltp", "last_traded_price", "close", "last_price", "LastPrice"):
+                v = row.get(field)
+                if v:
+                    try:
+                        ltp = float(v)
+                    except (ValueError, TypeError):
+                        pass
+                    if ltp > 0:
+                        break
+            if ltp > 1000:
+                # Cache it in tick store for next WS push
+                engine.tick_store.update(f"{stock_code.upper()}:SPOT", {
+                    "ltp": ltp, "is_spot": True, "source": "rest"
+                })
+                return {"success": True, "spot": ltp, "source": "rest_quote",
+                        "stock_code": stock_code, "exchange_code": exchange_code}
+        return {"success": False,
+                "error": f"No spot price returned for {stock_code}/{exchange_code}. "
+                         f"Raw Breeze response: {str(result)[:200]}"}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
 # ── Option Chain ──────────────────────────────────────────────────────────────
 
 @app.get("/api/optionchain")
@@ -938,11 +1050,12 @@ async def ws_ticks(websocket: WebSocket):
 
             last_version = current_version
             await websocket.send_json({
-                "type":    "tick_update",
-                "version": current_version,
-                "ticks":   engine.tick_store.to_option_chain_delta(),
-                "ts":      time.time(),
-                "ws_live": engine.ws_running,
+                "type":        "tick_update",
+                "version":     current_version,
+                "ticks":       engine.tick_store.to_option_chain_delta(),
+                "spot_prices": engine.tick_store.get_spot_prices(),
+                "ts":          time.time(),
+                "ws_live":     engine.ws_running,
             })
     except WebSocketDisconnect:
         log.info("[WS] frontend disconnected")
@@ -958,10 +1071,11 @@ async def api_ticks(since_version: int = Query(0)):
     if data["version"] <= since_version:
         return {"changed": False, "version": data["version"]}
     return {
-        "changed": True,
-        "version": data["version"],
-        "ticks":   engine.tick_store.to_option_chain_delta(),
-        "ws_live": engine.ws_running,
+        "changed":     True,
+        "version":     data["version"],
+        "ticks":       engine.tick_store.to_option_chain_delta(),
+        "spot_prices": engine.tick_store.get_spot_prices(),
+        "ws_live":     engine.ws_running,
     }
 
 

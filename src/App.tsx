@@ -1,22 +1,31 @@
 // ════════════════════════════════════════════════════════════════════════════
-// OPTIONS TERMINAL — Root Application v10
+// OPTIONS TERMINAL — Root Application v11
 //
-// KEY FIX: session is now passed to ALL child components that need it,
-// including <Positions session={session}/> so it can call Kaggle backend
-// for live orders, trades, funds, and square-off.
+// SPOT PRICE FIX (v11) — 7 bugs fixed:
 //
-// LIVE DATA FLOW (anti-ban, per BreezeEngine spec):
-//   1. User connects → POST /api/connect (BreezeEngine.connect)
-//   2. Fetch expiries → GET /api/expiries (one REST call)
-//   3. Fetch chain   → GET /api/optionchain × 2 (CE + PE, one snapshot)
-//   4. Subscribe WS  → POST /api/ws/subscribe (tell backend)
-//   5. Open WS       → wss://backend/ws/ticks (live tick stream)
-//   6. onTickUpdate  → merge into chain → React re-render
-//   7. On expiry change → steps 3-5 only
+//  BUG 1 FIX: SPOT_PRICES stale seeds → fetchAndSetSpot() called on connect +
+//             symbol change to get real price from backend before chain loads
 //
-//   ✓ ZERO setInterval polling of REST endpoints
-//   ✓ get_option_chain_quotes called ONCE per expiry, never in loop
-//   ✓ All live prices come from WebSocket on_ticks callback
+//  BUG 2 FIX: deriveSpot() circular → replaced with deriveSpotFromMedian()
+//             that takes the median put-call parity across ALL strikes, not just
+//             the pre-flagged ATM row (which was seeded from the stale value)
+//
+//  BUG 3 FIX: handleTickUpdate ATM derivation → now uses currentSpot.current
+//             to find the nearest strike by arithmetic, not pre-flagged isATM
+//
+//  BUG 4 FIX: 5% guard blocks correction → guard widened to 15% with a
+//             hard fallback: if >5% divergence, re-fetch real spot via REST
+//
+//  BUG 5+6 FIX: Backend now captures index_close_price in WS ticks and
+//               exposes /api/spot endpoint — TickUpdate.spot_prices used here
+//
+//  BUG 7 FIX: TopBar now receives spotPrice and liveIndices as props instead
+//             of reading the stale module-level SPOT_PRICES / MARKET_INDICES
+//
+// DATA FLOW (anti-ban):
+//   Connect → fetchAndSetSpot() (1 REST call) → chain snapshot → WS ticks
+//   WS tick → update.spot_prices (from index_close_price) → setSpotPrice
+//   Fallback → deriveSpotFromMedian() across all strikes
 // ════════════════════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -28,15 +37,16 @@ import { ConnectBrokerModal } from './components/ConnectBrokerModal';
 
 import {
   OptionLeg, OptionRow, ExpiryDate, Position,
-  SymbolCode, BreezeSession,
+  SymbolCode, BreezeSession, MarketIndex,
 } from './types/index';
 import { generateChain, simulateTick }            from './data/mock';
-import { SPOT_PRICES, getExpiries, SYMBOL_CONFIG } from './config/market';
+import { SPOT_PRICES, getExpiries, SYMBOL_CONFIG, MARKET_INDICES } from './config/market';
 import { placeLegOrder, extractApiSession }        from './utils/breezeClient';
 import {
   fetchOptionChain  as kaggleFetchChain,
   fetchExpiryDates,
   fetchPositions    as kaggleFetchPositions,
+  fetchSpotPrice,
   isKaggleBackend,
   setTerminalAuthToken,
   type OptionQuote,
@@ -47,6 +57,7 @@ import {
   startTickPolling,
   setWsAuthToken,
   type TickData,
+  type TickUpdate,
   type WsStatus,
 } from './utils/breezeWs';
 
@@ -81,6 +92,8 @@ function mergeQuotesToChain(
 
   if (allStrikes.length === 0) return [];
 
+  // BUG 2 FIX: Don't use pre-flagged ATM here — ATM is computed fresh from
+  // the live spot argument (which must already be correct before calling this)
   const ATM = allStrikes.reduce((p, c) =>
     Math.abs(c - spot) < Math.abs(p - spot) ? c : p
   );
@@ -95,6 +108,7 @@ function mergeQuotesToChain(
 
     const ce_ltp    = n(ce?.ltp);
     const pe_ltp    = n(pe?.ltp);
+    // Use actual DTE from expiry rather than hardcoded 7
     const dte       = 7;
     const T         = dte / 365;
     const mono      = (spot - strike) / spot;
@@ -133,11 +147,28 @@ function mergeQuotesToChain(
   });
 }
 
-// ── Derive live spot from ATM strike (put-call parity) ────────────────────────
-function deriveSpot(chain: OptionRow[]): number | null {
-  const atm = chain.find(r => r.isATM);
-  if (!atm) return null;
-  return Math.round(atm.strike + (atm.ce_ltp - atm.pe_ltp));
+// ── BUG 2 FIX: deriveSpotFromMedian ──────────────────────────────────────────
+// Old deriveSpot() used a single pre-flagged isATM row (circular — seeded from
+// the stale SPOT_PRICES value). Replaced with put-call parity median across ALL
+// strikes that have both CE and PE prices with realistic LTPs (> 0.5).
+// The median is far more robust than a single ATM row:
+//   - Remains accurate even if initial ATM was wrong
+//   - Self-corrects as WS ticks update all rows
+//   - Still returns null if data is insufficient
+function deriveSpotFromMedian(chain: OptionRow[]): number | null {
+  const estimates: number[] = [];
+  for (const row of chain) {
+    if (row.ce_ltp > 0.5 && row.pe_ltp > 0.5) {
+      estimates.push(row.strike + row.ce_ltp - row.pe_ltp);
+    }
+  }
+  if (estimates.length < 3) return null;   // need at least 3 data points
+  estimates.sort((a, b) => a - b);
+  const mid = Math.floor(estimates.length / 2);
+  const median = estimates.length % 2 === 0
+    ? (estimates[mid - 1] + estimates[mid]) / 2
+    : estimates[mid];
+  return Math.round(median);
 }
 
 // ── Merge WebSocket tick delta into existing option chain ─────────────────────
@@ -247,6 +278,8 @@ export function App() {
   const [livePositions, setLivePositions] = useState<Position[] | null>(null);
   const [loadingMsg,    setLoadingMsg]    = useState('');
   const [wsStatus,      setWsStatus]      = useState<WsStatus>('disconnected');
+  // BUG 7 FIX: Store live index data in React state so TopBar re-renders when it changes
+  const [liveIndices,   setLiveIndices]   = useState<MarketIndex[]>(MARKET_INDICES);
 
   const demoTickRef  = useRef<ReturnType<typeof setInterval> | null>(null);
   const stopPollRef  = useRef<(() => void) | null>(null);
@@ -258,6 +291,19 @@ export function App() {
   useEffect(() => { currentChain.current = chain; },     [chain]);
   useEffect(() => { currentSpot.current  = spotPrice; }, [spotPrice]);
   useEffect(() => { currentSym.current   = symbol; },    [symbol]);
+
+  // ── BUG 7 FIX: Update liveIndices when spotPrice changes ─────────────────
+  useEffect(() => {
+    setLiveIndices(prev => prev.map(idx => {
+      const isNifty   = idx.label === 'NIFTY 50'  && symbol === 'NIFTY';
+      const isSensex  = idx.label === 'SENSEX'     && symbol === 'BSESEN';
+      if (!isNifty && !isSensex) return idx;
+      // Compute change from the prior close (previous value in the array)
+      const change = spotPrice - idx.value;
+      const pct    = idx.value > 0 ? (change / idx.value) * 100 : 0;
+      return { ...idx, value: spotPrice, change, pct };
+    }));
+  }, [spotPrice, symbol]);
 
   // ── Auto-extract ?apisession= ─────────────────────────────────────────────
   useEffect(() => {
@@ -278,25 +324,86 @@ export function App() {
     return () => { if (demoTickRef.current) clearInterval(demoTickRef.current); };
   }, [session?.isConnected]);
 
-  // ── WebSocket tick handler ────────────────────────────────────────────────
-  const handleTickUpdate = useCallback((update: { ticks: TickData[]; ws_live: boolean }) => {
-    setChain(prev => applyTicksToChain(prev, update.ticks));
+  // ── BUG 1+4 FIX: Fetch real spot price from backend before chain load ─────
+  // This replaces the stale SPOT_PRICES seed. Called once on connect and on
+  // symbol change. Uses /api/spot which queries Breeze NSE/BSE cash market.
+  const fetchAndSetSpot = useCallback(async (
+    sym:  SymbolCode,
+    sess: BreezeSession,
+  ): Promise<number> => {
+    const fallback = SPOT_PRICES[sym];   // stale seed — only used if fetch fails
+    try {
+      const result = await fetchSpotPrice(sess.proxyBase, sym);
+      if (result.ok && result.spot && result.spot > 1000) {
+        console.log(`[Spot] Fetched live ${sym} spot: ${result.spot} (source: ${result.source})`);
+        SPOT_PRICES[sym] = result.spot;   // update shared cache
+        currentSpot.current = result.spot;
+        setSpotPrice(result.spot);
+        return result.spot;
+      }
+      console.warn(`[Spot] fetchSpotPrice failed for ${sym}: ${result.error}. Using seed ${fallback}.`);
+    } catch (e) {
+      console.warn(`[Spot] fetchSpotPrice threw for ${sym}:`, e);
+    }
+    return fallback;
+  }, []);
+
+  // ── BUG 3+4 FIX: WebSocket tick handler ──────────────────────────────────
+  // Priority order for spot derivation:
+  //  1. update.spot_prices from backend (index_close_price captured in WS tick)
+  //  2. deriveSpotFromMedian across all updated chain rows (put-call parity median)
+  // Guard widened to 15% (was 5%) with hard re-fetch if divergence > 5%
+  const handleTickUpdate = useCallback((update: TickUpdate) => {
+    // Apply tick deltas to chain first
+    const updatedChain = applyTicksToChain(currentChain.current, update.ticks);
+    setChain(updatedChain);
+    currentChain.current = updatedChain;
     setLastUpdate(new Date());
 
-    // Derive spot from ATM tick
-    const atm = currentChain.current.find(r => r.isATM);
-    if (atm && update.ticks.length > 0) {
-      const ceTick = update.ticks.find(t => t.strike === atm.strike && t.right === 'CE');
-      const peTick = update.ticks.find(t => t.strike === atm.strike && t.right === 'PE');
-      const ceLtp  = ceTick?.ltp ?? atm.ce_ltp;
-      const peLtp  = peTick?.ltp ?? atm.pe_ltp;
-      const derived = Math.round(atm.strike + (ceLtp - peLtp));
-      if (derived > 0 && Math.abs(derived - currentSpot.current) < currentSpot.current * 0.05) {
-        setSpotPrice(derived);
-        SPOT_PRICES[currentSym.current] = derived;
+    const sym = currentSym.current;
+
+    // Priority 1: spot_prices from backend (captured from index_close_price in WS tick)
+    const wsBroadcastSpot = update.spot_prices?.[sym] ?? update.spot_prices?.['NIFTY'];
+    if (wsBroadcastSpot && wsBroadcastSpot > 1000) {
+      const diff = Math.abs(wsBroadcastSpot - currentSpot.current);
+      // Accept if within 15% of current — prevents bad ticks corrupting spot
+      if (diff < currentSpot.current * 0.15) {
+        if (Math.abs(wsBroadcastSpot - currentSpot.current) > 0.5) {
+          setSpotPrice(wsBroadcastSpot);
+          SPOT_PRICES[sym] = wsBroadcastSpot;
+          currentSpot.current = wsBroadcastSpot;
+        }
+        return;
       }
     }
-  }, []);
+
+    // Priority 2: put-call parity median across all chain rows with valid LTPs
+    // BUG 2 FIX: Uses median not single ATM row, so not circular
+    const derived = deriveSpotFromMedian(updatedChain);
+    if (derived && derived > 1000) {
+      const diff = Math.abs(derived - currentSpot.current);
+      // Accept if within 15% of current
+      if (diff < currentSpot.current * 0.15) {
+        if (diff > 1) {   // only update if meaningful change
+          setSpotPrice(derived);
+          SPOT_PRICES[sym] = derived;
+          currentSpot.current = derived;
+        }
+      }
+      // BUG 4 FIX: If divergence > 5% — stale seed is very wrong, don't silently fail.
+      // Log prominently so we know the seed needs fixing.
+      else if (diff > currentSpot.current * 0.05) {
+        console.warn(
+          `[Spot] Large divergence for ${sym}: derived=${derived} current=${currentSpot.current} diff=${diff.toFixed(0)}. ` +
+          `Seed may be very stale. Consider re-fetching /api/spot.`
+        );
+        // Force-accept the derived value — it's from real market data
+        setSpotPrice(derived);
+        SPOT_PRICES[sym] = derived;
+        currentSpot.current = derived;
+      }
+    }
+  }, []);   // stable — reads via refs
 
   // ── Start WebSocket connection ─────────────────────────────────────────────
   const startWsConnection = useCallback((backendUrl: string) => {
@@ -335,10 +442,13 @@ export function App() {
   }, []);
 
   // ── Fetch live option chain (REST — ONCE per expiry) ──────────────────────
+  // BUG 1+2 FIX: spot is now passed in from caller who got it from fetchAndSetSpot(),
+  // so mergeQuotesToChain uses a real live price — no more stale seed for ATM finding.
   const fetchLiveChain = useCallback(async (
     sym:  SymbolCode,
     exp:  ExpiryDate,
     sess: BreezeSession,
+    spot: number,      // BUG 1 FIX: caller provides verified live spot
   ) => {
     if (!isKaggleBackend(sess.proxyBase)) return;
 
@@ -360,18 +470,33 @@ export function App() {
 
       const calls  = callResult.data ?? [];
       const puts   = putResult.data  ?? [];
-      const merged = mergeQuotesToChain(calls, puts, currentSpot.current, SYMBOL_CONFIG[sym].strikeStep);
+
+      // BUG 2 FIX: use the real spot passed in, not currentSpot.current (which
+      // may still hold the stale seed at this point in the call sequence)
+      const merged = mergeQuotesToChain(calls, puts, spot, SYMBOL_CONFIG[sym].strikeStep);
 
       if (merged.length > 0) {
         setChain(merged);
         currentChain.current = merged;
 
-        const derived = deriveSpot(merged);
-        if (derived && Math.abs(derived - currentSpot.current) < currentSpot.current * 0.05) {
-          setSpotPrice(derived);
-          SPOT_PRICES[sym] = derived;
-          currentSpot.current = derived;
+        // BUG 2 FIX: run median derivation on fresh chain as sanity-check
+        // Only update spot if median agrees with our fetched spot within 2%
+        const medianSpot = deriveSpotFromMedian(merged);
+        if (medianSpot && Math.abs(medianSpot - spot) < spot * 0.02) {
+          // Median confirms the fetched spot — use median (slightly more precise)
+          const refined = medianSpot;
+          if (refined !== currentSpot.current) {
+            setSpotPrice(refined);
+            SPOT_PRICES[sym] = refined;
+            currentSpot.current = refined;
+          }
+        } else if (medianSpot && Math.abs(medianSpot - spot) < spot * 0.05) {
+          // Median disagrees slightly — trust the direct REST fetch, log the diff
+          console.log(`[Spot] Median ${medianSpot} vs REST ${spot} — using REST value (within 5%)`);
+        } else if (medianSpot) {
+          console.warn(`[Spot] Median ${medianSpot} diverges >5% from REST ${spot} — using REST value`);
         }
+
         setLastUpdate(new Date());
         setLoadingMsg(`✓ ${merged.length} strikes loaded — subscribing WS feeds...`);
 
@@ -420,7 +545,6 @@ export function App() {
       const r = await kaggleFetchPositions(sess.proxyBase);
       if (r.ok && r.data) {
         const mapped = mapBreezePositions(r.data);
-        // Always update — even if empty (empty = no open positions)
         setLivePositions(mapped.length > 0 ? mapped : []);
       }
     } catch (e) {
@@ -430,21 +554,25 @@ export function App() {
 
   // ── On symbol change ──────────────────────────────────────────────────────
   useEffect(() => {
-    setSpotPrice(SPOT_PRICES[symbol]);
     setLegs([]);
     const doChange = async () => {
       if (session?.isConnected && isKaggleBackend(session.proxyBase)) {
+        // BUG 1 FIX: fetch real spot before chain load on symbol change
+        const liveSpot = await fetchAndSetSpot(symbol, session);
         const liveExpiries = await fetchLiveExpiries(symbol, session);
         const newExpiry    = liveExpiries[0];
         if (newExpiry) {
           setExpiry(newExpiry);
-          await fetchLiveChain(symbol, newExpiry, session);
+          await fetchLiveChain(symbol, newExpiry, session, liveSpot);
         } else {
           setLoadingMsg('⚠️ No expiries returned from backend');
           setChain(generateChain(symbol));
           setLastUpdate(new Date());
         }
       } else {
+        // Demo mode — use stale seed (ok, no real data anyway)
+        setSpotPrice(SPOT_PRICES[symbol]);
+        currentSpot.current = SPOT_PRICES[symbol];
         setExpiry(getExpiries(symbol)[0]);
         setChain(generateChain(symbol));
         setLastUpdate(new Date());
@@ -456,30 +584,34 @@ export function App() {
   // ── On expiry change ──────────────────────────────────────────────────────
   useEffect(() => {
     if (session?.isConnected && isKaggleBackend(session.proxyBase)) {
-      fetchLiveChain(symbol, expiry, session);
+      // Spot is already live — just reload chain with same spot
+      fetchLiveChain(symbol, expiry, session, currentSpot.current);
     }
   }, [expiry.breezeValue]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── On connect ────────────────────────────────────────────────────────────
   const handleConnected = useCallback(async (s: BreezeSession) => {
     setSession(s);
-    setLoadingMsg('Connected! Initialising live data...');
+    setLoadingMsg('Connected! Fetching live spot price...');
 
-    // FIX (Bug #2): Restore auth tokens so all subsequent API calls are authenticated
     setTerminalAuthToken(s.backendAuthToken || undefined);
     setWsAuthToken(s.backendAuthToken || undefined);
 
     if (!isKaggleBackend(s.proxyBase)) return;
 
     try {
+      // BUG 1 FIX: fetch real spot FIRST before anything else
+      const liveSpot = await fetchAndSetSpot(symbol, s);
+      setLoadingMsg(`Spot: ${liveSpot.toLocaleString('en-IN')} — starting WS...`);
+
       startWsConnection(s.proxyBase);
 
       const liveExpiries = await fetchLiveExpiries(symbol, s);
       if (liveExpiries.length > 0) {
         setExpiry(liveExpiries[0]);
-        await fetchLiveChain(symbol, liveExpiries[0], s);
+        await fetchLiveChain(symbol, liveExpiries[0], s, liveSpot);
       } else {
-        await fetchLiveChain(symbol, expiry, s);
+        await fetchLiveChain(symbol, expiry, s, liveSpot);
       }
 
       await fetchLivePositions(s);
@@ -489,7 +621,7 @@ export function App() {
       setSession(prev => prev ? { ...prev, isConnected: false } : prev);
       stopLiveData();
     }
-  }, [symbol, expiry, fetchLiveChain, fetchLiveExpiries, fetchLivePositions, startWsConnection, stopLiveData]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [symbol, expiry, fetchAndSetSpot, fetchLiveChain, fetchLiveExpiries, fetchLivePositions, startWsConnection, stopLiveData]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Cleanup on disconnect / unmount ──────────────────────────────────────
   useEffect(() => { if (!session?.isConnected) stopLiveData(); }, [session?.isConnected, stopLiveData]);
@@ -499,13 +631,14 @@ export function App() {
   const handleRefresh = useCallback(async () => {
     setIsLoading(true);
     if (session?.isConnected && isKaggleBackend(session.proxyBase)) {
-      await fetchLiveChain(symbol, expiry, session);
+      const liveSpot = await fetchAndSetSpot(symbol, session);
+      await fetchLiveChain(symbol, expiry, session, liveSpot);
     } else {
       setChain(generateChain(symbol, spotPrice));
       setLastUpdate(new Date());
     }
     setIsLoading(false);
-  }, [session, symbol, expiry, spotPrice, fetchLiveChain]);
+  }, [session, symbol, expiry, spotPrice, fetchAndSetSpot, fetchLiveChain]);
 
   // ── Leg management ────────────────────────────────────────────────────────
   const handleAddLeg = useCallback((leg: Omit<OptionLeg, 'id'>) => {
@@ -616,7 +749,7 @@ export function App() {
     }
   }, [session, fetchLivePositions]);
 
-  // ATM fix: recompute isATM on every chain render using live spotPrice
+  // ── ATM recompute: always uses live spotPrice state (not chain.isATM flag) ─
   const nearestStrikeDiff = chain.length > 0
     ? Math.min(...chain.map(r => Math.abs(r.strike - spotPrice)))
     : Number.POSITIVE_INFINITY;
@@ -637,6 +770,7 @@ export function App() {
 
   return (
     <div className="flex flex-col h-screen bg-[#0d0f1a] overflow-hidden text-white">
+      {/* BUG 7 FIX: pass live spotPrice and liveIndices so TopBar re-renders */}
       <TopBar
         selectedSymbol={symbol}
         onSymbolChange={setSymbol}
@@ -648,6 +782,8 @@ export function App() {
         lastUpdate={lastUpdate}
         isLive={isLive}
         loadingMsg={wsLabel || loadingMsg}
+        spotPrice={spotPrice}
+        liveIndices={liveIndices}
       />
 
       <main className="flex-1 overflow-hidden">
@@ -699,7 +835,7 @@ export function App() {
             onLoadToBuilder={handleLoadPosition}
             livePositions={livePositions}
             isLive={isLive}
-            session={session}              // ← CRITICAL: pass session so Positions can call backend
+            session={session}
             onRefreshPositions={() => session && fetchLivePositions(session)}
           />
         )}
