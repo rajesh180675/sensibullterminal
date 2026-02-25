@@ -8,7 +8,10 @@ import {
   CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer,
 } from 'recharts';
 import { Trash2, Plus, Zap, Target, BarChart2, BookOpen, ChevronDown, ChevronUp } from 'lucide-react';
-import { OptionLeg, SymbolCode } from '../types/index';
+import { OptionLeg, OptionRow, SymbolCode } from '../types/index';
+
+let _sbLid = 0;
+const nextId = () => `leg-sb-${++_sbLid}-${Date.now()}`;
 import { SYMBOL_CONFIG }          from '../config/market';
 import { buildPayoff, combinedGreeks, findBreakevens, maxProfitLoss, fmtPnL, fmtNum } from '../utils/math';
 
@@ -19,17 +22,100 @@ interface Props {
   onExecute:   (legs: OptionLeg[]) => void;
   spotPrice:   number;
   symbol:      SymbolCode;
+  chain?:      OptionRow[];  // live chain for real-time LTP/Greeks updates
 }
 
-const TEMPLATES = [
-  { name:'Bull Call Spread', icon:'📈' },
-  { name:'Bear Put Spread',  icon:'📉' },
-  { name:'Iron Condor',      icon:'🦅' },
-  { name:'Straddle',         icon:'⚖️' },
-  { name:'Strangle',         icon:'🎯' },
-  { name:'Covered Call',     icon:'🛡️' },
-  { name:'Bull Put Spread',  icon:'🐂' },
-  { name:'Butterfly',        icon:'🦋' },
+// ── Strategy template builder ─────────────────────────────────────────────────
+// Each template returns legs relative to current ATM (spotPrice) and lotSize.
+// Strikes are snapped to the nearest strikeStep.
+
+interface TemplateDef {
+  name:  string;
+  icon:  string;
+  desc:  string;
+  build: (spot: number, step: number) => Array<Omit<OptionLeg, 'id' | 'symbol' | 'expiry' | 'iv' | 'gamma' | 'vega'>>;
+}
+
+function snapStrike(price: number, step: number): number {
+  return Math.round(price / step) * step;
+}
+
+const TEMPLATES: TemplateDef[] = [
+  {
+    name: 'Bull Call Spread',
+    icon: '📈',
+    desc: 'Buy ATM CE + Sell OTM CE. Capped profit, limited risk.',
+    build: (spot, step) => [
+      { type:'CE', strike: snapStrike(spot, step),         action:'BUY',  lots:1, ltp:0, delta:0.5,  theta:-2.5 },
+      { type:'CE', strike: snapStrike(spot + step * 4, step), action:'SELL', lots:1, ltp:0, delta:0.25, theta:-1.5 },
+    ],
+  },
+  {
+    name: 'Bear Put Spread',
+    icon: '📉',
+    desc: 'Buy ATM PE + Sell OTM PE. Profits when market falls.',
+    build: (spot, step) => [
+      { type:'PE', strike: snapStrike(spot, step),         action:'BUY',  lots:1, ltp:0, delta:-0.5,  theta:-2.5 },
+      { type:'PE', strike: snapStrike(spot - step * 4, step), action:'SELL', lots:1, ltp:0, delta:-0.25, theta:-1.5 },
+    ],
+  },
+  {
+    name: 'Iron Condor',
+    icon: '🦅',
+    desc: 'Sell strangle + buy wings. Profits in range-bound markets.',
+    build: (spot, step) => [
+      { type:'CE', strike: snapStrike(spot + step * 3, step),  action:'SELL', lots:1, ltp:0, delta:0.3,  theta:-2.0 },
+      { type:'CE', strike: snapStrike(spot + step * 7, step),  action:'BUY',  lots:1, ltp:0, delta:0.1,  theta:-0.8 },
+      { type:'PE', strike: snapStrike(spot - step * 3, step),  action:'SELL', lots:1, ltp:0, delta:-0.3, theta:-2.0 },
+      { type:'PE', strike: snapStrike(spot - step * 7, step),  action:'BUY',  lots:1, ltp:0, delta:-0.1, theta:-0.8 },
+    ],
+  },
+  {
+    name: 'Straddle',
+    icon: '⚖️',
+    desc: 'Buy ATM CE + ATM PE. Profits from large moves either way.',
+    build: (spot, step) => [
+      { type:'CE', strike: snapStrike(spot, step), action:'BUY', lots:1, ltp:0, delta:0.5,  theta:-3.0 },
+      { type:'PE', strike: snapStrike(spot, step), action:'BUY', lots:1, ltp:0, delta:-0.5, theta:-3.0 },
+    ],
+  },
+  {
+    name: 'Short Straddle',
+    icon: '🎯',
+    desc: 'Sell ATM CE + ATM PE. Max profit when market stays flat.',
+    build: (spot, step) => [
+      { type:'CE', strike: snapStrike(spot, step), action:'SELL', lots:1, ltp:0, delta:0.5,  theta:3.0 },
+      { type:'PE', strike: snapStrike(spot, step), action:'SELL', lots:1, ltp:0, delta:-0.5, theta:3.0 },
+    ],
+  },
+  {
+    name: 'Strangle',
+    icon: '🌐',
+    desc: 'Buy OTM CE + OTM PE. Cheaper than straddle, needs bigger move.',
+    build: (spot, step) => [
+      { type:'CE', strike: snapStrike(spot + step * 3, step), action:'BUY', lots:1, ltp:0, delta:0.3,  theta:-2.0 },
+      { type:'PE', strike: snapStrike(spot - step * 3, step), action:'BUY', lots:1, ltp:0, delta:-0.3, theta:-2.0 },
+    ],
+  },
+  {
+    name: 'Bull Put Spread',
+    icon: '🐂',
+    desc: 'Sell OTM PE + Buy further OTM PE. Collect premium in bullish market.',
+    build: (spot, step) => [
+      { type:'PE', strike: snapStrike(spot - step * 2, step), action:'SELL', lots:1, ltp:0, delta:-0.35, theta:2.0 },
+      { type:'PE', strike: snapStrike(spot - step * 6, step), action:'BUY',  lots:1, ltp:0, delta:-0.15, theta:-0.8 },
+    ],
+  },
+  {
+    name: 'Butterfly',
+    icon: '🦋',
+    desc: 'Buy 1 ATM + Sell 2 OTM + Buy 1 far OTM. Profits near ATM at expiry.',
+    build: (spot, step) => [
+      { type:'CE', strike: snapStrike(spot, step),             action:'BUY',  lots:1, ltp:0, delta:0.5,  theta:-3.0 },
+      { type:'CE', strike: snapStrike(spot + step * 3, step),  action:'SELL', lots:2, ltp:0, delta:0.3,  theta:2.0  },
+      { type:'CE', strike: snapStrike(spot + step * 6, step),  action:'BUY',  lots:1, ltp:0, delta:0.1,  theta:-0.8 },
+    ],
+  },
 ];
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -53,8 +139,31 @@ const GCard: React.FC<{ label: string; value: number; color: string; desc: strin
 );
 
 export const StrategyBuilder: React.FC<Props> = ({
-  legs, onUpdateLeg, onRemoveLeg, onExecute, spotPrice, symbol,
+  legs, onUpdateLeg, onRemoveLeg, onExecute, spotPrice, symbol, chain,
 }) => {
+  // Live LTP sync: whenever chain ticks update, push current LTP into each leg
+  // This keeps the payoff curve and Greeks accurate during a live session
+  React.useEffect(() => {
+    if (!chain || chain.length === 0) return;
+    const chainMap = new Map(chain.map(r => [r.strike, r]));
+    legs.forEach(leg => {
+      const row = chainMap.get(leg.strike);
+      if (!row) return;
+      const liveLtp   = leg.type === 'CE' ? row.ce_ltp   : row.pe_ltp;
+      const liveDelta = leg.type === 'CE' ? row.ce_delta : row.pe_delta;
+      const liveTheta = leg.type === 'CE' ? row.ce_theta : row.pe_theta;
+      const liveIv    = leg.type === 'CE' ? row.ce_iv    : row.pe_iv;
+      const liveGamma = leg.type === 'CE' ? row.ce_gamma : row.pe_gamma;
+      const liveVega  = leg.type === 'CE' ? row.ce_vega  : row.pe_vega;
+      if (Math.abs(liveLtp - leg.ltp) > 0.01) {
+        onUpdateLeg(leg.id, {
+          ltp: liveLtp, delta: liveDelta, theta: liveTheta,
+          iv: liveIv, gamma: liveGamma, vega: liveVega,
+        });
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chain]);  // only re-run when chain data changes
   const [showTemplates, setShowTemplates] = useState(false);
   const [showConfirm,   setShowConfirm]   = useState(false);
   const [view,          setView]          = useState<'payoff'|'greeks'>('payoff');
@@ -96,7 +205,23 @@ export const StrategyBuilder: React.FC<Props> = ({
             <div className="grid grid-cols-4 gap-1.5">
               {TEMPLATES.map(t => (
                 <button key={t.name}
-                  onClick={() => { alert(`Add "${t.name}" legs from the Option Chain, then come back here.`); setShowTemplates(false); }}
+                  onClick={() => {
+                    const newLegs = t.build(spotPrice, cfg.strikeStep);
+                    const expStr  = legs[0]?.expiry ?? '';
+                    setLegs(prev => [
+                      ...prev,
+                      ...newLegs.map(l => ({
+                        ...l,
+                        id:     nextId(),
+                        symbol,
+                        expiry: expStr,
+                        iv:     14.0,
+                        gamma:  0.0002,
+                        vega:   0.15,
+                      })),
+                    ]);
+                    setShowTemplates(false);
+                  }}
                   className="flex flex-col items-center gap-1 p-2 bg-[#1a1d2e] hover:bg-[#222540] rounded-xl border border-gray-800/40 hover:border-blue-500/20 transition-colors group">
                   <span className="text-base leading-none">{t.icon}</span>
                   <span className="text-[8px] text-gray-700 group-hover:text-gray-400 text-center leading-tight">{t.name}</span>

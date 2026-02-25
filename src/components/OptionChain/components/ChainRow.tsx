@@ -5,7 +5,7 @@ import type { OptionRow } from '../../../types/index';
 import type { FlashEntry, OISignal } from '../types';
 import { FLASH_FIELD_KEYS } from '../constants';
 import { getRowValue } from '../utils/getRowValue';
-import { deriveOISignal, hasOISignalData } from '../utils/deriveOISignal';
+import { deriveOISignal } from '../utils/deriveOISignal';
 import { ActionButtons } from './ActionButtons';
 import { DataCell } from './DataCell';
 import { StrikeCell } from './StrikeCell';
@@ -56,19 +56,18 @@ export const ChainRow = memo<ChainRowProps>(
     }, [onAddLeg, row.strike]);
 
     // SPEC-F2: Derive OI signals
+    // FIX-4: ce_ltpChg / pe_ltpChg are now real fields tracked in OptionRow
+    //        (applyTicksToChain and simulateTick both populate them)
     const ceSignal: OISignal = useMemo(() => {
       if (!showOISignals) return 'neutral';
-      const ltpChg = getRowValue(row, 'ce_ltpChg');
-      if (ltpChg === 0 && !hasOISignalData(row)) return 'neutral';
-      return deriveOISignal(row.ce_oiChg, ltpChg);
-    }, [row, showOISignals]);
+      // ce_ltpChg is a real field — no longer 0 after first tick
+      return deriveOISignal(row.ce_oiChg, row.ce_ltpChg);
+    }, [row.ce_oiChg, row.ce_ltpChg, showOISignals]);
 
     const peSignal: OISignal = useMemo(() => {
       if (!showOISignals) return 'neutral';
-      const ltpChg = getRowValue(row, 'pe_ltpChg');
-      if (ltpChg === 0 && !hasOISignalData(row)) return 'neutral';
-      return deriveOISignal(row.pe_oiChg, ltpChg);
-    }, [row, showOISignals]);
+      return deriveOISignal(row.pe_oiChg, row.pe_ltpChg);
+    }, [row.pe_oiChg, row.pe_ltpChg, showOISignals]);
 
     // Stable callbacks for ActionButtons (SPEC perf fix for #8)
     const buyCE = useCallback(() => onAddLeg(row.strike, 'CE', 'BUY'), [onAddLeg, row.strike]);

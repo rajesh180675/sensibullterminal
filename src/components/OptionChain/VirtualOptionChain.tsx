@@ -56,6 +56,7 @@ const VirtualOptionChainInner: React.FC<OptionChainProps> = ({
   isLive,
   loadingMsg,
   error,
+  availableExpiries: _availableExpiries,  // FIX-5 accepted but unused in virtual renderer
 }) => {
   const [prefs, updatePrefs] = useChainPreferences();
   const tableContainerRef = useRef<HTMLDivElement | null>(null);

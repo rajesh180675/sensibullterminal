@@ -9,10 +9,10 @@ export interface SymbolConfig {
   code:               SymbolCode;
   displayName:        string;
   exchange:           'NFO' | 'BFO';
-  breezeStockCode:    string;   // 'NIFTY' or 'BSESEN'
-  breezeExchangeCode: string;   // 'NFO' or 'BFO'
-  strikeStep:         number;   // NIFTY=50, SENSEX=100
-  lotSize:            number;   // NIFTY=65, SENSEX=20
+  breezeStockCode:    string;
+  breezeExchangeCode: string;
+  strikeStep:         number;
+  lotSize:            number;
   expiryDay:          'Tuesday' | 'Thursday';
   color:              string;
   bg:                 string;
@@ -32,6 +32,8 @@ export interface OptionRow {
   ce_vega:    number;
   ce_bid:     number;
   ce_ask:     number;
+  // FIX: LTP change fields for OI signal price-direction component
+  ce_ltpChg:  number;
   pe_ltp:     number;
   pe_oi:      number;
   pe_oiChg:   number;
@@ -43,6 +45,8 @@ export interface OptionRow {
   pe_vega:    number;
   pe_bid:     number;
   pe_ask:     number;
+  // FIX: LTP change fields for OI signal price-direction component
+  pe_ltpChg:  number;
 }
 
 export interface OptionLeg {
@@ -107,26 +111,23 @@ export interface PositionLeg {
 }
 
 export interface MarketIndex {
-  label:  string;
-  value:  number;
-  change: number;
-  pct:    number;
+  label:   string;
+  value:   number;
+  change:  number;
+  pct:     number;
+  dayOpen: number;  // FIX: track day-open for accurate change%
 }
 
 // ── Breeze session (browser state — no backend) ─────────────
 export interface BreezeCredentials {
   apiKey:       string;
-  apiSecret:    string;    // Used for checksum only — stays in memory
-  sessionToken: string;    // Daily token from ?apisession= URL param
+  apiSecret:    string;
+  sessionToken: string;
 }
 
 export interface BreezeSession extends BreezeCredentials {
   isConnected:  boolean;
   connectedAt?: Date;
-  proxyBase:    string;    // Kaggle backend URL OR CORS proxy URL prefix
-  /**
-   * Optional shared secret for securing a public tunnel backend.
-   * Sent as `X-Terminal-Auth` header to the Python backend.
-   */
+  proxyBase:    string;
   backendAuthToken?: string;
 }

@@ -71,7 +71,7 @@ export const TopBar: React.FC<Props> = ({
       <div className="bg-[#0a0c15] border-b border-gray-800/70 overflow-hidden h-[22px] flex items-center">
         <div className="ticker-track">
           {doubled.map((idx, i) => (
-            <span key={`${idx.label}-${Math.floor(i / Math.max(1, (liveIndices?.length ?? 1)))}`} className="flex items-center gap-1.5 px-4 text-[10px] whitespace-nowrap">
+            <span key={i} className="flex items-center gap-1.5 px-4 text-[10px] whitespace-nowrap">
               <span className="text-gray-600 font-medium">{idx.label}</span>
               <span className="text-gray-300 font-bold mono">
                 {idx.value.toLocaleString('en-IN', { minimumFractionDigits: 2 })}

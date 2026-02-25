@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════════════════════
-// POSITIONS PANEL v10 — Debug & Integration Fix Pass
+// POSITIONS PANEL v11 — Sell + TradeOptions overhaul
 //
 // CHANGES FROM v9:
 // ────────────────
@@ -44,7 +44,7 @@ import {
 } from 'lucide-react';
 import { Position, SymbolCode, BreezeSession } from '../types/index';
 import { MOCK_POSITIONS } from '../data/mock';
-import { SYMBOL_CONFIG } from '../config/market';
+import { SYMBOL_CONFIG, ALL_SYMBOLS, getExpiries } from '../config/market';
 import { fmtPnL } from '../utils/math';
 import {
   fetchFunds, fetchOrderBook, fetchTradeBook,
@@ -1142,7 +1142,7 @@ const SquareOffModal: FC<{
           squareOffPosition(backendUrl, {
             stockCode: cfg.breezeStockCode,
             exchangeCode: cfg.breezeExchangeCode,
-            action: leg.origAction,
+            action: leg.exitAction,  // FIX: exit requires OPPOSITE action to original
             quantity: String(qty),
             expiryDate: pos.expiry,
             right: leg.type === 'CE' ? 'call' : 'put',
@@ -1892,11 +1892,24 @@ const SquareOffModal: FC<{
 
 const TradeOptionsPanel: FC<{
   backendUrl: string;
-  symbol: SymbolCode;
-  expiry: string;
+  // FIX: symbol+expiry now have defaults; parent can still pass overrides
+  initialSymbol?: SymbolCode;
+  initialExpiry?: string;
   onDone: () => void;
-}> = React.memo(({ backendUrl, symbol, expiry, onDone }) => {
+}> = React.memo(({ backendUrl, initialSymbol, initialExpiry, onDone }) => {
+  // ── Own symbol/expiry state ── 
+  // FIX: TradeOptionsPanel manages its own symbol and expiry independently
+  // so it always shows NIFTY + BSESEN (SENSEX) regardless of open positions.
+  const [symbol, setSymbol] = useState<SymbolCode>(initialSymbol ?? 'NIFTY');
   const cfg = SYMBOL_CONFIG[symbol];
+
+  // When symbol changes, reset expiry to the first available for that symbol
+  const [expiry, setExpiry] = useState<string>(
+    () => initialExpiry ?? getExpiries(initialSymbol ?? 'NIFTY')[0]?.breezeValue ?? '',
+  );
+  useEffect(() => {
+    setExpiry(getExpiries(symbol)[0]?.breezeValue ?? '');
+  }, [symbol]);
 
   const [optType, setOptType] = useState<'CE' | 'PE'>('CE');
   const [action, setAction] = useState<'BUY' | 'SELL'>('BUY');
@@ -1905,30 +1918,25 @@ const TradeOptionsPanel: FC<{
   const [orderType, setOrderType] = useState<OrderType>('market');
   const [limitPrice, setLimitPrice] = useState('');
   const [placing, setPlacing] = useState(false);
-  const [result, setResult] = useState<{
-    ok: boolean;
-    msg: string;
-  } | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [showConfirm, setShowConfirm] = useState(false);
 
+  // FIX: lots max is 500 (reasonable upper bound for retail); qty shown live
+  const MAX_LOTS = 500;
   const qty = lots * cfg.lotSize;
-  const strikeError = strike
-    ? validateStrike(strike, cfg.strikeStep)
-    : null;
-  const priceError =
-    orderType === 'limit' && limitPrice
-      ? validateLimitPrice(limitPrice)
-      : null;
-  const canSubmit =
-    !!strike &&
-    !strikeError &&
-    !priceError &&
-    (orderType !== 'limit' || !!limitPrice) &&
-    !!expiry;
 
-  useEffect(() => {
-    setResult(null);
-  }, [optType, action, strike, lots, orderType, limitPrice]);
+  const strikeError = strike ? validateStrike(strike, cfg.strikeStep) : null;
+  const priceError = orderType === 'limit' && limitPrice
+    ? validateLimitPrice(limitPrice)
+    : null;
+  const canSubmit =
+    !!strike && !strikeError && !priceError &&
+    (orderType !== 'limit' || !!limitPrice) && !!expiry;
+
+  useEffect(() => { setResult(null); }, [optType, action, strike, lots, orderType, limitPrice, symbol, expiry]);
+
+  // When symbol changes, clear strike (step size differs between NIFTY/BSESEN)
+  useEffect(() => { setStrike(''); setLots(1); }, [symbol]);
 
   const resetForm = useCallback(() => {
     setStrike('');
@@ -1942,17 +1950,19 @@ const TradeOptionsPanel: FC<{
     setPlacing(true);
     setResult(null);
     try {
+      // FIX: use cfg from current symbol state, not stale closure
+      const currentCfg = SYMBOL_CONFIG[symbol];
       const r = await withRetry(() =>
         placeOrder(backendUrl, {
-          stockCode: cfg.breezeStockCode,
-          exchangeCode: cfg.breezeExchangeCode,
+          stockCode:    currentCfg.breezeStockCode,
+          exchangeCode: currentCfg.breezeExchangeCode,
           action,
-          quantity: String(qty),
-          expiryDate: expiry,
-          right: optType === 'CE' ? 'call' : 'put',
-          strikePrice: strike,
+          quantity:     String(qty),
+          expiryDate:   expiry,
+          right:        optType === 'CE' ? 'call' : 'put',
+          strikePrice:  strike,
           orderType,
-          price: orderType === 'limit' ? limitPrice : '0',
+          price:        orderType === 'limit' ? limitPrice : '0',
         }),
       );
       setResult({
@@ -1975,43 +1985,70 @@ const TradeOptionsPanel: FC<{
   };
 
   return (
-    <div className="p-4 space-y-4 max-w-[520px] mx-auto">
+    <div className="p-4 space-y-4 max-w-[540px] mx-auto">
       <div className="bg-[#1a1d2e] rounded-2xl border border-gray-700/30 p-5 space-y-4">
         <div className="flex items-center gap-2 mb-1">
           <Activity size={14} className="text-blue-400" />
-          <span className="text-white font-bold text-sm">
-            Place Option Order
+          <span className="text-white font-bold text-sm">Place Option Order</span>
+          <span className="ml-auto text-[9px] text-gray-600 bg-gray-800/40 px-2 py-0.5 rounded-full">
+            Live · ICICI Breeze
           </span>
         </div>
 
-        <div className="flex items-center gap-2 p-2.5 bg-blue-500/8 border border-blue-500/20 rounded-xl text-[11px]">
-          <Info
-            size={11}
-            className="text-blue-400 flex-shrink-0"
-          />
-          <span className="text-blue-300">
-            {cfg.displayName} · Expiry:{' '}
-            <strong>
-              {expiry || (
-                <span className="text-red-400">not set</span>
-              )}
-            </strong>{' '}
-            · Lot:{' '}
-            <strong className="text-amber-400">
-              {cfg.lotSize}
-            </strong>
-          </span>
+        {/* ── Symbol + Expiry selectors (own state) ── */}
+        <div className="grid grid-cols-2 gap-3">
+          {/* Symbol */}
+          <div>
+            <label className="text-gray-500 text-[10px] font-semibold mb-1.5 block">
+              Symbol
+            </label>
+            <select
+              value={symbol}
+              onChange={e => setSymbol(e.target.value as SymbolCode)}
+              className="w-full bg-[#0a0c15] border border-gray-700/40 focus:border-blue-500/60 text-white text-sm rounded-xl px-3 py-2.5 outline-none transition-colors"
+              aria-label="Symbol"
+            >
+              {/* FIX: always shows NIFTY + BSESEN (SENSEX) */}
+              {ALL_SYMBOLS.map(s => (
+                <option key={s} value={s}>
+                  {SYMBOL_CONFIG[s].displayName}
+                </option>
+              ))}
+            </select>
+            <p className="text-[9px] text-gray-700 mt-0.5">
+              ICICI code: <span className="text-amber-500/70 font-mono">{cfg.breezeStockCode}</span>
+              {' · '}lot size: <span className="text-amber-400 font-bold">{cfg.lotSize}</span>
+            </p>
+          </div>
+          {/* Expiry */}
+          <div>
+            <label className="text-gray-500 text-[10px] font-semibold mb-1.5 block">
+              Expiry
+            </label>
+            <select
+              value={expiry}
+              onChange={e => setExpiry(e.target.value)}
+              className="w-full bg-[#0a0c15] border border-gray-700/40 focus:border-blue-500/60 text-white text-sm rounded-xl px-3 py-2.5 outline-none transition-colors"
+              aria-label="Expiry"
+            >
+              {getExpiries(symbol).map(e => (
+                <option key={e.breezeValue} value={e.breezeValue}>
+                  {e.label} ({e.daysToExpiry}d)
+                </option>
+              ))}
+            </select>
+            <p className="text-[9px] text-gray-700 mt-0.5">
+              {cfg.expiryDay} weekly expiry
+            </p>
+          </div>
         </div>
 
-        {/* Option Type */}
+        {/* ── Option Type ── */}
         <fieldset>
           <legend className="text-gray-500 text-[10px] font-semibold mb-1.5">
             Option Type
           </legend>
-          <div
-            className="flex rounded-xl overflow-hidden border border-gray-700/40"
-            role="radiogroup"
-          >
+          <div className="flex rounded-xl overflow-hidden border border-gray-700/40" role="radiogroup">
             {(['CE', 'PE'] as const).map(t => (
               <button
                 key={t}
@@ -2020,9 +2057,7 @@ const TradeOptionsPanel: FC<{
                 aria-checked={optType === t}
                 className={`flex-1 py-2.5 text-sm font-bold transition-colors ${
                   optType === t
-                    ? t === 'CE'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-orange-600 text-white'
+                    ? t === 'CE' ? 'bg-blue-600 text-white' : 'bg-orange-600 text-white'
                     : 'text-gray-600 hover:text-gray-300 bg-[#1a1d2e]'
                 }`}
               >
@@ -2032,15 +2067,12 @@ const TradeOptionsPanel: FC<{
           </div>
         </fieldset>
 
-        {/* Action */}
+        {/* ── Action ── */}
         <fieldset>
           <legend className="text-gray-500 text-[10px] font-semibold mb-1.5">
             Action
           </legend>
-          <div
-            className="flex rounded-xl overflow-hidden border border-gray-700/40"
-            role="radiogroup"
-          >
+          <div className="flex rounded-xl overflow-hidden border border-gray-700/40" role="radiogroup">
             {(['BUY', 'SELL'] as const).map(a => (
               <button
                 key={a}
@@ -2049,9 +2081,7 @@ const TradeOptionsPanel: FC<{
                 aria-checked={action === a}
                 className={`flex-1 py-2.5 text-sm font-bold transition-colors ${
                   action === a
-                    ? a === 'BUY'
-                      ? 'bg-emerald-600 text-white'
-                      : 'bg-red-600 text-white'
+                    ? a === 'BUY' ? 'bg-emerald-600 text-white' : 'bg-red-600 text-white'
                     : 'text-gray-600 hover:text-gray-300 bg-[#1a1d2e]'
                 }`}
               >
@@ -2061,16 +2091,11 @@ const TradeOptionsPanel: FC<{
           </div>
         </fieldset>
 
-        {/* Strike */}
+        {/* ── Strike ── */}
         <div>
-          <label
-            htmlFor="strike-input"
-            className="text-gray-500 text-[10px] font-semibold mb-1.5 block"
-          >
+          <label htmlFor="strike-input" className="text-gray-500 text-[10px] font-semibold mb-1.5 block">
             Strike{' '}
-            <span className="text-gray-700">
-              (step ₹{cfg.strikeStep})
-            </span>
+            <span className="text-gray-700">(step ₹{cfg.strikeStep})</span>
           </label>
           <input
             id="strike-input"
@@ -2088,16 +2113,15 @@ const TradeOptionsPanel: FC<{
             aria-invalid={!!strikeError}
           />
           {strikeError && (
-            <p className="text-red-400 text-[10px] mt-1">
-              ⚠ {strikeError}
-            </p>
+            <p className="text-red-400 text-[10px] mt-1">⚠ {strikeError}</p>
           )}
         </div>
 
-        {/* Lots */}
+        {/* ── Lots + Qty ── */}
         <div>
           <label className="text-gray-500 text-[10px] font-semibold mb-2 block">
             Lots
+            <span className="text-gray-700 ml-1 font-normal">(1–{MAX_LOTS})</span>
           </label>
           <div className="flex items-center gap-3 mb-2">
             <button
@@ -2112,20 +2136,17 @@ const TradeOptionsPanel: FC<{
               type="number"
               value={lots}
               min={1}
-              max={100}
+              max={MAX_LOTS}
               onChange={e => {
                 const v = parseInt(e.target.value, 10);
-                if (!Number.isNaN(v))
-                  setLots(clamp(v, 1, 100));
+                if (!Number.isNaN(v)) setLots(clamp(v, 1, MAX_LOTS));
               }}
-              className="flex-1 text-center bg-[#0a0c15] border border-gray-700/40 text-white text-lg rounded-xl py-2 mono outline-none font-bold"
+              className="flex-1 text-center bg-[#0a0c15] border border-gray-700/40 focus:border-blue-500/60 text-white text-lg rounded-xl py-2 mono outline-none font-bold"
               aria-label="Lots"
             />
             <button
-              onClick={() =>
-                setLots(l => Math.min(100, l + 1))
-              }
-              disabled={lots >= 100}
+              onClick={() => setLots(l => Math.min(MAX_LOTS, l + 1))}
+              disabled={lots >= MAX_LOTS}
               className="w-10 h-10 bg-gray-700/60 hover:bg-gray-600 disabled:opacity-30 text-white rounded-xl flex items-center justify-center"
               aria-label="Increase"
             >
@@ -2135,29 +2156,22 @@ const TradeOptionsPanel: FC<{
           <div className="bg-[#0e1018] rounded-xl border border-gray-800/40 px-4 py-2.5 flex items-center justify-between">
             <span className="text-gray-600 text-[11px]">
               {lots}L ×{' '}
-              <span className="text-amber-400 font-bold">
-                {cfg.lotSize}
-              </span>{' '}
-              =
+              <span className="text-amber-400 font-bold">{cfg.lotSize}</span>
+              {' '}=
             </span>
             <span className="text-white font-black text-xl mono">
               {qty}{' '}
-              <span className="text-gray-600 text-[10px] font-normal">
-                qty
-              </span>
+              <span className="text-gray-600 text-[10px] font-normal">qty</span>
             </span>
           </div>
         </div>
 
-        {/* Order Type */}
+        {/* ── Order Type ── */}
         <fieldset>
           <legend className="text-gray-500 text-[10px] font-semibold mb-1.5">
             Order Type
           </legend>
-          <div
-            className="flex rounded-xl overflow-hidden border border-gray-700/40"
-            role="radiogroup"
-          >
+          <div className="flex rounded-xl overflow-hidden border border-gray-700/40" role="radiogroup">
             {(['market', 'limit'] as const).map(ot => (
               <button
                 key={ot}
@@ -2166,9 +2180,7 @@ const TradeOptionsPanel: FC<{
                 aria-checked={orderType === ot}
                 className={`flex-1 py-2.5 text-sm font-bold transition-colors ${
                   orderType === ot
-                    ? ot === 'market'
-                      ? 'bg-amber-600 text-white'
-                      : 'bg-blue-600 text-white'
+                    ? ot === 'market' ? 'bg-amber-600 text-white' : 'bg-blue-600 text-white'
                     : 'text-gray-600 hover:text-gray-300 bg-[#1a1d2e]'
                 }`}
               >
@@ -2178,12 +2190,10 @@ const TradeOptionsPanel: FC<{
           </div>
         </fieldset>
 
+        {/* ── Limit Price ── */}
         {orderType === 'limit' && (
           <div>
-            <label
-              htmlFor="limit-price"
-              className="text-gray-500 text-[10px] font-semibold mb-1.5 block"
-            >
+            <label htmlFor="limit-price" className="text-gray-500 text-[10px] font-semibold mb-1.5 block">
               Limit Price (₹)
             </label>
             <input
@@ -2202,59 +2212,42 @@ const TradeOptionsPanel: FC<{
               aria-invalid={!!priceError}
             />
             {priceError && (
-              <p className="text-red-400 text-[10px] mt-1">
-                ⚠ {priceError}
-              </p>
+              <p className="text-red-400 text-[10px] mt-1">⚠ {priceError}</p>
             )}
           </div>
         )}
 
-        {/* Preview */}
+        {/* ── Order Preview ── */}
         {strike && !strikeError && (
-          <div
-            className={`p-3 rounded-xl border text-[11px] ${
-              action === 'BUY'
-                ? 'bg-emerald-500/6 border-emerald-500/20'
-                : 'bg-red-500/6 border-red-500/20'
-            }`}
-          >
-            <div className="text-gray-500 text-[9px] mb-1 uppercase tracking-wider">
-              Preview
-            </div>
+          <div className={`p-3 rounded-xl border text-[11px] ${
+            action === 'BUY'
+              ? 'bg-emerald-500/6 border-emerald-500/20'
+              : 'bg-red-500/6 border-red-500/20'
+          }`}>
+            <div className="text-gray-500 text-[9px] mb-1 uppercase tracking-wider">Preview</div>
             <div className="flex flex-wrap gap-2 items-center">
-              <span
-                className={`font-black text-base ${action === 'BUY' ? 'text-emerald-400' : 'text-red-400'}`}
-              >
+              <span className={`font-black text-base ${action === 'BUY' ? 'text-emerald-400' : 'text-red-400'}`}>
                 {action}
               </span>
-              <span
-                className={`font-bold ${optType === 'CE' ? 'text-blue-300' : 'text-orange-300'}`}
-              >
+              <span className="text-white font-bold mono">{cfg.displayName}</span>
+              <span className="text-gray-500">·</span>
+              <span className="text-white font-bold mono">{strike}</span>
+              <span className={`font-bold ${optType === 'CE' ? 'text-blue-300' : 'text-orange-300'}`}>
                 {optType}
               </span>
-              <span className="text-white font-bold mono">
-                {strike}
+              <span className="text-gray-500">·</span>
+              <span className="text-amber-400 font-bold">{lots}L = {qty}qty</span>
+              <span className="text-gray-500">·</span>
+              <span className={orderType === 'market' ? 'text-amber-400' : 'text-blue-400'}>
+                {orderType === 'market' ? 'MARKET' : `LIMIT ₹${limitPrice}`}
               </span>
               <span className="text-gray-500">·</span>
-              <span className="text-amber-400 font-bold">
-                {lots}L={qty}qty
-              </span>
-              <span className="text-gray-500">·</span>
-              <span
-                className={
-                  orderType === 'market'
-                    ? 'text-amber-400'
-                    : 'text-blue-400'
-                }
-              >
-                {orderType === 'market'
-                  ? 'MARKET'
-                  : `LIMIT ₹${limitPrice}`}
-              </span>
+              <span className="text-gray-400 text-[10px]">{expiry}</span>
             </div>
           </div>
         )}
 
+        {/* ── Result ── */}
         {result && (
           <div
             className={`p-3 rounded-xl border text-[11px] font-mono ${
@@ -2268,6 +2261,7 @@ const TradeOptionsPanel: FC<{
           </div>
         )}
 
+        {/* ── Submit ── */}
         <button
           onClick={() => setShowConfirm(true)}
           disabled={placing || !canSubmit}
@@ -2278,20 +2272,14 @@ const TradeOptionsPanel: FC<{
           }`}
         >
           {placing ? (
-            <>
-              <RefreshCw size={14} className="animate-spin" />
-              Placing…
-            </>
+            <><RefreshCw size={14} className="animate-spin" />Placing…</>
           ) : (
-            <>
-              <Crosshair size={14} />
-              {action} {lots}L {optType}{' '}
-              {strike ? `@ ${strike}` : ''}
-            </>
+            <><Crosshair size={14} />{action} {lots}L {optType}{strike ? ` @ ${strike}` : ''}</>
           )}
         </button>
       </div>
 
+      {/* ── Confirm Dialog ── */}
       <ConfirmDialog
         open={showConfirm}
         title="Confirm Live Order"
@@ -2303,52 +2291,45 @@ const TradeOptionsPanel: FC<{
         message={
           <div className="space-y-2">
             <p>
-              Place a{' '}
-              <strong className="text-white">{action}</strong>{' '}
-              order:
+              Place a <strong className="text-white">{action}</strong> order via ICICI Breeze:
             </p>
             <div className="bg-[#0a0c15] rounded-xl p-3 text-[11px] font-mono space-y-1 border border-gray-800/40">
               <p>
-                <span className="text-gray-500">
-                  Instrument:
-                </span>{' '}
-                <span className="text-white">
-                  {cfg.displayName} {strike} {optType}
-                </span>
+                <span className="text-gray-500">Symbol:</span>{' '}
+                <span className="text-white">{cfg.displayName}</span>
+                <span className="text-gray-600 ml-2">({cfg.breezeStockCode} / {cfg.breezeExchangeCode})</span>
+              </p>
+              <p>
+                <span className="text-gray-500">Instrument:</span>{' '}
+                <span className="text-white">{strike} {optType}</span>
+              </p>
+              <p>
+                <span className="text-gray-500">Expiry:</span>{' '}
+                <span className="text-blue-300">{expiry}</span>
               </p>
               <p>
                 <span className="text-gray-500">Qty:</span>{' '}
-                <span className="text-amber-400">
-                  {lots}L×{cfg.lotSize}={qty}
-                </span>
+                <span className="text-amber-400">{lots}L × {cfg.lotSize} = {qty}</span>
               </p>
               <p>
                 <span className="text-gray-500">Type:</span>{' '}
-                <span
-                  className={
-                    orderType === 'market'
-                      ? 'text-amber-400'
-                      : 'text-blue-400'
-                  }
-                >
+                <span className={orderType === 'market' ? 'text-amber-400' : 'text-blue-400'}>
                   {orderType.toUpperCase()}
                 </span>{' '}
                 {orderType === 'limit' && (
-                  <span className="text-blue-300">
-                    ₹{limitPrice}
-                  </span>
+                  <span className="text-blue-300">₹{limitPrice}</span>
                 )}
               </p>
             </div>
             <p className="text-red-300 text-[10px] font-semibold">
-              ⚠ LIVE order — verify carefully.
+              ⚠ LIVE order — will execute immediately. Cannot be undone.
             </p>
           </div>
         }
       />
     </div>
   );
-});
+})
 TradeOptionsPanel.displayName = 'TradeOptionsPanel';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3826,38 +3807,21 @@ const PositionsInner: FC<Props> = ({
   );
 
   // Symbol/expiry for trade panel
-  const symbolChoices = useMemo(() => {
-    const set = new Set(
-      positions.map(p => p.symbol as SymbolCode),
-    );
-    return set.size > 0
-      ? Array.from(set)
-      : (['NIFTY'] as SymbolCode[]);
-  }, [positions]);
-  const expiryChoices = useMemo(
-    () =>
-      Array.from(
-        new Set(positions.map(p => p.expiry)),
-      ).filter(Boolean),
-    [positions],
-  );
+  // FIX: Always show all supported symbols — not just those in existing positions.
+  // This allows trading NIFTY or BSESEN (SENSEX) even with no open positions.
+  const symbolChoices: SymbolCode[] = ALL_SYMBOLS;
 
-  const [tradeSym, setTradeSym] = useState<SymbolCode>(
-    symbolChoices[0],
-  );
+  // FIX: initialise tradeSym to 'NIFTY' (always valid), not symbolChoices[0]
+  // which was computed from a memo that may not be populated yet.
+  // expiryChoices is now managed inside TradeOptionsPanel via getExpiries(symbol).
+  const [tradeSym, setTradeSym] = useState<SymbolCode>('NIFTY');
+
+  // FIX: initialise tradeExpiry lazily from the correct symbol's schedule
   const [tradeExpiry, setTradeExpiry] = useState(
-    expiryChoices[0] ?? '',
+    () => getExpiries('NIFTY')[0]?.breezeValue ?? '',
   );
 
-  useEffect(() => {
-    if (!symbolChoices.includes(tradeSym))
-      setTradeSym(symbolChoices[0]);
-  }, [symbolChoices, tradeSym]);
 
-  useEffect(() => {
-    if (tradeExpiry && !expiryChoices.includes(tradeExpiry))
-      setTradeExpiry(expiryChoices[0] ?? '');
-  }, [expiryChoices, tradeExpiry]);
 
   // ── Data loaders with deduplication + retry ──
   const loadFunds = useCallback(async () => {
@@ -4472,67 +4436,20 @@ const PositionsInner: FC<Props> = ({
         <div role="tabpanel" id="tabpanel-trade">
           {canFetch ? (
             <div className="space-y-3">
-              <div className="mx-4 rounded-2xl border border-gray-700/30 bg-[#1a1d2e] p-3 flex items-center gap-3 flex-wrap">
-                <label
-                  htmlFor="trade-sym"
-                  className="text-[10px] text-gray-500"
-                >
-                  Symbol
-                </label>
-                <select
-                  id="trade-sym"
-                  value={tradeSym}
-                  onChange={e =>
-                    setTradeSym(
-                      e.target.value as SymbolCode,
-                    )
-                  }
-                  className="bg-[#0e1018] border border-gray-700/50 rounded-lg px-2 py-1 text-[11px] text-white outline-none focus:border-blue-500/50"
-                >
-                  {symbolChoices.map(s => (
-                    <option key={s} value={s}>
-                      {s}
-                    </option>
-                  ))}
-                </select>
-                <label
-                  htmlFor="trade-exp"
-                  className="text-[10px] text-gray-500"
-                >
-                  Expiry
-                </label>
-                <select
-                  id="trade-exp"
-                  value={tradeExpiry}
-                  onChange={e =>
-                    setTradeExpiry(e.target.value)
-                  }
-                  className="bg-[#0e1018] border border-gray-700/50 rounded-lg px-2 py-1 text-[11px] text-white outline-none focus:border-blue-500/50"
-                >
-                  {expiryChoices.length > 0 ? (
-                    expiryChoices.map(ex => (
-                      <option key={ex} value={ex}>
-                        {ex}
-                      </option>
-                    ))
-                  ) : (
-                    <option value="">Select expiry</option>
-                  )}
-                </select>
-              </div>
+              {/* Quick-jump defaults passed to the panel as initialSymbol/initialExpiry.
+                  The panel itself has its own selectors and manages state independently. */}
+              {/* FIX: TradeOptionsPanel now self-contained — manages its own
+                  symbol + expiry state. Parent selector above is kept for
+                  a quick-jump default (initialSymbol/initialExpiry), but
+                  the panel independently keeps NIFTY and BSESEN in sync. */}
               <TradeOptionsPanel
                 backendUrl={backendUrl}
-                symbol={tradeSym}
-                expiry={tradeExpiry}
+                initialSymbol={tradeSym}
+                initialExpiry={tradeExpiry}
                 onDone={() => {
                   onRefreshPositions?.();
-                  // FIX: also reload order book so new order appears
-                  // in Orders/Sell tabs without requiring manual navigation.
                   loadOrders();
-                  addToast(
-                    'Order placed successfully',
-                    'success',
-                  );
+                  addToast('Order placed successfully', 'success');
                 }}
               />
             </div>

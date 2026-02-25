@@ -40,6 +40,7 @@ const OptionChainInner: React.FC<OptionChainProps> = ({
   symbol, data, spotPrice, selectedExpiry, onExpiryChange,
   onAddLeg, highlightedStrikes, lastUpdate, isLoading, onRefresh,
   isLive, loadingMsg, error, strikeRange: strikeRangeProp,
+  availableExpiries,  // FIX-5
 }) => {
   // ── Preferences (SPEC-F4) ───────────────────────────────
   const [prefs, updatePrefs] = useChainPreferences();
@@ -49,7 +50,11 @@ const OptionChainInner: React.FC<OptionChainProps> = ({
 
   // ── Config ───────────────────────────────────────────────
   const cfg = SYMBOL_CONFIG[symbol];
-  const expiries = useMemo(() => (cfg ? getExpiries(symbol) : []), [symbol, cfg]);
+  // FIX-5: prefer live backend expiries; fall back to static calculation
+  const expiries = useMemo(
+    () => availableExpiries?.length ? availableExpiries : (cfg ? getExpiries(symbol) : []),
+    [symbol, cfg, availableExpiries],
+  );
 
   // ── Hooks ────────────────────────────────────────────────
   const filteredData = useFilteredData(data, prefs.strikeRange, spotPrice, symbol);

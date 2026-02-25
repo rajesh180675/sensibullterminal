@@ -21,6 +21,8 @@ export interface OptionChainProps {
   loadingMsg?: string;
   error?: string | null;
   strikeRange?: number;
+  // FIX-5: live expiries from backend so Toolbar shows correct options
+  availableExpiries?: ExpiryDate[];
 }
 
 // ════════════════════════════════════════════════════════════════

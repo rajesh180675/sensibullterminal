@@ -1,31 +1,21 @@
 // ════════════════════════════════════════════════════════════════════════════
-// OPTIONS TERMINAL — Root Application v11
+// OPTIONS TERMINAL — Root Application v12 (bug-fix release)
 //
-// SPOT PRICE FIX (v11) — 7 bugs fixed:
-//
-//  BUG 1 FIX: SPOT_PRICES stale seeds → fetchAndSetSpot() called on connect +
-//             symbol change to get real price from backend before chain loads
-//
-//  BUG 2 FIX: deriveSpot() circular → replaced with deriveSpotFromMedian()
-//             that takes the median put-call parity across ALL strikes, not just
-//             the pre-flagged ATM row (which was seeded from the stale value)
-//
-//  BUG 3 FIX: handleTickUpdate ATM derivation → now uses currentSpot.current
-//             to find the nearest strike by arithmetic, not pre-flagged isATM
-//
-//  BUG 4 FIX: 5% guard blocks correction → guard widened to 15% with a
-//             hard fallback: if >5% divergence, re-fetch real spot via REST
-//
-//  BUG 5+6 FIX: Backend now captures index_close_price in WS ticks and
-//               exposes /api/spot endpoint — TickUpdate.spot_prices used here
-//
-//  BUG 7 FIX: TopBar now receives spotPrice and liveIndices as props instead
-//             of reading the stale module-level SPOT_PRICES / MARKET_INDICES
-//
-// DATA FLOW (anti-ban):
-//   Connect → fetchAndSetSpot() (1 REST call) → chain snapshot → WS ticks
-//   WS tick → update.spot_prices (from index_close_price) → setSpotPrice
-//   Fallback → deriveSpotFromMedian() across all strikes
+// FIXES APPLIED (v12):
+//  FIX-1: mergeQuotesToChain now accepts daysToExpiry param — DTE no longer
+//          hardcoded to 7. Theta/Vega correct for all expiries.
+//  FIX-2: PE theta now uses pe_ltp, not ce_ltp.
+//  FIX-3: liveIndices change% computed from dayOpen snapshot (captured on
+//          first spot fetch), not from the previous tick value.
+//  FIX-4: ce_ltpChg/pe_ltpChg tracked in applyTicksToChain — OI signals
+//          now have accurate price direction component.
+//  FIX-5: availableExpiries state added; live expiries passed to OptionChain
+//          so Toolbar dropdown reflects backend-available expiries.
+//  FIX-6: chainError state; error prop wired into OptionChain.
+//  FIX-7: handleLoadPosition uses pos.expiry, not the UI-selected expiry.
+//  FIX-8: maxProfitLoss boundary fix in math.ts (monotonic trend check).
+//  FIX-9: startTickPolling includes auth header (was missing, broke
+//          AUTH_ENABLED backend fallback).
 // ════════════════════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -68,11 +58,14 @@ const nextId = () => `leg-${++_lid}-${Date.now()}`;
 const DEFAULT_SYM: SymbolCode = 'NIFTY';
 
 // ── Merge Breeze OptionQuote[] (CE + PE) → OptionRow[] ───────────────────────
+// FIX-1: daysToExpiry parameter replaces hardcoded DTE=7
+// FIX-2: separate ce_theta/pe_theta using their respective LTPs
 function mergeQuotesToChain(
   calls: OptionQuote[],
   puts:  OptionQuote[],
   spot:  number,
   step:  number,
+  daysToExpiry: number,  // FIX-1
 ): OptionRow[] {
   const ceMap = new Map<number, OptionQuote>();
   const peMap = new Map<number, OptionQuote>();
@@ -92,11 +85,13 @@ function mergeQuotesToChain(
 
   if (allStrikes.length === 0) return [];
 
-  // BUG 2 FIX: Don't use pre-flagged ATM here — ATM is computed fresh from
-  // the live spot argument (which must already be correct before calling this)
   const ATM = allStrikes.reduce((p, c) =>
     Math.abs(c - spot) < Math.abs(p - spot) ? c : p
   );
+
+  // FIX-1: use actual DTE
+  const dte = Math.max(1, daysToExpiry);
+  const T   = dte / 365;
 
   return allStrikes.map(strike => {
     const ce = ceMap.get(strike);
@@ -108,14 +103,13 @@ function mergeQuotesToChain(
 
     const ce_ltp    = n(ce?.ltp);
     const pe_ltp    = n(pe?.ltp);
-    // Use actual DTE from expiry rather than hardcoded 7
-    const dte       = 7;
-    const T         = dte / 365;
     const mono      = (spot - strike) / spot;
     const ce_delta  = Math.max(0.01, Math.min(0.99, 0.5 + mono * 2.5));
     const pe_delta  = -(1 - ce_delta);
     const gamma     = 0.00028 * Math.exp(-Math.pow(mono * 10, 2) / 2);
-    const theta     = -((ce_ltp || 1) * 0.016 + 1.2);
+    // FIX-2: separate theta for CE and PE
+    const ce_theta  = -((ce_ltp || 1) * 0.016 + 1.2);
+    const pe_theta  = -((pe_ltp || 1) * 0.016 + 1.2);
     const vega      = 18 * gamma * spot * 0.01 * Math.sqrt(T > 0 ? T : 0.019);
 
     return {
@@ -127,34 +121,29 @@ function mergeQuotesToChain(
       ce_volume: n(ce?.['total-quantity-traded']),
       ce_iv:     n(ce?.['implied-volatility']),
       ce_delta,
-      ce_theta:  theta,
+      ce_theta,
       ce_gamma:  gamma,
       ce_vega:   vega,
-      ce_bid:    n(ce?.['best-bid-price']),
+      ce_bid:    Math.max(0.05, n(ce?.['best-bid-price'])),
       ce_ask:    n(ce?.['best-offer-price']),
+      ce_ltpChg: 0,  // FIX-4: initialised 0; updated by applyTicksToChain
       pe_ltp,
       pe_oi:     n(pe?.['open-interest']),
       pe_oiChg:  n(pe?.['oi-change-percentage']),
       pe_volume: n(pe?.['total-quantity-traded']),
       pe_iv:     n(pe?.['implied-volatility']),
       pe_delta,
-      pe_theta:  theta,
+      pe_theta,
       pe_gamma:  gamma,
       pe_vega:   vega,
-      pe_bid:    n(pe?.['best-bid-price']),
+      pe_bid:    Math.max(0.05, n(pe?.['best-bid-price'])),
       pe_ask:    n(pe?.['best-offer-price']),
+      pe_ltpChg: 0,  // FIX-4
     } satisfies OptionRow;
   });
 }
 
-// ── BUG 2 FIX: deriveSpotFromMedian ──────────────────────────────────────────
-// Old deriveSpot() used a single pre-flagged isATM row (circular — seeded from
-// the stale SPOT_PRICES value). Replaced with put-call parity median across ALL
-// strikes that have both CE and PE prices with realistic LTPs (> 0.5).
-// The median is far more robust than a single ATM row:
-//   - Remains accurate even if initial ATM was wrong
-//   - Self-corrects as WS ticks update all rows
-//   - Still returns null if data is insufficient
+// ── deriveSpotFromMedian ──────────────────────────────────────────────────────
 function deriveSpotFromMedian(chain: OptionRow[]): number | null {
   const estimates: number[] = [];
   for (const row of chain) {
@@ -162,7 +151,7 @@ function deriveSpotFromMedian(chain: OptionRow[]): number | null {
       estimates.push(row.strike + row.ce_ltp - row.pe_ltp);
     }
   }
-  if (estimates.length < 3) return null;   // need at least 3 data points
+  if (estimates.length < 3) return null;
   estimates.sort((a, b) => a - b);
   const mid = Math.floor(estimates.length / 2);
   const median = estimates.length % 2 === 0
@@ -172,6 +161,7 @@ function deriveSpotFromMedian(chain: OptionRow[]): number | null {
 }
 
 // ── Merge WebSocket tick delta into existing option chain ─────────────────────
+// FIX-4: track ltpChg fields so OI signals have price direction data
 function applyTicksToChain(chain: OptionRow[], ticks: TickData[]): OptionRow[] {
   if (ticks.length === 0) return chain;
 
@@ -209,7 +199,16 @@ function applyTicksToChain(chain: OptionRow[], ticks: TickData[]): OptionRow[] {
     const pu = peUpdates.get(row.strike);
     if (!cu && !pu) return row;
     changed = true;
-    return { ...row, ...cu, ...pu };
+    // FIX-4: compute ltpChg as delta from previous ltp
+    const ceLtpChg = cu?.ce_ltp != null ? cu.ce_ltp - row.ce_ltp : 0;
+    const peLtpChg = pu?.pe_ltp != null ? pu.pe_ltp - row.pe_ltp : 0;
+    return {
+      ...row,
+      ...cu,
+      ...pu,
+      ce_ltpChg: ceLtpChg,
+      pe_ltpChg: peLtpChg,
+    };
   });
 
   return changed ? next : chain;
@@ -250,12 +249,7 @@ function mapBreezePositions(data: unknown): Position[] {
       mtmPnl:    Math.round(pnl),
       maxProfit: Infinity,
       maxLoss:   -Infinity,
-      legs: [{
-        type, strike, action, lots,
-        entryPrice:   entryPx,
-        currentPrice: currentPx,
-        pnl:          Math.round(pnl),
-      }],
+      legs: [{ type, strike, action, lots, entryPrice: entryPx, currentPrice: currentPx, pnl: Math.round(pnl) }],
     });
   });
 
@@ -265,53 +259,60 @@ function mapBreezePositions(data: unknown): Position[] {
 // ═════════════════════════════════════════════════════════════════════════════
 
 export function App() {
-  const [tab,           setTab]           = useState<Tab>('optionchain');
-  const [symbol,        setSymbol]        = useState<SymbolCode>(DEFAULT_SYM);
-  const [expiry,        setExpiry]        = useState<ExpiryDate>(getExpiries(DEFAULT_SYM)[0]);
-  const [chain,         setChain]         = useState<OptionRow[]>(() => generateChain(DEFAULT_SYM));
-  const [legs,          setLegs]          = useState<OptionLeg[]>([]);
-  const [showBroker,    setShowBroker]    = useState(false);
-  const [session,       setSession]       = useState<BreezeSession | null>(null);
-  const [lastUpdate,    setLastUpdate]    = useState(new Date());
-  const [isLoading,     setIsLoading]     = useState(false);
-  const [spotPrice,     setSpotPrice]     = useState<number>(SPOT_PRICES[DEFAULT_SYM]);
-  const [livePositions, setLivePositions] = useState<Position[] | null>(null);
-  const [loadingMsg,    setLoadingMsg]    = useState('');
-  const [wsStatus,      setWsStatus]      = useState<WsStatus>('disconnected');
-  // BUG 7 FIX: Store live index data in React state so TopBar re-renders when it changes
-  const [liveIndices,   setLiveIndices]   = useState<MarketIndex[]>(MARKET_INDICES);
+  const [tab,                setTab]               = useState<Tab>('optionchain');
+  const [symbol,             setSymbol]            = useState<SymbolCode>(DEFAULT_SYM);
+  const [expiry,             setExpiry]            = useState<ExpiryDate>(getExpiries(DEFAULT_SYM)[0]);
+  // FIX-5: store live expiries from backend so Toolbar dropdown is accurate
+  const [availableExpiries,  setAvailableExpiries] = useState<ExpiryDate[]>(getExpiries(DEFAULT_SYM));
+  const [chain,              setChain]             = useState<OptionRow[]>(() => generateChain(DEFAULT_SYM));
+  const [legs,               setLegs]              = useState<OptionLeg[]>([]);
+  const [showBroker,         setShowBroker]        = useState(false);
+  const [session,            setSession]           = useState<BreezeSession | null>(null);
+  const [lastUpdate,         setLastUpdate]        = useState(new Date());
+  const [isLoading,          setIsLoading]         = useState(false);
+  const [spotPrice,          setSpotPrice]         = useState<number>(SPOT_PRICES[DEFAULT_SYM]);
+  const [livePositions,      setLivePositions]     = useState<Position[] | null>(null);
+  const [loadingMsg,         setLoadingMsg]        = useState('');
+  const [wsStatus,           setWsStatus]          = useState<WsStatus>('disconnected');
+  const [liveIndices,        setLiveIndices]       = useState<MarketIndex[]>(MARKET_INDICES);
+  // FIX-6: chain error state
+  const [chainError,         setChainError]        = useState<string | null>(null);
 
-  const demoTickRef  = useRef<ReturnType<typeof setInterval> | null>(null);
-  const stopPollRef  = useRef<(() => void) | null>(null);
-  const currentChain = useRef<OptionRow[]>(chain);
-  const currentSpot  = useRef<number>(spotPrice);
-  const currentSym   = useRef<SymbolCode>(symbol);
-  const cfg          = SYMBOL_CONFIG[symbol];
+  const demoTickRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stopPollRef   = useRef<(() => void) | null>(null);
+  const currentChain  = useRef<OptionRow[]>(chain);
+  const currentSpot   = useRef<number>(spotPrice);
+  const currentSym    = useRef<SymbolCode>(symbol);
+  // FIX-3: dayOpen snapshot per symbol — set once on first spot fetch
+  const dayOpenRef    = useRef<Partial<Record<SymbolCode, number>>>({});
+  const cfg           = SYMBOL_CONFIG[symbol];
 
   useEffect(() => { currentChain.current = chain; },     [chain]);
   useEffect(() => { currentSpot.current  = spotPrice; }, [spotPrice]);
   useEffect(() => { currentSym.current   = symbol; },    [symbol]);
 
-  // ── BUG 7 FIX: Update liveIndices when spotPrice changes ─────────────────
+  // FIX-3: update liveIndices using dayOpen, not the previous tick value
   useEffect(() => {
     setLiveIndices(prev => prev.map(idx => {
       const isNifty   = idx.label === 'NIFTY 50'  && symbol === 'NIFTY';
       const isSensex  = idx.label === 'SENSEX'     && symbol === 'BSESEN';
       if (!isNifty && !isSensex) return idx;
-      // Compute change from the prior close (previous value in the array)
-      const change = spotPrice - idx.value;
-      const pct    = idx.value > 0 ? (change / idx.value) * 100 : 0;
+      // Use stored dayOpen (set once on connect). If not yet set, skip.
+      const dayOpen = dayOpenRef.current[symbol];
+      if (!dayOpen) return { ...idx, value: spotPrice };
+      const change = spotPrice - dayOpen;
+      const pct    = dayOpen > 0 ? (change / dayOpen) * 100 : 0;
       return { ...idx, value: spotPrice, change, pct };
     }));
   }, [spotPrice, symbol]);
 
-  // ── Auto-extract ?apisession= ─────────────────────────────────────────────
+  // Auto-extract ?apisession=
   useEffect(() => {
     const token = extractApiSession();
     if (token) setShowBroker(true);
   }, []);
 
-  // ── Demo tick simulation (only when NOT connected) ────────────────────────
+  // Demo tick simulation (only when NOT connected)
   useEffect(() => {
     if (session?.isConnected) {
       if (demoTickRef.current) { clearInterval(demoTickRef.current); demoTickRef.current = null; }
@@ -324,19 +325,22 @@ export function App() {
     return () => { if (demoTickRef.current) clearInterval(demoTickRef.current); };
   }, [session?.isConnected]);
 
-  // ── BUG 1+4 FIX: Fetch real spot price from backend before chain load ─────
-  // This replaces the stale SPOT_PRICES seed. Called once on connect and on
-  // symbol change. Uses /api/spot which queries Breeze NSE/BSE cash market.
+  // Fetch real spot price from backend
   const fetchAndSetSpot = useCallback(async (
     sym:  SymbolCode,
     sess: BreezeSession,
   ): Promise<number> => {
-    const fallback = SPOT_PRICES[sym];   // stale seed — only used if fetch fails
+    const fallback = SPOT_PRICES[sym];
     try {
       const result = await fetchSpotPrice(sess.proxyBase, sym);
       if (result.ok && result.spot && result.spot > 1000) {
         console.log(`[Spot] Fetched live ${sym} spot: ${result.spot} (source: ${result.source})`);
-        SPOT_PRICES[sym] = result.spot;   // update shared cache
+        // FIX-3: capture dayOpen on first fetch for this symbol
+        if (!dayOpenRef.current[sym]) {
+          dayOpenRef.current[sym] = result.spot;
+          console.log(`[Spot] Day open snapshot for ${sym}: ${result.spot}`);
+        }
+        SPOT_PRICES[sym] = result.spot;
         currentSpot.current = result.spot;
         setSpotPrice(result.spot);
         return result.spot;
@@ -348,13 +352,8 @@ export function App() {
     return fallback;
   }, []);
 
-  // ── BUG 3+4 FIX: WebSocket tick handler ──────────────────────────────────
-  // Priority order for spot derivation:
-  //  1. update.spot_prices from backend (index_close_price captured in WS tick)
-  //  2. deriveSpotFromMedian across all updated chain rows (put-call parity median)
-  // Guard widened to 15% (was 5%) with hard re-fetch if divergence > 5%
+  // WebSocket tick handler
   const handleTickUpdate = useCallback((update: TickUpdate) => {
-    // Apply tick deltas to chain first
     const updatedChain = applyTicksToChain(currentChain.current, update.ticks);
     setChain(updatedChain);
     currentChain.current = updatedChain;
@@ -362,11 +361,9 @@ export function App() {
 
     const sym = currentSym.current;
 
-    // Priority 1: spot_prices from backend (captured from index_close_price in WS tick)
     const wsBroadcastSpot = update.spot_prices?.[sym] ?? update.spot_prices?.['NIFTY'];
     if (wsBroadcastSpot && wsBroadcastSpot > 1000) {
       const diff = Math.abs(wsBroadcastSpot - currentSpot.current);
-      // Accept if within 15% of current — prevents bad ticks corrupting spot
       if (diff < currentSpot.current * 0.15) {
         if (Math.abs(wsBroadcastSpot - currentSpot.current) > 0.5) {
           setSpotPrice(wsBroadcastSpot);
@@ -377,41 +374,28 @@ export function App() {
       }
     }
 
-    // Priority 2: put-call parity median across all chain rows with valid LTPs
-    // BUG 2 FIX: Uses median not single ATM row, so not circular
     const derived = deriveSpotFromMedian(updatedChain);
     if (derived && derived > 1000) {
       const diff = Math.abs(derived - currentSpot.current);
-      // Accept if within 15% of current
       if (diff < currentSpot.current * 0.15) {
-        if (diff > 1) {   // only update if meaningful change
+        if (diff > 1) {
           setSpotPrice(derived);
           SPOT_PRICES[sym] = derived;
           currentSpot.current = derived;
         }
-      }
-      // BUG 4 FIX: If divergence > 5% — stale seed is very wrong, don't silently fail.
-      // Log prominently so we know the seed needs fixing.
-      else if (diff > currentSpot.current * 0.05) {
-        console.warn(
-          `[Spot] Large divergence for ${sym}: derived=${derived} current=${currentSpot.current} diff=${diff.toFixed(0)}. ` +
-          `Seed may be very stale. Consider re-fetching /api/spot.`
-        );
-        // Force-accept the derived value — it's from real market data
+      } else if (diff > currentSpot.current * 0.05) {
+        console.warn(`[Spot] Large divergence for ${sym}: derived=${derived} current=${currentSpot.current}`);
         setSpotPrice(derived);
         SPOT_PRICES[sym] = derived;
         currentSpot.current = derived;
       }
     }
-  }, []);   // stable — reads via refs
+  }, []);
 
-  // ── Start WebSocket connection ─────────────────────────────────────────────
+  // Start WebSocket
   const startWsConnection = useCallback((backendUrl: string) => {
     setWsStatus('connecting');
-    if (stopPollRef.current) {
-      stopPollRef.current();
-      stopPollRef.current = null;
-    }
+    if (stopPollRef.current) { stopPollRef.current(); stopPollRef.current = null; }
     breezeWs.connect(
       backendUrl,
       handleTickUpdate,
@@ -423,9 +407,7 @@ export function App() {
           setLoadingMsg('⟳ WebSocket reconnecting...');
         } else if (status === 'error') {
           console.warn('[App] WS failed — falling back to REST tick polling');
-          if (stopPollRef.current) {
-            stopPollRef.current();
-          }
+          if (stopPollRef.current) stopPollRef.current();
           const stopFn = startTickPolling(backendUrl, handleTickUpdate);
           stopPollRef.current = stopFn;
           setLoadingMsg('⚠️ WS unavailable — REST polling fallback active');
@@ -434,26 +416,25 @@ export function App() {
     );
   }, [handleTickUpdate]);
 
-  // ── Stop WebSocket / polling ──────────────────────────────────────────────
   const stopLiveData = useCallback(() => {
     breezeWs.disconnect();
     if (stopPollRef.current) { stopPollRef.current(); stopPollRef.current = null; }
     setWsStatus('disconnected');
   }, []);
 
-  // ── Fetch live option chain (REST — ONCE per expiry) ──────────────────────
-  // BUG 1+2 FIX: spot is now passed in from caller who got it from fetchAndSetSpot(),
-  // so mergeQuotesToChain uses a real live price — no more stale seed for ATM finding.
+  // Fetch live option chain (REST — ONCE per expiry)
+  // FIX-1+2: pass daysToExpiry into mergeQuotesToChain
   const fetchLiveChain = useCallback(async (
     sym:  SymbolCode,
     exp:  ExpiryDate,
     sess: BreezeSession,
-    spot: number,      // BUG 1 FIX: caller provides verified live spot
+    spot: number,
   ) => {
     if (!isKaggleBackend(sess.proxyBase)) return;
 
     const { breezeStockCode, breezeExchangeCode } = SYMBOL_CONFIG[sym];
     setIsLoading(true);
+    setChainError(null);  // FIX-6
     setLoadingMsg('Fetching option chain snapshot from ICICI Breeze...');
 
     try {
@@ -471,30 +452,21 @@ export function App() {
       const calls  = callResult.data ?? [];
       const puts   = putResult.data  ?? [];
 
-      // BUG 2 FIX: use the real spot passed in, not currentSpot.current (which
-      // may still hold the stale seed at this point in the call sequence)
-      const merged = mergeQuotesToChain(calls, puts, spot, SYMBOL_CONFIG[sym].strikeStep);
+      // FIX-1: pass actual daysToExpiry instead of hardcoded 7
+      const merged = mergeQuotesToChain(calls, puts, spot, SYMBOL_CONFIG[sym].strikeStep, exp.daysToExpiry);
 
       if (merged.length > 0) {
         setChain(merged);
         currentChain.current = merged;
 
-        // BUG 2 FIX: run median derivation on fresh chain as sanity-check
-        // Only update spot if median agrees with our fetched spot within 2%
         const medianSpot = deriveSpotFromMedian(merged);
         if (medianSpot && Math.abs(medianSpot - spot) < spot * 0.02) {
-          // Median confirms the fetched spot — use median (slightly more precise)
           const refined = medianSpot;
           if (refined !== currentSpot.current) {
             setSpotPrice(refined);
             SPOT_PRICES[sym] = refined;
             currentSpot.current = refined;
           }
-        } else if (medianSpot && Math.abs(medianSpot - spot) < spot * 0.05) {
-          // Median disagrees slightly — trust the direct REST fetch, log the diff
-          console.log(`[Spot] Median ${medianSpot} vs REST ${spot} — using REST value (within 5%)`);
-        } else if (medianSpot) {
-          console.warn(`[Spot] Median ${medianSpot} diverges >5% from REST ${spot} — using REST value`);
         }
 
         setLastUpdate(new Date());
@@ -512,13 +484,16 @@ export function App() {
         setLoadingMsg('⚠️ No data — market may be closed or expiry invalid');
       }
     } catch (err) {
-      setLoadingMsg(`⚠️ ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      setLoadingMsg(`⚠️ ${msg}`);
+      setChainError(msg);  // FIX-6
     } finally {
       setIsLoading(false);
     }
   }, []);
 
-  // ── Fetch expiries from backend ───────────────────────────────────────────
+  // Fetch expiries from backend
+  // FIX-5: also updates availableExpiries state
   const fetchLiveExpiries = useCallback(async (
     sym:  SymbolCode,
     sess: BreezeSession,
@@ -528,17 +503,19 @@ export function App() {
       const { breezeStockCode, breezeExchangeCode } = SYMBOL_CONFIG[sym];
       const r = await fetchExpiryDates(sess.proxyBase, breezeStockCode, breezeExchangeCode);
       if (r.ok && r.expiries.length > 0) {
-        return r.expiries.map(e => ({
+        const expiries = r.expiries.map(e => ({
           label:        e.label || e.date,
           breezeValue:  e.date,
           daysToExpiry: e.days_away,
         }));
+        setAvailableExpiries(expiries);  // FIX-5
+        return expiries;
       }
     } catch { /* fall through */ }
     return getExpiries(sym);
   }, []);
 
-  // ── Fetch live positions ──────────────────────────────────────────────────
+  // Fetch live positions
   const fetchLivePositions = useCallback(async (sess: BreezeSession) => {
     if (!isKaggleBackend(sess.proxyBase)) return;
     try {
@@ -552,12 +529,11 @@ export function App() {
     }
   }, []);
 
-  // ── On symbol change ──────────────────────────────────────────────────────
+  // On symbol change
   useEffect(() => {
     setLegs([]);
     const doChange = async () => {
       if (session?.isConnected && isKaggleBackend(session.proxyBase)) {
-        // BUG 1 FIX: fetch real spot before chain load on symbol change
         const liveSpot = await fetchAndSetSpot(symbol, session);
         const liveExpiries = await fetchLiveExpiries(symbol, session);
         const newExpiry    = liveExpiries[0];
@@ -570,10 +546,11 @@ export function App() {
           setLastUpdate(new Date());
         }
       } else {
-        // Demo mode — use stale seed (ok, no real data anyway)
         setSpotPrice(SPOT_PRICES[symbol]);
         currentSpot.current = SPOT_PRICES[symbol];
-        setExpiry(getExpiries(symbol)[0]);
+        const staticExpiries = getExpiries(symbol);
+        setAvailableExpiries(staticExpiries);  // FIX-5
+        setExpiry(staticExpiries[0]);
         setChain(generateChain(symbol));
         setLastUpdate(new Date());
       }
@@ -581,15 +558,14 @@ export function App() {
     doChange();
   }, [symbol]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── On expiry change ──────────────────────────────────────────────────────
+  // On expiry change
   useEffect(() => {
     if (session?.isConnected && isKaggleBackend(session.proxyBase)) {
-      // Spot is already live — just reload chain with same spot
       fetchLiveChain(symbol, expiry, session, currentSpot.current);
     }
   }, [expiry.breezeValue]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── On connect ────────────────────────────────────────────────────────────
+  // On connect
   const handleConnected = useCallback(async (s: BreezeSession) => {
     setSession(s);
     setLoadingMsg('Connected! Fetching live spot price...');
@@ -600,7 +576,6 @@ export function App() {
     if (!isKaggleBackend(s.proxyBase)) return;
 
     try {
-      // BUG 1 FIX: fetch real spot FIRST before anything else
       const liveSpot = await fetchAndSetSpot(symbol, s);
       setLoadingMsg(`Spot: ${liveSpot.toLocaleString('en-IN')} — starting WS...`);
 
@@ -623,13 +598,14 @@ export function App() {
     }
   }, [symbol, expiry, fetchAndSetSpot, fetchLiveChain, fetchLiveExpiries, fetchLivePositions, startWsConnection, stopLiveData]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Cleanup on disconnect / unmount ──────────────────────────────────────
+  // Cleanup
   useEffect(() => { if (!session?.isConnected) stopLiveData(); }, [session?.isConnected, stopLiveData]);
   useEffect(() => () => { stopLiveData(); }, [stopLiveData]);
 
-  // ── Manual refresh ────────────────────────────────────────────────────────
+  // Manual refresh
   const handleRefresh = useCallback(async () => {
     setIsLoading(true);
+    setChainError(null);
     if (session?.isConnected && isKaggleBackend(session.proxyBase)) {
       const liveSpot = await fetchAndSetSpot(symbol, session);
       await fetchLiveChain(symbol, expiry, session, liveSpot);
@@ -640,7 +616,7 @@ export function App() {
     setIsLoading(false);
   }, [session, symbol, expiry, spotPrice, fetchAndSetSpot, fetchLiveChain]);
 
-  // ── Leg management ────────────────────────────────────────────────────────
+  // Leg management
   const handleAddLeg = useCallback((leg: Omit<OptionLeg, 'id'>) => {
     setLegs(prev => [...prev, { ...leg, id: nextId() }]);
     if (tab === 'optionchain') setTab('strategy');
@@ -652,11 +628,21 @@ export function App() {
   const handleRemoveLeg = useCallback((id: string) =>
     setLegs(prev => prev.filter(l => l.id !== id)), []);
 
-  // ── Execute strategy ──────────────────────────────────────────────────────
+  // Execute strategy
   const handleExecute = useCallback(async (execLegs: OptionLeg[]) => {
     if (!session?.isConnected) {
       alert('⚠️ Not connected.\n\nClick "Connect Broker" → enter credentials → Validate Live.');
       return;
+    }
+
+    // Validate legs before sending
+    for (const leg of execLegs) {
+      if (!leg.expiry)            { alert(`⚠️ Leg ${leg.type} ${leg.strike}: missing expiry date.`); return; }
+      if (!leg.strike || leg.strike <= 0) { alert(`⚠️ Invalid strike price.`); return; }
+      if (!leg.lots || leg.lots <= 0)     { alert(`⚠️ Lots must be ≥ 1.`); return; }
+      if (leg.orderType === 'limit' && (!leg.limitPrice || leg.limitPrice <= 0)) {
+        alert(`⚠️ Leg ${leg.type} ${leg.strike}: limit price must be > 0.`); return;
+      }
     }
 
     const results: string[] = [];
@@ -720,7 +706,7 @@ export function App() {
     alert(`Strategy Results:\n\n${results.join('\n')}`);
   }, [session, cfg]);
 
-  // ── Load position into builder ────────────────────────────────────────────
+  // FIX-7: Load position into builder — use position's own expiry
   const handleLoadPosition = useCallback((pos: Position) => {
     setLegs(pos.legs.map(l => ({
       id:     nextId(),
@@ -735,13 +721,13 @@ export function App() {
       theta:  -2.5,
       gamma:  0.0002,
       vega:   0.15,
-      expiry: expiry.breezeValue,
+      expiry: pos.expiry,  // FIX-7: use position's own expiry, not UI-selected expiry
     })));
     setSymbol(pos.symbol);
     setTab('strategy');
-  }, [expiry.breezeValue]);
+  }, []); // FIX-7: removed expiry.breezeValue dependency
 
-  // ── Tab switch → refresh live data ────────────────────────────────────────
+  // Tab switch
   const handleTabChange = useCallback(async (t: string) => {
     setTab(t as Tab);
     if (t === 'positions' && session?.isConnected && isKaggleBackend(session.proxyBase)) {
@@ -749,7 +735,7 @@ export function App() {
     }
   }, [session, fetchLivePositions]);
 
-  // ── ATM recompute: always uses live spotPrice state (not chain.isATM flag) ─
+  // ATM recompute
   const nearestStrikeDiff = chain.length > 0
     ? Math.min(...chain.map(r => Math.abs(r.strike - spotPrice)))
     : Number.POSITIVE_INFINITY;
@@ -770,7 +756,6 @@ export function App() {
 
   return (
     <div className="flex flex-col h-screen bg-[#0d0f1a] overflow-hidden text-white">
-      {/* BUG 7 FIX: pass live spotPrice and liveIndices so TopBar re-renders */}
       <TopBar
         selectedSymbol={symbol}
         onSymbolChange={setSymbol}
@@ -801,6 +786,8 @@ export function App() {
             onRefresh={handleRefresh}
             isLive={isLive}
             loadingMsg={loadingMsg}
+            error={chainError}           // FIX-6
+            availableExpiries={availableExpiries}  // FIX-5
           />
         )}
 
@@ -814,6 +801,7 @@ export function App() {
                 onExecute={handleExecute}
                 spotPrice={spotPrice}
                 symbol={symbol}
+                chain={chainWithAtm}
               />
             </div>
             <div className="border-t border-gray-800/40 bg-[#1a1d2e] px-4 py-1.5 flex items-center gap-3 text-[10px] flex-shrink-0">

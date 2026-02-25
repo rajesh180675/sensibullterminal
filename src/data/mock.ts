@@ -5,7 +5,7 @@
 // ================================================================
 
 import { OptionRow, Position, SymbolCode } from '../types/index';
-import { SYMBOL_CONFIG, SPOT_PRICES }      from '../config/market';
+import { SYMBOL_CONFIG, SPOT_PRICES, getExpiries } from '../config/market';
 
 export function generateChain(symbol: SymbolCode, spotOverride?: number): OptionRow[] {
   const cfg   = SYMBOL_CONFIG[symbol];
@@ -34,9 +34,12 @@ export function generateChain(symbol: SymbolCode, spotOverride?: number): Option
     const peLTP   = Math.max(0.05, Math.round((peIntr + peBase*tv)*20)/20);
     const peDelta = -(1 - ceDelta);
 
+    const T     = dte / 365;
     const gamma = 0.00028 * Math.exp(-Math.pow(mono*10, 2)/2);
-    const theta = -(ceLTP*0.016 + 1.2);
-    const vega  = 18*gamma*spot*0.01*Math.sqrt(dte/365);
+    // FIX: separate theta for CE and PE using their respective LTPs
+    const ceTheta = -(ceLTP * 0.016 + 1.2);
+    const peTheta = -(peLTP * 0.016 + 1.2);
+    const vega  = 18*gamma*spot*0.01*Math.sqrt(T);
 
     const baseOI = Math.max(400_000, 7_500_000*Math.exp(-distSteps*0.28));
     const ceOI   = Math.round(baseOI*(0.9+Math.random()*0.3)*(mono > 0 ? 1.2 : 0.8));
@@ -50,71 +53,86 @@ export function generateChain(symbol: SymbolCode, spotOverride?: number): Option
       ce_volume: Math.round(ceOI*(0.04+Math.random()*0.09)),
       ce_iv:     Math.round(ceIV*10)/10,
       ce_delta:  Math.round(ceDelta*1000)/1000,
-      ce_theta:  Math.round(theta*100)/100,
+      ce_theta:  Math.round(ceTheta*100)/100,
       ce_gamma:  Math.round(gamma*100000)/100000,
       ce_vega:   Math.round(vega*100)/100,
-      ce_bid:    Math.round((ceLTP-0.5)*20)/20,
+      // FIX: bid floor at 0.05 to prevent negative bids for cheap OTM options
+      ce_bid:    Math.max(0.05, Math.round((ceLTP-0.5)*20)/20),
       ce_ask:    Math.round((ceLTP+0.5)*20)/20,
+      ce_ltpChg: 0,  // initialised 0; updated by simulateTick/applyTicksToChain
       pe_ltp:    peLTP,
       pe_oi:     peOI,
       pe_oiChg:  Math.round((Math.random()-0.42)*peOI*0.05),
       pe_volume: Math.round(peOI*(0.04+Math.random()*0.09)),
       pe_iv:     Math.round(Math.max(0, peIV)*10)/10,
       pe_delta:  Math.round(peDelta*1000)/1000,
-      pe_theta:  Math.round(theta*100)/100,
+      pe_theta:  Math.round(peTheta*100)/100,
       pe_gamma:  Math.round(gamma*100000)/100000,
       pe_vega:   Math.round(vega*100)/100,
-      pe_bid:    Math.round((peLTP-0.5)*20)/20,
+      // FIX: bid floor at 0.05
+      pe_bid:    Math.max(0.05, Math.round((peLTP-0.5)*20)/20),
       pe_ask:    Math.round((peLTP+0.5)*20)/20,
+      pe_ltpChg: 0,  // initialised 0; updated by simulateTick/applyTicksToChain
     };
   });
 }
 
 // Simulates WebSocket tick → updates LTP/OI on each call
+// FIX: also tracks ltpChg so OI signals have price direction data
 export function simulateTick(rows: OptionRow[]): OptionRow[] {
   return rows.map(row => {
     const cn = (Math.random()-0.5)*0.9;
     const pn = (Math.random()-0.5)*0.9;
     const on = Math.round((Math.random()-0.5)*5000);
+    const newCeLTP = Math.max(0.05, Math.round((row.ce_ltp+cn)*20)/20);
+    const newPeLTP = Math.max(0.05, Math.round((row.pe_ltp+pn)*20)/20);
     return {
       ...row,
-      ce_ltp: Math.max(0.05, Math.round((row.ce_ltp+cn)*20)/20),
-      pe_ltp: Math.max(0.05, Math.round((row.pe_ltp+pn)*20)/20),
-      ce_oi:  Math.max(0, row.ce_oi+on),
-      pe_oi:  Math.max(0, row.pe_oi+on),
+      ce_ltp:    newCeLTP,
+      pe_ltp:    newPeLTP,
+      ce_ltpChg: newCeLTP - row.ce_ltp,
+      pe_ltpChg: newPeLTP - row.pe_ltp,
+      ce_oi:     Math.max(0, row.ce_oi+on),
+      pe_oi:     Math.max(0, row.pe_oi+on),
     };
   });
 }
 
-// Sample positions for Positions tab
+// Sample positions for Positions tab — uses dynamic expiry dates
+function getDynamicExpiry(symbol: SymbolCode, offsetWeeks = 0): string {
+  const expiries = getExpiries(symbol);
+  const idx = Math.min(offsetWeeks, expiries.length - 1);
+  return expiries[idx]?.breezeValue ?? expiries[0]?.breezeValue ?? '';
+}
+
 export const MOCK_POSITIONS: Position[] = [
   {
-    id:'p1', symbol:'NIFTY', expiry:'01 Jul 25',
-    strategy:'Bull Call Spread', entryDate:'2025-06-20',
+    id:'p1', symbol:'NIFTY', expiry: getDynamicExpiry('NIFTY', 0),
+    strategy:'Bull Call Spread', entryDate: new Date(Date.now() - 3*86400000).toISOString().slice(0,10),
     status:'ACTIVE', mtmPnl:3250, maxProfit:8750, maxLoss:-3750,
     legs:[
-      { type:'CE', strike:24500, action:'BUY',  lots:1, entryPrice:185.00, currentPrice:210.50, pnl: 3250 },
-      { type:'CE', strike:24700, action:'SELL', lots:1, entryPrice: 98.00, currentPrice: 95.25, pnl:  179 },
+      { type:'CE', strike:SPOT_PRICES.NIFTY - 100, action:'BUY',  lots:1, entryPrice:185.00, currentPrice:210.50, pnl: 3250 },
+      { type:'CE', strike:SPOT_PRICES.NIFTY + 100, action:'SELL', lots:1, entryPrice: 98.00, currentPrice: 95.25, pnl:  179 },
     ],
   },
   {
-    id:'p2', symbol:'NIFTY', expiry:'01 Jul 25',
-    strategy:'Short Strangle', entryDate:'2025-06-18',
+    id:'p2', symbol:'NIFTY', expiry: getDynamicExpiry('NIFTY', 0),
+    strategy:'Short Strangle', entryDate: new Date(Date.now() - 5*86400000).toISOString().slice(0,10),
     status:'ACTIVE', mtmPnl:-1450, maxProfit:12600, maxLoss:-Infinity,
     legs:[
-      { type:'CE', strike:25000, action:'SELL', lots:2, entryPrice:125.00, currentPrice:142.50, pnl:-2275 },
-      { type:'PE', strike:24000, action:'SELL', lots:2, entryPrice:110.00, currentPrice:101.25, pnl: 1138 },
+      { type:'CE', strike:SPOT_PRICES.NIFTY + 500, action:'SELL', lots:2, entryPrice:125.00, currentPrice:142.50, pnl:-2275 },
+      { type:'PE', strike:SPOT_PRICES.NIFTY - 500, action:'SELL', lots:2, entryPrice:110.00, currentPrice:101.25, pnl: 1138 },
     ],
   },
   {
-    id:'p3', symbol:'BSESEN', expiry:'03 Jul 25',
-    strategy:'Iron Condor', entryDate:'2025-06-22',
+    id:'p3', symbol:'BSESEN', expiry: getDynamicExpiry('BSESEN', 0),
+    strategy:'Iron Condor', entryDate: new Date(Date.now() - 1*86400000).toISOString().slice(0,10),
     status:'DRAFT', mtmPnl:0, maxProfit:5400, maxLoss:-2100,
     legs:[
-      { type:'CE', strike:81000, action:'SELL', lots:1, entryPrice:280, currentPrice:275, pnl: 100 },
-      { type:'CE', strike:81500, action:'BUY',  lots:1, entryPrice:155, currentPrice:148, pnl:-140 },
-      { type:'PE', strike:79000, action:'SELL', lots:1, entryPrice:260, currentPrice:252, pnl: 160 },
-      { type:'PE', strike:78500, action:'BUY',  lots:1, entryPrice:148, currentPrice:143, pnl:-100 },
+      { type:'CE', strike:SPOT_PRICES.BSESEN + 500,  action:'SELL', lots:1, entryPrice:280, currentPrice:275, pnl: 100 },
+      { type:'CE', strike:SPOT_PRICES.BSESEN + 1000, action:'BUY',  lots:1, entryPrice:155, currentPrice:148, pnl:-140 },
+      { type:'PE', strike:SPOT_PRICES.BSESEN - 500,  action:'SELL', lots:1, entryPrice:260, currentPrice:252, pnl: 160 },
+      { type:'PE', strike:SPOT_PRICES.BSESEN - 1000, action:'BUY',  lots:1, entryPrice:148, currentPrice:143, pnl:-100 },
     ],
   },
 ];

@@ -302,7 +302,13 @@ export function startTickPolling(
 
   const poll = async () => {
     try {
-      const res  = await fetch(`${base}/api/ticks?since_version=${lastVersion}`);
+      // FIX-9: include auth header so polling works when AUTH_ENABLED=true
+      const pollHeaders: Record<string, string> = {};
+      const pollToken = getSubscribeAuthToken();
+      if (pollToken) pollHeaders['x-terminal-auth'] = pollToken;
+      const res  = await fetch(`${base}/api/ticks?since_version=${lastVersion}`, {
+        headers: pollHeaders,
+      });
       const data = await res.json() as {
         changed:      boolean;
         version:      number;

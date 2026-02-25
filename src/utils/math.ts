@@ -1,6 +1,5 @@
 // ================================================================
 // MATH UTILITIES — Options calculations, payoff, Greeks
-// Used by OptionChain, StrategyBuilder, Positions
 // ================================================================
 
 import { OptionLeg, PayoffPoint, Greeks } from '../types/index';
@@ -45,11 +44,11 @@ function normalCDF(x: number): number {
 }
 
 export interface BSParams {
-  S:   number;   // spot
-  K:   number;   // strike
-  T:   number;   // time to expiry in years
-  r:   number;   // risk-free rate
-  iv:  number;   // implied volatility (0–1)
+  S:   number;
+  K:   number;
+  T:   number;
+  r:   number;
+  iv:  number;
   type: 'CE' | 'PE';
 }
 
@@ -63,7 +62,6 @@ export function bsPrice(p: BSParams): number {
 }
 
 // ── Payoff curve ──────────────────────────────────────────────
-// Builds the P&L at expiry across a ±8% price range
 export function buildPayoff(legs: OptionLeg[], spot: number): PayoffPoint[] {
   if (legs.length === 0) return [];
 
@@ -72,7 +70,6 @@ export function buildPayoff(legs: OptionLeg[], spot: number): PayoffPoint[] {
   const step = (hi - lo) / 120;
   const points: PayoffPoint[] = [];
 
-  // Get lot size from first leg's symbol
   const sym     = legs[0].symbol;
   const lotSize = SYMBOL_CONFIG[sym]?.lotSize ?? 65;
 
@@ -95,14 +92,13 @@ export function buildPayoff(legs: OptionLeg[], spot: number): PayoffPoint[] {
   return points;
 }
 
-// ── Breakevent finder ─────────────────────────────────────────
+// ── Breakeven finder ─────────────────────────────────────────
 export function findBreakevens(payoff: PayoffPoint[]): number[] {
   const bes: number[] = [];
   for (let i = 1; i < payoff.length; i++) {
     const a = payoff[i - 1];
     const b = payoff[i];
     if ((a.pnl < 0 && b.pnl >= 0) || (a.pnl >= 0 && b.pnl < 0)) {
-      // Linear interpolation
       const frac = Math.abs(a.pnl) / (Math.abs(a.pnl) + Math.abs(b.pnl));
       bes.push(Math.round(a.price + frac * (b.price - a.price)));
     }
@@ -111,21 +107,32 @@ export function findBreakevens(payoff: PayoffPoint[]): number[] {
 }
 
 // ── Max profit / loss ─────────────────────────────────────────
+// FIX: Uses monotonic trend at boundaries to distinguish
+//      "plateau at max" (bounded spread) from "still rising" (unlimited).
+//      A Bull Call Spread has a flat top — last 3 points all equal → bounded.
+//      A naked short put has a rising loss at the left edge → unlimited.
 export function maxProfitLoss(payoff: PayoffPoint[]): { maxProfit: number; maxLoss: number } {
   if (payoff.length === 0) return { maxProfit: 0, maxLoss: 0 };
+
   let maxProfit = -Infinity;
   let maxLoss   =  Infinity;
   for (const p of payoff) {
     if (p.pnl > maxProfit) maxProfit = p.pnl;
     if (p.pnl < maxLoss)   maxLoss   = p.pnl;
   }
-  // Check if unlimited (hit boundary)
-  const lastPnl  = payoff[payoff.length - 1].pnl;
-  const firstPnl = payoff[0].pnl;
-  if (lastPnl > 0 && lastPnl === maxProfit)  maxProfit = Infinity;
-  if (firstPnl > 0 && firstPnl === maxProfit) maxProfit = Infinity;
-  if (lastPnl < 0 && lastPnl === maxLoss)    maxLoss   = -Infinity;
-  if (firstPnl < 0 && firstPnl === maxLoss)  maxLoss   = -Infinity;
+
+  const n = payoff.length;
+  // Require at least 3 points of strictly monotonic rise/fall to call it unlimited
+  const risingAtEnd   = n >= 3 && payoff[n-1].pnl > payoff[n-2].pnl && payoff[n-2].pnl > payoff[n-3].pnl;
+  const risingAtStart = n >= 3 && payoff[0].pnl > payoff[1].pnl   && payoff[1].pnl > payoff[2].pnl;
+  const fallingAtEnd  = n >= 3 && payoff[n-1].pnl < payoff[n-2].pnl && payoff[n-2].pnl < payoff[n-3].pnl;
+  const fallingAtStart= n >= 3 && payoff[0].pnl < payoff[1].pnl   && payoff[1].pnl < payoff[2].pnl;
+
+  if (risingAtEnd   && payoff[n-1].pnl > 0) maxProfit = Infinity;
+  if (risingAtStart && payoff[0].pnl   > 0) maxProfit = Infinity;
+  if (fallingAtEnd  && payoff[n-1].pnl < 0) maxLoss   = -Infinity;
+  if (fallingAtStart&& payoff[0].pnl   < 0) maxLoss   = -Infinity;
+
   return { maxProfit, maxLoss };
 }
 
