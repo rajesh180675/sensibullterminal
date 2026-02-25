@@ -49,7 +49,9 @@ import { fmtPnL } from '../utils/math';
 import {
   fetchFunds, fetchOrderBook, fetchTradeBook,
   cancelOrder, squareOffPosition, placeOrder,
+  fetchExpiryDates,
   isKaggleBackend,
+  type ExpiryInfo,
   type FundsData, type OrderBookRow, type TradeBookRow,
 } from '../utils/kaggleClient';
 
@@ -1903,13 +1905,54 @@ const TradeOptionsPanel: FC<{
   const [symbol, setSymbol] = useState<SymbolCode>(initialSymbol ?? 'NIFTY');
   const cfg = SYMBOL_CONFIG[symbol];
 
-  // When symbol changes, reset expiry to the first available for that symbol
+  const staticExpiries = useMemo(
+    () => getExpiries(symbol).map(e => ({ date: e.breezeValue, label: e.label, days_away: e.daysToExpiry, weekday: '' })),
+    [symbol],
+  );
+  const [expiryChoices, setExpiryChoices] = useState<ExpiryInfo[]>(
+    () => getExpiries(initialSymbol ?? 'NIFTY').map(e => ({ date: e.breezeValue, label: e.label, days_away: e.daysToExpiry, weekday: '' })),
+  );
+
+  // When symbol changes, reset expiry to first available choice
   const [expiry, setExpiry] = useState<string>(
     () => initialExpiry ?? getExpiries(initialSymbol ?? 'NIFTY')[0]?.breezeValue ?? '',
   );
+
   useEffect(() => {
-    setExpiry(getExpiries(symbol)[0]?.breezeValue ?? '');
-  }, [symbol]);
+    let cancelled = false;
+
+    const resetToStatic = () => {
+      if (cancelled) return;
+      setExpiryChoices(staticExpiries);
+      setExpiry(staticExpiries[0]?.date ?? '');
+    };
+
+    if (!isKaggleBackend(backendUrl)) {
+      resetToStatic();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const currentCfg = SYMBOL_CONFIG[symbol];
+    fetchExpiryDates(backendUrl, currentCfg.breezeStockCode, currentCfg.breezeExchangeCode)
+      .then(r => {
+        if (cancelled) return;
+        if (r.ok && r.expiries.length > 0) {
+          setExpiryChoices(r.expiries);
+          setExpiry(r.expiries[0].date);
+          return;
+        }
+        resetToStatic();
+      })
+      .catch(() => {
+        resetToStatic();
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [symbol, backendUrl, staticExpiries]);
 
   const [optType, setOptType] = useState<'CE' | 'PE'>('CE');
   const [action, setAction] = useState<'BUY' | 'SELL'>('BUY');
@@ -2031,9 +2074,9 @@ const TradeOptionsPanel: FC<{
               className="w-full bg-[#0a0c15] border border-gray-700/40 focus:border-blue-500/60 text-white text-sm rounded-xl px-3 py-2.5 outline-none transition-colors"
               aria-label="Expiry"
             >
-              {getExpiries(symbol).map(e => (
-                <option key={e.breezeValue} value={e.breezeValue}>
-                  {e.label} ({e.daysToExpiry}d)
+              {expiryChoices.map(e => (
+                <option key={e.date} value={e.date}>
+                  {e.label} ({e.days_away}d)
                 </option>
               ))}
             </select>
