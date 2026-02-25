@@ -104,20 +104,25 @@ export const ChainRow = memo<ChainRowProps>(
       >
         <ActionButtons visible={isHovered} onBuy={buyCE} onSell={sellCE} side="CE" strike={row.strike} />
 
-        {ceCols.map((col) => (
-          <DataCell
-            key={col}
-            col={col}
-            value={getRowValue(row, col)}
-            flash={flashed.get(`${col}_${row.strike}`)}
-            showOIBars={showOIBars}
-            maxOI={maxOI}
-            side="ce"
-            align="text-right"
-            oiSignal={col === 'ce_oiChg' ? ceSignal : undefined}
-            showOISignals={showOISignals}
-          />
-        ))}
+        {ceCols.map((col) => {
+          const flash = flashed.get(`${col}_${row.strike}`);
+          // SPEC-B4: include flash timestamp in key to force remount → CSS animation restart
+          const flashKey = flash ? `${col}_${flash.timestamp}` : col;
+          return (
+            <DataCell
+              key={flashKey}
+              col={col}
+              value={getRowValue(row, col)}
+              flash={flash}
+              showOIBars={showOIBars}
+              maxOI={maxOI}
+              side="ce"
+              align="text-right"
+              oiSignal={col === 'ce_oiChg' ? ceSignal : undefined}
+              showOISignals={showOISignals}
+            />
+          );
+        })}
 
         <StrikeCell
           strike={row.strike}
@@ -127,20 +132,25 @@ export const ChainRow = memo<ChainRowProps>(
           isMaxPeOI={isMaxPeOI}
         />
 
-        {peCols.map((col) => (
-          <DataCell
-            key={col}
-            col={col}
-            value={getRowValue(row, col)}
-            flash={flashed.get(`${col}_${row.strike}`)}
-            showOIBars={showOIBars}
-            maxOI={maxOI}
-            side="pe"
-            align="text-left"
-            oiSignal={col === 'pe_oiChg' ? peSignal : undefined}
-            showOISignals={showOISignals}
-          />
-        ))}
+        {peCols.map((col) => {
+          const flash = flashed.get(`${col}_${row.strike}`);
+          // SPEC-B4: include flash timestamp in key to force remount → CSS animation restart
+          const flashKey = flash ? `${col}_${flash.timestamp}` : col;
+          return (
+            <DataCell
+              key={flashKey}
+              col={col}
+              value={getRowValue(row, col)}
+              flash={flash}
+              showOIBars={showOIBars}
+              maxOI={maxOI}
+              side="pe"
+              align="text-left"
+              oiSignal={col === 'pe_oiChg' ? peSignal : undefined}
+              showOISignals={showOISignals}
+            />
+          );
+        })}
 
         <ActionButtons visible={isHovered} onBuy={buyPE} onSell={sellPE} side="PE" strike={row.strike} />
       </tr>
@@ -165,9 +175,13 @@ export const ChainRow = memo<ChainRowProps>(
     if (wasHov !== nowHov) return false;
 
     const s = prev.row.strike;
-    const hadFlash = FLASH_FIELD_KEYS.some((k) => prev.flashed.has(`${k}_${s}`));
-    const hasFlash = FLASH_FIELD_KEYS.some((k) => next.flashed.has(`${k}_${s}`));
-    if (hadFlash !== hasFlash) return false;
+    // SPEC-B4: Re-render whenever any flash entry changes (presence OR timestamp)
+    // This ensures ChainRow re-renders so DataCell gets a new key, restarting CSS animation
+    for (const k of FLASH_FIELD_KEYS) {
+      const prevEntry = prev.flashed.get(`${k}_${s}`);
+      const nextEntry = next.flashed.get(`${k}_${s}`);
+      if (prevEntry?.timestamp !== nextEntry?.timestamp) return false;
+    }
 
     return true;
   },

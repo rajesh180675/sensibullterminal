@@ -45,7 +45,7 @@ const OptionChainInner: React.FC<OptionChainProps> = ({
   const [prefs, updatePrefs] = useChainPreferences();
 
   // ── Refs ─────────────────────────────────────────────────
-  const tableContainerRef = useRef<HTMLDivElement>(null);
+  const tableContainerRef = useRef<HTMLDivElement | null>(null);
 
   // ── Config ───────────────────────────────────────────────
   const cfg = SYMBOL_CONFIG[symbol];

@@ -19,9 +19,11 @@ function makeRow(strike: number, overrides: Partial<OptionRow> = {}): OptionRow 
     ce_oi: 10000, ce_oiChg: 500, ce_volume: 3000, ce_iv: 15.5,
     ce_ltp: 120.50, ce_delta: 0.55, ce_theta: -3.2,
     ce_gamma: 0.002, ce_vega: 8.5,
+    ce_bid: 120.00, ce_ask: 121.00,
     pe_oi: 8000, pe_oiChg: -200, pe_volume: 2500, pe_iv: 16.0,
     pe_ltp: 95.75, pe_delta: -0.45, pe_theta: -2.8,
     pe_gamma: 0.0018, pe_vega: 7.9,
+    pe_bid: 95.25, pe_ask: 96.25,
     ...overrides,
   };
 }

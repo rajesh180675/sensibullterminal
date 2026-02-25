@@ -5,26 +5,32 @@ import type { OptionRow, ExpiryDate, SymbolCode } from '../types/index';
 import { useEffect, useState, useRef } from 'react';
 
 function makeRow(strike: number, overrides: Partial<OptionRow> = {}): OptionRow {
+  const ceLtp = Math.max(0.05, (22500 - strike) * 0.8 + Math.random() * 50);
+  const peLtp = Math.max(0.05, (strike - 22500) * 0.8 + Math.random() * 50);
   return {
     strike, isATM: false,
     ce_oi: 10000 + Math.random() * 50000,
     ce_oiChg: (Math.random() - 0.4) * 5000,
     ce_volume: Math.random() * 20000,
     ce_iv: 12 + Math.random() * 10,
-    ce_ltp: Math.max(0.05, (22500 - strike) * 0.8 + Math.random() * 50),
+    ce_ltp: ceLtp,
     ce_delta: Math.max(0, Math.min(1, 0.5 + (22500 - strike) / 2000)),
     ce_theta: -(2 + Math.random() * 5),
     ce_gamma: 0.001 + Math.random() * 0.003,
     ce_vega: 5 + Math.random() * 10,
+    ce_bid: Math.max(0, ceLtp - 0.5),      // required by OptionRow
+    ce_ask: ceLtp + 0.5,                   // required by OptionRow
     pe_oi: 8000 + Math.random() * 40000,
     pe_oiChg: (Math.random() - 0.5) * 4000,
     pe_volume: Math.random() * 18000,
     pe_iv: 13 + Math.random() * 10,
-    pe_ltp: Math.max(0.05, (strike - 22500) * 0.8 + Math.random() * 50),
+    pe_ltp: peLtp,
     pe_delta: -Math.max(0, Math.min(1, 0.5 + (strike - 22500) / 2000)),
     pe_theta: -(2 + Math.random() * 5),
     pe_gamma: 0.001 + Math.random() * 0.003,
     pe_vega: 5 + Math.random() * 10,
+    pe_bid: Math.max(0, peLtp - 0.5),     // required by OptionRow
+    pe_ask: peLtp + 0.5,                  // required by OptionRow
     ...overrides,
   };
 }

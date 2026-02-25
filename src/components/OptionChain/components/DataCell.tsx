@@ -5,7 +5,6 @@ import { TrendingUp, TrendingDown } from 'lucide-react';
 import type { FlashEntry, OISignal } from '../types';
 import { TOOLTIPS, OI_SIGNAL_CONFIG } from '../constants';
 import { formatCell } from '../utils/formatCell';
-import { flashAnimationKey } from '../hooks/useFlashCells';
 import { OIBar } from './OIBar';
 
 interface DataCellProps {
@@ -37,8 +36,8 @@ export const DataCell = memo<DataCellProps>(function DataCell({
   const isOI =
     col.endsWith('_oi') && !col.includes('Chg') && !col.includes('iv');
 
-  // SPEC-B4: Use flash key to force animation restart
-  const animKey = flashAnimationKey(flash);
+  // SPEC-B4: Animation restart is driven by key prop on <DataCell> in ChainRow.
+  // The flash direction class is sufficient here.
   const flashCls = flash
     ? flash.direction === 'up' ? 'flash-up' : 'flash-dn'
     : '';
@@ -61,7 +60,6 @@ export const DataCell = memo<DataCellProps>(function DataCell({
 
   return (
     <td
-      key={animKey}
       className={`py-[3px] px-2 ${align} relative ${flashCls}`}
       role="gridcell"
       aria-label={`${TOOLTIPS[col] ?? col}: ${formatCell(col, value)}`}
