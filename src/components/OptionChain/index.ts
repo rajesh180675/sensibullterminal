@@ -2,6 +2,7 @@
 
 // ── Main component ─────────────────────────────────────────────
 export { OptionChain } from './OptionChain';
+export { VirtualOptionChain } from './VirtualOptionChain';
 
 // ── Types ──────────────────────────────────────────────────────
 export type {
