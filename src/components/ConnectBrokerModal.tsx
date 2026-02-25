@@ -4,7 +4,7 @@
 // All previous versions had Python SyntaxErrors and missing endpoints.
 // ════════════════════════════════════════════════════════════════════════════
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   X, Shield, Eye, EyeOff, ExternalLink, AlertTriangle,
   CheckCircle, Copy, Wifi, WifiOff, Bug, RefreshCw, Zap,
@@ -1648,6 +1648,7 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
   const [lastDebug,    setLastDebug]    = useState<DebugInfo | undefined>();
   const [healthMsg,    setHealthMsg]    = useState('');
   const [healthOk,     setHealthOk]     = useState<boolean | null>(null);
+  const closeTimeoutRef = useRef<number | null>(null);
 
   // Auto-extract ?apisession= from URL on mount
   useEffect(() => {
@@ -1660,6 +1661,19 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
   }, []);
 
   const loginUrl  = `https://api.icicidirect.com/apiuser/login?api_key=${encodeURIComponent(apiKey || 'YOUR_API_KEY')}`;
+  useEffect(() => () => {
+    if (closeTimeoutRef.current !== null) {
+      window.clearTimeout(closeTimeoutRef.current);
+    }
+  }, []);
+
+  const scheduleClose = useCallback(() => {
+    if (closeTimeoutRef.current !== null) {
+      window.clearTimeout(closeTimeoutRef.current);
+    }
+    closeTimeoutRef.current = window.setTimeout(() => onClose(), 1500);
+  }, [onClose]);
+
   const allFilled = !!(apiKey.trim() && apiSecret.trim() && sessionToken.trim());
   const isBackend = isKaggleBackend(proxyBase.trim());
 
@@ -1720,7 +1734,7 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
           setStatus('ok');
           setStatusMsg(`✓ Connected via Python SDK! ${result.user ? `(${result.user})` : ''}`);
           onConnected(live);
-          setTimeout(onClose, 1500);
+          scheduleClose();
         } else {
           setStatus('error');
           setStatusMsg(result.reason);
@@ -1747,7 +1761,7 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
         setStatus('ok');
         setStatusMsg(`✓ Live — ${result.reason}`);
         onConnected(live);
-        setTimeout(onClose, 1500);
+        scheduleClose();
       } else {
         setStatus('error');
         setStatusMsg(result.reason);
@@ -1756,7 +1770,7 @@ export const ConnectBrokerModal: React.FC<Props> = ({ onClose, onConnected, sess
       setStatus('error');
       setStatusMsg(e instanceof Error ? e.message : String(e));
     }
-  }, [apiKey, apiSecret, sessionToken, proxyBase, authToken, allFilled, isBackend, onConnected, onClose]);
+  }, [apiKey, apiSecret, sessionToken, proxyBase, authToken, allFilled, isBackend, onConnected, scheduleClose]);
 
   // ── Save offline (no validation) ────────────────────────────────────────────
   const handleSaveOffline = useCallback(() => {
