@@ -1,8 +1,8 @@
-import { BellRing, Bot, Pause, Play, PlusCircle } from 'lucide-react';
+import { BellRing, Bot, Pause, Play, PlusCircle, Radar } from 'lucide-react';
 import { useAutomationStore } from '../../domains/automation/automationStore';
 
 export function AutomationWorkspace() {
-  const { rules, createRuleFromStrategy, toggleRuleStatus } = useAutomationStore();
+  const { rules, callbacks, syncStatus, createRuleFromStrategy, toggleRuleStatus, evaluateRules } = useAutomationStore();
 
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[0.8fr,1.2fr]">
@@ -16,11 +16,18 @@ export function AutomationWorkspace() {
           Draft GTT, alert, hedge, and rebalance workflows from the current staged strategy.
         </p>
         <button
-          onClick={createRuleFromStrategy}
+          onClick={() => void createRuleFromStrategy()}
           className="mt-5 inline-flex items-center gap-2 rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition hover:bg-orange-400"
         >
           <PlusCircle size={14} />
           Create From Strategy
+        </button>
+        <button
+          onClick={() => void evaluateRules()}
+          className="mt-3 inline-flex items-center gap-2 rounded-2xl border border-white/10 px-4 py-3 text-sm text-slate-200 transition hover:bg-white/10"
+        >
+          <Radar size={14} />
+          Evaluate Now
         </button>
 
         <div className="mt-5 grid gap-3">
@@ -35,6 +42,10 @@ export function AutomationWorkspace() {
           <div className="rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-300">
             <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Paused</div>
             <div className="mt-2 text-white">{rules.filter((rule) => rule.status === 'paused').length} rules paused</div>
+          </div>
+          <div className="rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-300">
+            <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Backend sync</div>
+            <div className="mt-2 text-white">{syncStatus === 'ready' ? 'Live backend' : syncStatus === 'loading' ? 'Refreshing' : 'Local fallback'}</div>
           </div>
         </div>
       </section>
@@ -53,7 +64,7 @@ export function AutomationWorkspace() {
                   <div className="mt-1 text-sm text-slate-400">{rule.kind.toUpperCase()} · {rule.scope}</div>
                 </div>
                 <button
-                  onClick={() => toggleRuleStatus(rule.id)}
+                  onClick={() => void toggleRuleStatus(rule.id)}
                   className="inline-flex items-center gap-2 rounded-2xl border border-white/10 px-3 py-2 text-xs text-slate-300 transition hover:bg-white/10"
                 >
                   {rule.status === 'active' ? <Pause size={12} /> : <Play size={12} />}
@@ -78,6 +89,29 @@ export function AutomationWorkspace() {
               {rule.notes && <div className="mt-3 text-xs text-slate-500">{rule.notes}</div>}
             </div>
           ))}
+        </div>
+        <div className="mt-5">
+          <div className="text-[11px] uppercase tracking-[0.3em] text-orange-300/70">Callback log</div>
+          <div className="mt-3 space-y-3">
+            {callbacks.length === 0 && (
+              <div className="rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-400">
+                No backend callback events recorded yet.
+              </div>
+            )}
+            {callbacks.slice(0, 6).map((event) => (
+              <div key={event.id} className="rounded-3xl border border-white/8 bg-black/15 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-white">{event.ruleName}</div>
+                  <span className="text-[11px] uppercase tracking-[0.2em] text-slate-400">{event.eventType}</span>
+                </div>
+                <div className="mt-2 text-sm text-slate-300">{event.message}</div>
+                <div className="mt-2 text-xs text-slate-500">
+                  {new Date(event.timestamp).toLocaleString()} · {event.status}
+                  {event.brokerResults && event.brokerResults.length > 0 ? ` · ${event.brokerResults.filter((item) => item.success).length}/${event.brokerResults.length} legs successful` : ''}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
     </div>

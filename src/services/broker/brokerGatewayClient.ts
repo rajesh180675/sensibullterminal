@@ -4,6 +4,10 @@ import { extractApiSession, placeLegOrder, validateSession } from '../../utils/b
 import {
   checkBackendHealth,
   connectToBreeze,
+  createAutomationRule,
+  evaluateAutomationRules,
+  fetchAutomationCallbacks,
+  fetchAutomationRules,
   fetchExecutionPreview,
   fetchFunds,
   fetchExpiryDates,
@@ -17,6 +21,7 @@ import {
   fetchTradeBook,
   isKaggleBackend,
   setTerminalAuthToken,
+  updateAutomationRuleStatus,
 } from '../../utils/kaggleClient';
 import { setWsAuthToken, subscribeOptionChain } from '../../utils/breezeWs';
 import type { OptionLeg } from '../../types/index';
@@ -207,6 +212,23 @@ export const brokerGatewayClient = {
         right: leg.type === 'CE' ? 'call' : 'put',
         strike_price: String(leg.strike),
       })));
+    },
+  },
+  automation: {
+    async fetchRules(session: BreezeSession) {
+      return fetchAutomationRules(session.proxyBase);
+    },
+    async createRule(session: BreezeSession, payload: Record<string, unknown>) {
+      return createAutomationRule(session.proxyBase, payload);
+    },
+    async updateRuleStatus(session: BreezeSession, ruleId: string, status: 'active' | 'paused' | 'draft') {
+      return updateAutomationRuleStatus(session.proxyBase, ruleId, status);
+    },
+    async evaluate(session: BreezeSession) {
+      return evaluateAutomationRules(session.proxyBase);
+    },
+    async fetchCallbacks(session: BreezeSession, limit = 25) {
+      return fetchAutomationCallbacks(session.proxyBase, limit);
     },
   },
 };

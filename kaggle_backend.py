@@ -318,6 +318,308 @@ class CandleStore:
             return payload
 
 
+class JsonStateStore:
+    def __init__(self, path: str, default_factory: Callable[[], dict]):
+        self.path = path
+        self.default_factory = default_factory
+        self._lock = threading.Lock()
+
+    def load(self) -> dict:
+        with self._lock:
+            if not os.path.exists(self.path):
+                return self.default_factory()
+            try:
+                with open(self.path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                return payload if isinstance(payload, dict) else self.default_factory()
+            except Exception:
+                return self.default_factory()
+
+    def save(self, payload: dict) -> None:
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = self.path + ".tmp"
+        with self._lock:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=True, indent=2)
+            os.replace(tmp, self.path)
+
+
+class AutomationRuleManager:
+    def __init__(self, engine: "BreezeEngine", path: str):
+        self.engine = engine
+        self.store = JsonStateStore(path, lambda: {"rules": [], "callbacks": []})
+        self._lock = threading.Lock()
+        self._callbacks = deque(maxlen=200)
+        self._state = self.store.load()
+        for event in reversed(self._state.get("callbacks", [])[-50:]):
+            self._callbacks.appendleft(event)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="automation-rule-loop", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop_event.wait(5.0):
+            try:
+                self.evaluate_active_rules()
+            except Exception as exc:
+                log.warning(f"[Automation] background evaluation failed: {exc}")
+
+    def close(self) -> None:
+        self._stop_event.set()
+
+    @staticmethod
+    def _now_ts() -> float:
+        return time.time()
+
+    @staticmethod
+    def _fmt_run(ts: Optional[float]) -> str:
+        if not ts:
+            return "Never"
+        return datetime.fromtimestamp(ts).strftime("%d %b %H:%M")
+
+    def _persist_locked(self) -> None:
+        self.store.save({
+            "rules": self._state.get("rules", []),
+            "callbacks": list(self._callbacks),
+        })
+
+    def _append_event_locked(self, event: dict) -> None:
+        self._callbacks.appendleft(event)
+
+    def _find_rule_locked(self, rule_id: str) -> Optional[dict]:
+        for rule in self._state.get("rules", []):
+            if str(rule.get("id")) == rule_id:
+                return rule
+        return None
+
+    def _build_event(
+        self,
+        rule: dict,
+        event_type: str,
+        status: str,
+        message: str,
+        broker_results: Optional[List[dict]] = None,
+        meta: Optional[dict] = None,
+    ) -> dict:
+        return {
+            "id": f"automation-event-{int(self._now_ts() * 1000)}-{len(self._callbacks) + 1}",
+            "ruleId": str(rule.get("id", "")),
+            "ruleName": str(rule.get("name", "Automation rule")),
+            "kind": str(rule.get("kind", "gtt")),
+            "eventType": event_type,
+            "status": status,
+            "message": message,
+            "timestamp": self._now_ts(),
+            "brokerResults": broker_results or [],
+            "meta": meta or {},
+        }
+
+    def list_rules(self) -> List[dict]:
+        with self._lock:
+            return [dict(rule) for rule in self._state.get("rules", [])]
+
+    def list_callbacks(self, limit: int = 25) -> List[dict]:
+        with self._lock:
+            return list(self._callbacks)[: max(1, min(limit, len(self._callbacks) or 1))]
+
+    def create_rule(self, payload: dict) -> dict:
+        now = self._now_ts()
+        rule = {
+            "id": str(payload.get("id") or f"rule-{int(now * 1000)}"),
+            "name": str(payload.get("name") or "Automation rule"),
+            "kind": str(payload.get("kind") or "gtt"),
+            "status": str(payload.get("status") or "draft"),
+            "scope": str(payload.get("scope") or "Strategy workspace"),
+            "trigger": str(payload.get("trigger") or "Manual review required"),
+            "action": str(payload.get("action") or "Notify operator"),
+            "lastRun": str(payload.get("lastRun") or "Never"),
+            "nextRun": str(payload.get("nextRun") or "Live"),
+            "notes": str(payload.get("notes") or ""),
+            "symbol": str(payload.get("symbol") or ""),
+            "triggerConfig": payload.get("triggerConfig") or {"type": "manual"},
+            "actionConfig": payload.get("actionConfig") or {"type": "notify"},
+            "runCount": int(payload.get("runCount") or 0),
+            "updatedAt": now,
+        }
+        with self._lock:
+            self._state.setdefault("rules", []).insert(0, rule)
+            self._append_event_locked(self._build_event(rule, "created", "info", "Automation rule created."))
+            self._persist_locked()
+            return dict(rule)
+
+    def update_rule_status(self, rule_id: str, status: str) -> Optional[dict]:
+        with self._lock:
+            rule = self._find_rule_locked(rule_id)
+            if not rule:
+                return None
+            rule["status"] = status
+            rule["updatedAt"] = self._now_ts()
+            rule["nextRun"] = "Live" if status == "active" else "Paused"
+            self._append_event_locked(self._build_event(rule, "status_changed", "info", f"Rule status changed to {status}.", meta={"status": status}))
+            self._persist_locked()
+            return dict(rule)
+
+    def receive_callback(self, payload: dict) -> dict:
+        rule_id = str(payload.get("ruleId") or payload.get("rule_id") or "")
+        with self._lock:
+            rule = self._find_rule_locked(rule_id) or {
+                "id": rule_id or "manual-callback",
+                "name": str(payload.get("ruleName") or "Manual callback"),
+                "kind": str(payload.get("kind") or "alert"),
+            }
+            event = self._build_event(
+                rule,
+                str(payload.get("eventType") or payload.get("event_type") or "manual"),
+                str(payload.get("status") or "info"),
+                str(payload.get("message") or "Manual automation callback received."),
+                broker_results=payload.get("brokerResults") or payload.get("broker_results") or [],
+                meta=payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
+            )
+            self._append_event_locked(event)
+            self._persist_locked()
+            return event
+
+    def _fetch_spot(self, symbol: str) -> float:
+        cached = self.engine.tick_store.get_spot_prices().get(symbol.upper())
+        if cached and cached > 0:
+            return cached
+        if not self.engine.connected or not self.engine.breeze:
+            return 0.0
+
+        exchange_code = "NSE" if symbol.upper() == "NIFTY" else "BSE"
+
+        def _call():
+            return self.engine.breeze.get_quotes(
+                stock_code=symbol.upper(),
+                exchange_code=exchange_code,
+                expiry_date="",
+                right="",
+                strike_price="",
+            )
+
+        try:
+            result = self.engine.rate_limiter.enqueue(_call)
+            rows = result.get("Success", []) if isinstance(result, dict) else []
+            if isinstance(rows, dict):
+                rows = [rows]
+            for row in rows:
+                for field in ("ltp", "last_traded_price", "close", "last_price", "LastPrice"):
+                    value = _safe_float(row.get(field))
+                    if value > 0:
+                        self.engine.tick_store.update(f"{symbol.upper()}:SPOT", {"ltp": value, "source": "rest"})
+                        return value
+        except Exception as exc:
+            log.warning(f"[Automation] spot fetch failed: {exc}")
+        return 0.0
+
+    def _trigger_status(self, rule: dict) -> tuple[bool, str, dict]:
+        trigger = rule.get("triggerConfig") or {}
+        trigger_type = str(trigger.get("type") or "manual")
+        symbol = str(rule.get("symbol") or "NIFTY")
+        if trigger_type == "manual":
+            return False, "Manual rule pending operator action.", {}
+        if trigger_type == "spot_range_break":
+            spot = self._fetch_spot(symbol)
+            lower_price = _safe_float(trigger.get("lowerPrice"))
+            upper_price = _safe_float(trigger.get("upperPrice"))
+            if spot <= 0:
+                return False, "Spot price unavailable.", {"spot": spot}
+            if lower_price > 0 and spot <= lower_price:
+                return True, f"Spot {spot:.2f} broke below {lower_price:.2f}.", {"spot": spot, "threshold": lower_price, "direction": "down"}
+            if upper_price > 0 and spot >= upper_price:
+                return True, f"Spot {spot:.2f} broke above {upper_price:.2f}.", {"spot": spot, "threshold": upper_price, "direction": "up"}
+            return False, f"Spot {spot:.2f} remains inside rule range.", {"spot": spot, "lowerPrice": lower_price, "upperPrice": upper_price}
+        if trigger_type == "mtm_drawdown":
+            threshold = _safe_float(trigger.get("maxDrawdown"))
+            current = _safe_float(trigger.get("currentMtm"))
+            return current <= threshold, f"Estimated MTM {current:.2f} vs threshold {threshold:.2f}.", {"estimatedMtm": current, "threshold": threshold}
+        return False, f"Unsupported trigger type {trigger_type}.", {"triggerType": trigger_type}
+
+    def _normalise_action_legs(self, rule: dict) -> List[dict]:
+        action_config = rule.get("actionConfig") or {}
+        legs = action_config.get("legs") or []
+        normalised: List[dict] = []
+        for leg in legs:
+            order_type = str(leg.get("orderType") or "market").lower()
+            symbol = str(leg.get("symbol") or rule.get("symbol") or "NIFTY").upper()
+            exchange_code = str(leg.get("exchange_code") or ("NFO" if symbol == "NIFTY" else "BFO"))
+            lots = max(1, int(_safe_float(leg.get("lots"), 1)))
+            lot_size = 75 if symbol == "NIFTY" else 20
+            normalised.append({
+                "stock_code": str(leg.get("stock_code") or symbol),
+                "exchange_code": exchange_code,
+                "product": "options",
+                "action": str(leg.get("action") or "BUY").lower(),
+                "quantity": str(int(_safe_float(leg.get("quantity"), lots * lot_size))),
+                "price": str(leg.get("limitPrice") or leg.get("price") or 0),
+                "order_type": order_type,
+                "expiry_date": str(leg.get("expiry") or leg.get("expiry_date") or ""),
+                "right": "call" if str(leg.get("type") or leg.get("right") or "CE").upper().startswith("C") else "put",
+                "strike_price": str(leg.get("strike") or leg.get("strike_price") or 0),
+                "stoploss": str(leg.get("stoploss") or 0),
+            })
+        return normalised
+
+    def _execute_locked(self, rule: dict, trigger_meta: dict) -> dict:
+        action_config = rule.get("actionConfig") or {}
+        action_type = str(action_config.get("type") or "notify")
+        if action_type == "notify":
+            event = self._build_event(rule, "executed", "info", str(action_config.get("message") or rule.get("action") or "Automation notification triggered."), meta=trigger_meta)
+            self._append_event_locked(event)
+            rule["runCount"] = int(rule.get("runCount") or 0) + 1
+            rule["lastRun"] = self._fmt_run(self._now_ts())
+            rule["status"] = "paused" if str(rule.get("kind")) == "alert" else rule.get("status", "active")
+            rule["nextRun"] = "Paused" if rule["status"] == "paused" else "Live"
+            return event
+        if not self.engine.connected:
+            event = self._build_event(rule, "failed", "error", "Broker session is not connected.", meta=trigger_meta)
+            self._append_event_locked(event)
+            rule["lastRun"] = self._fmt_run(self._now_ts())
+            return event
+        legs = self._normalise_action_legs(rule)
+        if not legs:
+            event = self._build_event(rule, "failed", "error", "No automation legs configured.", meta=trigger_meta)
+            self._append_event_locked(event)
+            rule["lastRun"] = self._fmt_run(self._now_ts())
+            return event
+        results = self.engine.place_strategy_order(legs)
+        success = all(bool(item.get("success")) for item in results) if results else False
+        event = self._build_event(
+            rule,
+            "executed" if success else "failed",
+            "success" if success else "error",
+            "Broker automation execution completed." if success else "Broker automation execution had failures.",
+            broker_results=results,
+            meta=trigger_meta,
+        )
+        self._append_event_locked(event)
+        rule["runCount"] = int(rule.get("runCount") or 0) + 1
+        rule["lastRun"] = self._fmt_run(self._now_ts())
+        rule["status"] = "paused"
+        rule["nextRun"] = "Paused after trigger"
+        return event
+
+    def evaluate_active_rules(self) -> List[dict]:
+        events: List[dict] = []
+        with self._lock:
+            for rule in self._state.get("rules", []):
+                if str(rule.get("status")) != "active":
+                    continue
+                triggered, message, meta = self._trigger_status(rule)
+                if not triggered:
+                    continue
+                trigger_event = self._build_event(rule, "triggered", "warning", message, meta=meta)
+                self._append_event_locked(trigger_event)
+                events.append(trigger_event)
+                events.append(self._execute_locked(rule, meta))
+                rule["updatedAt"] = self._now_ts()
+            if events:
+                self._persist_locked()
+        return events
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BreezeEngine
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -339,6 +641,13 @@ class BreezeEngine:
                 "BREEZE_VALIDATION_CAPTURE_FILE",
                 os.path.join(os.getcwd(), "logs", "breeze_execution_validation.jsonl"),
             )
+        )
+        self.automation_rules = AutomationRuleManager(
+            self,
+            os.environ.get(
+                "BREEZE_AUTOMATION_RULE_FILE",
+                os.path.join(os.getcwd(), "logs", "automation_rules.json"),
+            ),
         )
         self._ws_thread   = None
         self._ws_lock     = threading.Lock()
@@ -1735,6 +2044,66 @@ async def api_strategy_execute(request: Request):
             None, engine.place_strategy_order, legs
         )
         return {"success": all(r["success"] for r in results), "results": results}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+@app.get("/api/automation/rules")
+async def api_automation_rules():
+    return {"success": True, "rules": engine.automation_rules.list_rules()}
+
+
+@app.post("/api/automation/rules")
+async def api_automation_create_rule(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+    try:
+        rule = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.create_rule, body)
+        return {"success": True, "rule": rule}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+@app.post("/api/automation/rules/{rule_id}/status")
+async def api_automation_update_rule_status(rule_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    status = str(body.get("status") or "")
+    if status not in {"active", "paused", "draft"}:
+        return JSONResponse(status_code=400, content={"success": False, "error": "status must be active, paused, or draft"})
+    rule = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.update_rule_status, rule_id, status)
+    if not rule:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Rule not found"})
+    return {"success": True, "rule": rule}
+
+
+@app.post("/api/automation/evaluate")
+async def api_automation_evaluate():
+    try:
+        events = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.evaluate_active_rules)
+        return {"success": True, "events": events, "count": len(events)}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+@app.get("/api/automation/callbacks")
+async def api_automation_callbacks(limit: int = Query(25)):
+    return {"success": True, "events": engine.automation_rules.list_callbacks(limit=limit)}
+
+
+@app.post("/api/automation/callbacks")
+async def api_automation_receive_callback(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+    try:
+        event = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.receive_callback, body)
+        return {"success": True, "event": event}
     except Exception as exc:
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 

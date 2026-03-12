@@ -268,6 +268,48 @@ export interface AutomationRule {
   lastRun: string;
   nextRun: string;
   notes?: string;
+  symbol?: SymbolCode;
+  triggerConfig?: {
+    type: 'spot_range_break' | 'mtm_drawdown' | 'manual';
+    referencePrice?: number;
+    lowerPrice?: number;
+    upperPrice?: number;
+    maxDrawdown?: number;
+  };
+  actionConfig?: {
+    type: 'execute_strategy' | 'notify' | 'suggest_hedge';
+    legs?: Array<{
+      symbol: SymbolCode;
+      type: 'CE' | 'PE';
+      strike: number;
+      action: 'BUY' | 'SELL';
+      lots: number;
+      expiry: string;
+      orderType?: 'market' | 'limit';
+      limitPrice?: number;
+    }>;
+    message?: string;
+  };
+  runCount?: number;
+  updatedAt?: number;
+}
+
+export interface AutomationCallbackEvent {
+  id: string;
+  ruleId: string;
+  ruleName: string;
+  kind: AutomationRule['kind'];
+  eventType: 'triggered' | 'executed' | 'failed' | 'status_changed' | 'created' | 'manual';
+  status: 'success' | 'warning' | 'error' | 'info';
+  message: string;
+  timestamp: number;
+  brokerResults?: Array<{
+    leg_index?: number;
+    success?: boolean;
+    order_id?: string;
+    error?: string;
+  }>;
+  meta?: Record<string, unknown>;
 }
 
 // ── Breeze session (browser state — no backend) ─────────────

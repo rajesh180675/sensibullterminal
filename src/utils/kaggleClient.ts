@@ -277,6 +277,47 @@ export interface BackendExecutionValidationSummary {
   margin?: BackendExecutionValidationLegSummary;
 }
 
+export interface BackendAutomationRule {
+  id: string;
+  name: string;
+  kind: 'gtt' | 'alert' | 'hedge' | 'rebalance';
+  status: 'active' | 'paused' | 'draft';
+  scope: string;
+  trigger: string;
+  action: string;
+  lastRun: string;
+  nextRun: string;
+  notes?: string;
+  symbol?: string;
+  triggerConfig?: {
+    type: 'spot_range_break' | 'mtm_drawdown' | 'manual';
+    referencePrice?: number;
+    lowerPrice?: number;
+    upperPrice?: number;
+    maxDrawdown?: number;
+  };
+  actionConfig?: {
+    type: 'execute_strategy' | 'notify' | 'suggest_hedge';
+    legs?: Array<Record<string, unknown>>;
+    message?: string;
+  };
+  runCount?: number;
+  updatedAt?: number;
+}
+
+export interface BackendAutomationCallbackEvent {
+  id: string;
+  ruleId: string;
+  ruleName: string;
+  kind: BackendAutomationRule['kind'];
+  eventType: 'triggered' | 'executed' | 'failed' | 'status_changed' | 'created' | 'manual';
+  status: 'success' | 'warning' | 'error' | 'info';
+  message: string;
+  timestamp: number;
+  brokerResults?: Array<{ leg_index?: number; success?: boolean; order_id?: string; error?: string }>;
+  meta?: Record<string, unknown>;
+}
+
 // ── Health check ──────────────────────────────────────────────────────────────
 // FIX (Bug #5): Improved messages — clearly distinguish:
 //   ok:true  + connected:false  = "Backend reachable, click Validate Live to connect Breeze"
@@ -717,6 +758,83 @@ export async function fetchExecutionValidation(
     return data.success
       ? { ok: true, records: data.records ?? [], captureFile: data.capture_file }
       : { ok: false, error: data.error ?? 'Unknown error' };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function fetchAutomationRules(
+  backendUrl: string,
+): Promise<{ ok: boolean; rules?: BackendAutomationRule[]; error?: string }> {
+  const url = apiUrl(backendUrl, '/api/automation/rules');
+  try {
+    const data = await fetchJson<{ success: boolean; rules?: BackendAutomationRule[]; error?: string }>(url);
+    return data.success ? { ok: true, rules: data.rules ?? [] } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function createAutomationRule(
+  backendUrl: string,
+  payload: Record<string, unknown>,
+): Promise<{ ok: boolean; rule?: BackendAutomationRule; error?: string }> {
+  const url = apiUrl(backendUrl, '/api/automation/rules');
+  try {
+    const data = await fetchJson<{ success: boolean; rule?: BackendAutomationRule; error?: string }>(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return data.success ? { ok: true, rule: data.rule } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function updateAutomationRuleStatus(
+  backendUrl: string,
+  ruleId: string,
+  status: 'active' | 'paused' | 'draft',
+): Promise<{ ok: boolean; rule?: BackendAutomationRule; error?: string }> {
+  const url = apiUrl(backendUrl, `/api/automation/rules/${encodeURIComponent(ruleId)}/status`);
+  try {
+    const data = await fetchJson<{ success: boolean; rule?: BackendAutomationRule; error?: string }>(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    return data.success ? { ok: true, rule: data.rule } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function evaluateAutomationRules(
+  backendUrl: string,
+): Promise<{ ok: boolean; events?: BackendAutomationCallbackEvent[]; count?: number; error?: string }> {
+  const url = apiUrl(backendUrl, '/api/automation/evaluate');
+  try {
+    const data = await fetchJson<{ success: boolean; events?: BackendAutomationCallbackEvent[]; count?: number; error?: string }>(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    return data.success ? { ok: true, events: data.events ?? [], count: data.count ?? 0 } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function fetchAutomationCallbacks(
+  backendUrl: string,
+  limit = 25,
+): Promise<{ ok: boolean; events?: BackendAutomationCallbackEvent[]; error?: string }> {
+  const qs = new URLSearchParams({ limit: String(limit) });
+  const url = apiUrl(backendUrl, `/api/automation/callbacks?${qs}`);
+  try {
+    const data = await fetchJson<{ success: boolean; events?: BackendAutomationCallbackEvent[]; error?: string }>(url);
+    return data.success ? { ok: true, events: data.events ?? [] } : { ok: false, error: data.error };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
