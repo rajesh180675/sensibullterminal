@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { SYMBOL_CONFIG } from '../../config/market';
 import type { ExecutionBlotterItem, ExecutionPreview, OptionLeg, Position } from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
@@ -21,6 +21,8 @@ function buildExecutionPreview(legs: OptionLeg[]): ExecutionPreview {
       maxProfit: 0,
       maxLoss: 0,
       breakevens: [],
+      source: 'estimated',
+      updatedAt: Date.now(),
     };
   }
 
@@ -52,12 +54,42 @@ function buildExecutionPreview(legs: OptionLeg[]): ExecutionPreview {
     maxProfit,
     maxLoss,
     breakevens: findBreakevens(payoff),
+    source: 'estimated',
+    updatedAt: Date.now(),
   };
+}
+
+function enrichPreview(base: ExecutionPreview, patch?: Partial<ExecutionPreview>): ExecutionPreview {
+  if (!patch) return base;
+  return {
+    ...base,
+    ...patch,
+    maxProfit: patch.maxProfit ?? base.maxProfit,
+    maxLoss: patch.maxLoss ?? base.maxLoss,
+    breakevens: patch.breakevens ?? base.breakevens,
+  };
+}
+
+function buildBackendLegPayload(legs: OptionLeg[]) {
+  const cfg = SYMBOL_CONFIG[legs[0].symbol];
+  return legs.map((leg) => ({
+    stock_code: cfg.breezeStockCode,
+    exchange_code: cfg.breezeExchangeCode,
+    product: 'options',
+    action: leg.action.toLowerCase(),
+    quantity: String(leg.lots * cfg.lotSize),
+    price: String(leg.limitPrice ?? leg.ltp ?? 0),
+    order_type: leg.orderType ?? 'market',
+    expiry_date: leg.expiry,
+    right: leg.type === 'CE' ? 'call' : 'put',
+    strike_price: String(leg.strike),
+  }));
 }
 
 interface ExecutionStoreValue {
   legs: OptionLeg[];
   preview: ExecutionPreview;
+  previewStatus: 'idle' | 'loading' | 'ready' | 'fallback';
   blotter: ExecutionBlotterItem[];
   isExecuting: boolean;
   addLeg: (leg: Omit<OptionLeg, 'id'>) => void;
@@ -78,6 +110,9 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
   const [legs, setLegs] = useState<OptionLeg[]>([]);
   const [blotter, setBlotter] = useState<ExecutionBlotterItem[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
+  const localPreview = useMemo(() => buildExecutionPreview(legs), [legs]);
+  const [preview, setPreview] = useState<ExecutionPreview>(localPreview);
+  const [previewStatus, setPreviewStatus] = useState<'idle' | 'loading' | 'ready' | 'fallback'>('idle');
 
   const addLeg = useCallback((leg: Omit<OptionLeg, 'id'>) => {
     setLegs((current) => [...current, { ...leg, id: nextExecutionLegId() }]);
@@ -119,7 +154,66 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     })));
   }, []);
 
-  const preview = useMemo(() => buildExecutionPreview(legs), [legs]);
+  useEffect(() => {
+    setPreview(localPreview);
+    if (legs.length === 0) {
+      setPreviewStatus('idle');
+      return;
+    }
+
+    if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) {
+      setPreviewStatus('fallback');
+      return;
+    }
+
+    let cancelled = false;
+    setPreviewStatus('loading');
+
+    const loadPreview = async () => {
+      const requestLegs = buildBackendLegPayload(legs);
+      const [previewResult, marginResult] = await Promise.all([
+        brokerGatewayClient.execution.previewStrategy(session, requestLegs),
+        brokerGatewayClient.execution.fetchMargin(session, legs),
+      ]);
+
+      if (cancelled) return;
+
+      if (!previewResult.ok && !marginResult.ok) {
+        setPreview(localPreview);
+        setPreviewStatus('fallback');
+        notify({
+          title: 'Backend preview unavailable',
+          message: previewResult.error || marginResult.error || 'Falling back to local execution estimates.',
+          tone: 'warning',
+        });
+        return;
+      }
+
+      const merged = enrichPreview(localPreview, {
+        ...previewResult.data,
+        ...marginResult.data,
+        source: 'backend',
+        updatedAt: previewResult.data?.updated_at ?? marginResult.data?.updated_at ?? Date.now(),
+      });
+      setPreview(merged);
+      setPreviewStatus('ready');
+    };
+
+    void loadPreview().catch((error) => {
+      if (cancelled) return;
+      setPreview(localPreview);
+      setPreviewStatus('fallback');
+      notify({
+        title: 'Backend preview failed',
+        message: error instanceof Error ? error.message : String(error),
+        tone: 'warning',
+      });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [legs, localPreview, notify, session]);
 
   const executeStrategy = useCallback(async (selectedLegs: OptionLeg[]) => {
     if (selectedLegs.length === 0) return;
@@ -238,6 +332,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo(() => ({
     legs,
     preview,
+    previewStatus,
     blotter,
     isExecuting,
     addLeg,
@@ -248,7 +343,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     loadPosition,
     clearBlotter,
     executeStrategy,
-  }), [legs, preview, blotter, isExecuting, addLeg, appendLegs, updateLeg, removeLeg, clearLegs, loadPosition, clearBlotter, executeStrategy]);
+  }), [legs, preview, previewStatus, blotter, isExecuting, addLeg, appendLegs, updateLeg, removeLeg, clearLegs, loadPosition, clearBlotter, executeStrategy]);
 
   return <ExecutionStore.Provider value={value}>{children}</ExecutionStore.Provider>;
 }

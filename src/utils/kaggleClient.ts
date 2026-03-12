@@ -230,6 +230,23 @@ export interface BackendMarketDepth {
   contract_key?: string;
 }
 
+export interface BackendExecutionPreview {
+  estimatedPremium: number;
+  estimatedFees: number;
+  slippage: number;
+  capitalAtRisk: number;
+  marginRequired: number;
+  availableMargin?: number;
+  spanMargin?: number;
+  blockTradeMargin?: number;
+  orderMargin?: number;
+  tradeMargin?: number;
+  totalBrokerage?: number;
+  chargesBreakdown?: Record<string, number>;
+  notes?: string[];
+  updated_at?: number;
+}
+
 // ── Health check ──────────────────────────────────────────────────────────────
 // FIX (Bug #5): Improved messages — clearly distinguish:
 //   ok:true  + connected:false  = "Backend reachable, click Validate Live to connect Breeze"
@@ -620,6 +637,40 @@ export async function fetchMarketDepth(
     return data.success
       ? { ok: true, data: data.data }
       : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function fetchExecutionPreview(
+  backendUrl: string,
+  legs: unknown[],
+): Promise<{ ok: boolean; data?: BackendExecutionPreview; error?: string }> {
+  const url = apiUrl(backendUrl, '/api/preview');
+  try {
+    const data = await fetchJson<{ success: boolean; data?: BackendExecutionPreview; error?: string }>(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ legs }),
+    });
+    return data.success ? { ok: true, data: data.data } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function fetchMarginPreview(
+  backendUrl: string,
+  legs: unknown[],
+): Promise<{ ok: boolean; data?: BackendExecutionPreview; error?: string }> {
+  const url = apiUrl(backendUrl, '/api/margin');
+  try {
+    const data = await fetchJson<{ success: boolean; data?: BackendExecutionPreview; error?: string }>(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ legs }),
+    });
+    return data.success ? { ok: true, data: data.data } : { ok: false, error: data.error };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }

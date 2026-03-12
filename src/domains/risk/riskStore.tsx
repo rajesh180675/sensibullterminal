@@ -23,19 +23,20 @@ export function RiskProvider({ children }: { children: React.ReactNode }) {
   const snapshot = useMemo<RiskSnapshot>(() => {
     const stagedGreeks = combinedGreeks(legs);
     const positionCount = Math.max(livePositions.length, 1);
+    const availableFunds = preview.availableMargin ?? summary.availableFunds;
     const portfolioDelta = stagedGreeks.delta + summary.grossExposure / 100000;
     const portfolioTheta = stagedGreeks.theta - positionCount * 1.8;
     const portfolioGamma = stagedGreeks.gamma + positionCount * 0.0025;
     const portfolioVega = stagedGreeks.vega + positionCount * 0.65;
     const stressLoss1Pct = preview.capitalAtRisk * 0.35 + summary.totalMaxLoss * 0.08;
     const stressLoss2Pct = preview.capitalAtRisk * 0.62 + summary.totalMaxLoss * 0.14;
-    const marginHeadroom = summary.availableFunds - preview.marginRequired;
+    const marginHeadroom = availableFunds - preview.marginRequired;
     const concentration = summary.grossExposure === 0 ? 0 : (summary.grossExposure - summary.hedgedExposure) / summary.grossExposure;
 
     const alerts: RiskAlert[] = [
       {
         id: 'margin-headroom',
-        severity: marginHeadroom < 0 ? 'critical' : marginHeadroom < summary.availableFunds * 0.15 ? 'warning' : 'info',
+        severity: marginHeadroom < 0 ? 'critical' : marginHeadroom < availableFunds * 0.15 ? 'warning' : 'info',
         title: 'Margin headroom',
         detail: marginHeadroom < 0
           ? 'Staged execution exceeds available funds.'
@@ -49,7 +50,7 @@ export function RiskProvider({ children }: { children: React.ReactNode }) {
       },
       {
         id: 'stress-2',
-        severity: severityFor(stressLoss2Pct, summary.availableFunds * 0.18, summary.availableFunds * 0.35),
+        severity: severityFor(stressLoss2Pct, availableFunds * 0.18, availableFunds * 0.35),
         title: 'Two-sigma stress',
         detail: `Estimated drawdown under a 2% move is ${Math.round(stressLoss2Pct).toLocaleString('en-IN')}.`,
       },
@@ -66,7 +67,7 @@ export function RiskProvider({ children }: { children: React.ReactNode }) {
       concentration,
       alerts,
     };
-  }, [legs, livePositions.length, preview.capitalAtRisk, preview.marginRequired, summary]);
+  }, [legs, livePositions.length, preview.availableMargin, preview.capitalAtRisk, preview.marginRequired, summary]);
 
   const value = useMemo(() => ({ snapshot }), [snapshot]);
   return <RiskStore.Provider value={value}>{children}</RiskStore.Provider>;

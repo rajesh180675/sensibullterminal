@@ -6,7 +6,7 @@ import { fmtNum, fmtPnL } from '../../utils/math';
 
 export function RiskWorkspace() {
   const { snapshot } = useRiskStore();
-  const { preview } = useExecutionStore();
+  const { preview, previewStatus } = useExecutionStore();
   const { summary } = usePortfolioStore();
 
   return (
@@ -37,6 +37,10 @@ export function RiskWorkspace() {
 
         <div className="mt-4 rounded-3xl border border-white/8 bg-white/5 px-4 py-4 text-sm text-slate-300">
           Staged margin requirement: {fmtPnL(-preview.marginRequired)}. Estimated capital at risk: {fmtPnL(-preview.capitalAtRisk)}.
+          <div className="mt-2 text-xs text-slate-400">
+            Margin source: {preview.source === 'backend' ? 'broker backend' : 'local estimate'}
+            {previewStatus === 'loading' ? ' · refreshing...' : ''}
+          </div>
         </div>
       </section>
 
@@ -90,6 +94,9 @@ export function RiskWorkspace() {
             Funds context
           </div>
           <div className="mt-2">Available: {fmtPnL(summary.availableFunds)} · Used: {fmtPnL(-summary.marginUsed)}</div>
+          {preview.availableMargin !== undefined && (
+            <div className="mt-1">Broker available margin: {fmtPnL(preview.availableMargin)}</div>
+          )}
           <div className="mt-1">Utilization: {Math.round(summary.marginUtilization * 100)}%</div>
         </div>
       </section>

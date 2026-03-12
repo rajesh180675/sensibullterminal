@@ -4,7 +4,7 @@ import { useMarketStore } from '../../domains/market/marketStore';
 import { fmtPnL } from '../../utils/math';
 
 export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void }) {
-  const { legs, preview, blotter, clearBlotter, executeStrategy, isExecuting } = useExecutionStore();
+  const { legs, preview, previewStatus, blotter, clearBlotter, executeStrategy, isExecuting } = useExecutionStore();
   const { symbol, spotPrice } = useMarketStore();
 
   return (
@@ -51,6 +51,11 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
             <div className="mt-2 text-lg font-semibold text-white">{fmtPnL(-preview.capitalAtRisk)}</div>
           </div>
         </div>
+        <div className="mt-4 rounded-3xl border border-white/8 bg-white/5 px-4 py-3 text-xs text-slate-300">
+          Preview source: {preview.source === 'backend' ? 'Broker backend' : 'Local estimate'}
+          {previewStatus === 'loading' ? ' · refreshing...' : ''}
+          {preview.availableMargin !== undefined ? ` · Available margin ${fmtPnL(preview.availableMargin)}` : ''}
+        </div>
       </section>
 
       <div className="grid gap-4">
@@ -63,8 +68,14 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
             <div className="rounded-3xl bg-white/5 px-4 py-3">Underlying: {symbol}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">Spot: {spotPrice.toFixed(2)}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">Margin required: {fmtPnL(-preview.marginRequired)}</div>
+            <div className="rounded-3xl bg-white/5 px-4 py-3">SPAN / Block / Order: {fmtPnL(-(preview.spanMargin ?? 0))} / {fmtPnL(-(preview.blockTradeMargin ?? 0))} / {fmtPnL(-(preview.orderMargin ?? 0))}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">Max profit / loss: {fmtPnL(preview.maxProfit)} / {fmtPnL(preview.maxLoss)}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">Breakevens: {preview.breakevens.length > 0 ? preview.breakevens.join(', ') : 'None'}</div>
+            {preview.notes && preview.notes.length > 0 && (
+              <div className="rounded-3xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-amber-100">
+                {preview.notes.join(' | ')}
+              </div>
+            )}
           </div>
 
           <div className="mt-5 flex gap-3">

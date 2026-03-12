@@ -618,6 +618,218 @@ class BreezeEngine:
         result = self.rate_limiter.enqueue(self.breeze.get_funds)
         return result.get("Success", {}) if isinstance(result, dict) else {}
 
+    def _normalise_execution_leg(self, leg: dict) -> dict:
+        right_norm = "call" if str(leg.get("right") or "call").lower().startswith("c") else "put"
+        order_type = str(leg.get("order_type") or "market").lower()
+        return {
+            "stock_code": str(leg.get("stock_code", "")),
+            "exchange_code": str(leg.get("exchange_code", "NFO")),
+            "product": str(leg.get("product", "options")),
+            "action": str(leg.get("action", "buy")).lower(),
+            "order_type": order_type,
+            "price": str(leg.get("price", "0") if order_type == "limit" else leg.get("price", "0")),
+            "quantity": str(leg.get("quantity", "0")),
+            "expiry_date": str(leg.get("expiry_date", "")),
+            "right": right_norm,
+            "strike_price": str(leg.get("strike_price", "0")),
+            "stoploss": str(leg.get("stoploss", "0")),
+        }
+
+    def _extract_success_payload(self, result: dict) -> dict:
+        if not isinstance(result, dict):
+            return {}
+        payload = result.get("Success", result.get("success", {}))
+        if isinstance(payload, list):
+            return payload[0] if payload and isinstance(payload[0], dict) else {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _build_margin_position(self, leg: dict) -> dict:
+        normalised = self._normalise_execution_leg(leg)
+        return {
+            "strike_price": normalised["strike_price"],
+            "quantity": normalised["quantity"],
+            "right": "Call" if normalised["right"] == "call" else "Put",
+            "product": normalised["product"],
+            "action": normalised["action"].capitalize(),
+            "price": normalised["price"],
+            "stock_code": normalised["stock_code"],
+            "expiry_date": normalised["expiry_date"],
+            "fresh_order_type": normalised["order_type"].capitalize(),
+            "cover_order_flow": "N",
+            "cover_limit_rate": "",
+            "cover_sltp_price": "",
+            "fresh_limit_rate": normalised["price"],
+            "open_quantity": normalised["quantity"],
+        }
+
+    def _sum_known_charge_fields(self, payload: dict) -> tuple[float, float, Dict[str, float]]:
+        charge_keys = {
+            "brokerage": "brokerage",
+            "exchange_turnover_charge": "exchange_turnover_charge",
+            "exchange_turnover_charges": "exchange_turnover_charge",
+            "gst": "gst",
+            "stt": "stt",
+            "stamp_duty": "stamp_duty",
+            "sebi_charges": "sebi_charges",
+            "transaction_charges": "transaction_charges",
+            "ipft": "ipft",
+            "other_charges": "other_charges",
+            "total_charges": "total_charges",
+            "total_tax": "total_tax",
+        }
+        charges: Dict[str, float] = {}
+        for raw_key, canonical_key in charge_keys.items():
+            value = _safe_float(payload.get(raw_key))
+            if value > 0:
+                charges[canonical_key] = charges.get(canonical_key, 0.0) + value
+
+        brokerage = _safe_float(payload.get("brokerage") or payload.get("total_brokerage"))
+        total = _safe_float(payload.get("total_charges") or payload.get("charges"))
+        if total <= 0:
+            total = sum(value for key, value in charges.items() if key != "total_charges")
+        return brokerage, total, charges
+
+    def calculate_margin(self, legs: List[dict]) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        if not legs:
+            return {
+                "margin_required": 0.0,
+                "available_margin": 0.0,
+                "span_margin": 0.0,
+                "block_trade_margin": 0.0,
+                "order_margin": 0.0,
+                "trade_margin": 0.0,
+                "raw": {},
+            }
+
+        positions = [self._build_margin_position(leg) for leg in legs]
+        exchange_code = str(legs[0].get("exchange_code", "NFO"))
+        result = self.rate_limiter.enqueue(self.breeze.margin_calculator, positions, exchange_code)
+        payload = self._extract_success_payload(result)
+        funds = self.get_funds()
+
+        order_margin = _safe_float(
+            payload.get("order_margin")
+            or payload.get("orderMargin")
+            or payload.get("total_order_margin")
+        )
+        trade_margin = _safe_float(
+            payload.get("trade_margin")
+            or payload.get("tradeMargin")
+            or payload.get("total_trade_margin")
+        )
+        span_margin = _safe_float(payload.get("span_margin") or payload.get("spanMargin"))
+        block_trade_margin = _safe_float(
+            payload.get("block_trade_margin")
+            or payload.get("blockTradeMargin")
+            or payload.get("block_margin")
+        )
+        margin_required = max(
+            order_margin,
+            trade_margin,
+            span_margin + block_trade_margin,
+            _safe_float(payload.get("total_margin") or payload.get("margin_required")),
+        )
+
+        return {
+            "margin_required": margin_required,
+            "available_margin": _safe_float(funds.get("available_margin")),
+            "span_margin": span_margin,
+            "block_trade_margin": block_trade_margin,
+            "order_margin": order_margin,
+            "trade_margin": trade_margin,
+            "raw": payload,
+        }
+
+    def preview_strategy(self, legs: List[dict]) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        if not legs:
+            return {
+                "estimatedPremium": 0.0,
+                "estimatedFees": 0.0,
+                "slippage": 0.0,
+                "capitalAtRisk": 0.0,
+                "marginRequired": 0.0,
+                "availableMargin": _safe_float(self.get_funds().get("available_margin")),
+                "spanMargin": 0.0,
+                "blockTradeMargin": 0.0,
+                "orderMargin": 0.0,
+                "tradeMargin": 0.0,
+                "totalBrokerage": 0.0,
+                "chargesBreakdown": {},
+                "notes": [],
+                "updated_at": time.time(),
+            }
+
+        preview_rows = []
+        total_brokerage = 0.0
+        total_charges = 0.0
+        charges_breakdown: Dict[str, float] = {}
+        notes: List[str] = []
+        estimated_premium = 0.0
+        capital_at_risk = 0.0
+        slippage = 0.0
+
+        for leg in legs:
+            normalised = self._normalise_execution_leg(leg)
+            price = _safe_float(normalised["price"])
+            quantity = _safe_float(normalised["quantity"])
+            estimated_premium += price * quantity * (1 if normalised["action"] == "sell" else -1)
+            capital_at_risk += abs(price * quantity)
+            slippage += abs(price * quantity) * 0.0006
+
+            response = self.rate_limiter.enqueue(
+                self.breeze.preview_order,
+                normalised["stock_code"],
+                normalised["exchange_code"],
+                normalised["product"],
+                normalised["order_type"],
+                normalised["price"],
+                normalised["action"],
+                normalised["quantity"],
+                normalised["expiry_date"],
+                normalised["right"],
+                normalised["strike_price"],
+                "",
+                normalised["stoploss"],
+                "N",
+            )
+            payload = self._extract_success_payload(response)
+            brokerage, total, charges = self._sum_known_charge_fields(payload)
+            total_brokerage += brokerage
+            total_charges += total
+            for key, value in charges.items():
+                charges_breakdown[key] = charges_breakdown.get(key, 0.0) + value
+            error = ""
+            if isinstance(response, dict):
+                error = str(response.get("Error") or response.get("error") or "")
+            if error:
+                notes.append(error)
+            preview_rows.append(payload)
+
+        margin = self.calculate_margin(legs)
+        margin_required = max(margin["margin_required"], capital_at_risk + total_charges)
+
+        return {
+            "estimatedPremium": estimated_premium,
+            "estimatedFees": total_charges,
+            "slippage": slippage,
+            "capitalAtRisk": capital_at_risk + total_charges,
+            "marginRequired": margin_required,
+            "availableMargin": margin["available_margin"],
+            "spanMargin": margin["span_margin"],
+            "blockTradeMargin": margin["block_trade_margin"],
+            "orderMargin": margin["order_margin"],
+            "tradeMargin": margin["trade_margin"],
+            "totalBrokerage": total_brokerage,
+            "chargesBreakdown": charges_breakdown,
+            "notes": notes,
+            "updated_at": time.time(),
+            "legs": preview_rows,
+        }
+
     # ── REST: Historical OHLCV ────────────────────────────────────────────────
 
     def get_historical(
@@ -1262,6 +1474,62 @@ async def api_ticks(since_version: int = Query(0)):
 
 # ── Orders ─────────────────────────────────────────────────────────────────────
 
+@app.post("/api/preview")
+async def api_preview(request: Request):
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+
+    legs = body.get("legs", [])
+    if not legs:
+        return {"success": True, "data": engine.preview_strategy([])}
+
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, engine.preview_strategy, legs)
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+@app.post("/api/margin")
+async def api_margin(request: Request):
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+
+    legs = body.get("legs", [])
+    if not legs:
+        return {"success": True, "data": engine.calculate_margin([])}
+
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, engine.calculate_margin, legs)
+        return {
+            "success": True,
+            "data": {
+                "estimatedPremium": 0.0,
+                "estimatedFees": 0.0,
+                "slippage": 0.0,
+                "capitalAtRisk": 0.0,
+                "marginRequired": data["margin_required"],
+                "availableMargin": data["available_margin"],
+                "spanMargin": data["span_margin"],
+                "blockTradeMargin": data["block_trade_margin"],
+                "orderMargin": data["order_margin"],
+                "tradeMargin": data["trade_margin"],
+                "chargesBreakdown": {},
+                "notes": [],
+                "updated_at": time.time(),
+            },
+        }
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
 @app.post("/api/order")
 async def api_order(request: Request):
     if not engine.connected:
@@ -1656,6 +1924,8 @@ def main():
     print("    POST  /api/ws/subscribe     subscribe Breeze WS feeds")
     print("    WS    /ws/ticks             live tick stream to frontend")
     print("    POST  /api/strategy/execute multi-leg concurrent order")
+    print("    POST  /api/preview          broker-native preview aggregation")
+    print("    POST  /api/margin           broker-native margin aggregation")
     print("    POST  /api/squareoff        exit / square-off a position")
     print("    POST  /api/order/cancel     cancel pending order")
     print("    PATCH /api/order/modify     modify order price/qty")

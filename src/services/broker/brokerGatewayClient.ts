@@ -4,9 +4,11 @@ import { extractApiSession, placeLegOrder, validateSession } from '../../utils/b
 import {
   checkBackendHealth,
   connectToBreeze,
+  fetchExecutionPreview,
   fetchFunds,
   fetchExpiryDates,
   fetchHistorical,
+  fetchMarginPreview,
   fetchMarketDepth,
   fetchOptionChain,
   fetchOrderBook,
@@ -17,6 +19,7 @@ import {
   setTerminalAuthToken,
 } from '../../utils/kaggleClient';
 import { setWsAuthToken, subscribeOptionChain } from '../../utils/breezeWs';
+import type { OptionLeg } from '../../types/index';
 
 export interface BrokerCapabilities {
   backendPrimary: boolean;
@@ -184,6 +187,26 @@ export const brokerGatewayClient = {
   orders: {
     async placeDirectLeg(session: BreezeSession, params: Parameters<typeof placeLegOrder>[1]) {
       return placeLegOrder(session, params);
+    },
+  },
+  execution: {
+    async previewStrategy(session: BreezeSession, legs: Array<Record<string, unknown>>) {
+      return fetchExecutionPreview(session.proxyBase, legs);
+    },
+    async fetchMargin(session: BreezeSession, legs: OptionLeg[]) {
+      const cfg = SYMBOL_CONFIG[legs[0].symbol];
+      return fetchMarginPreview(session.proxyBase, legs.map((leg) => ({
+        stock_code: cfg.breezeStockCode,
+        exchange_code: cfg.breezeExchangeCode,
+        product: 'options',
+        action: leg.action.toLowerCase(),
+        quantity: String(leg.lots * cfg.lotSize),
+        price: String(leg.limitPrice ?? leg.ltp ?? 0),
+        order_type: leg.orderType ?? 'market',
+        expiry_date: leg.expiry,
+        right: leg.type === 'CE' ? 'call' : 'put',
+        strike_price: String(leg.strike),
+      })));
     },
   },
 };

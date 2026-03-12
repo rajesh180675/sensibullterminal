@@ -164,6 +164,16 @@ export interface ExecutionPreview {
   maxProfit: number;
   maxLoss: number;
   breakevens: number[];
+  source?: 'backend' | 'estimated';
+  availableMargin?: number;
+  spanMargin?: number;
+  blockTradeMargin?: number;
+  orderMargin?: number;
+  tradeMargin?: number;
+  totalBrokerage?: number;
+  chargesBreakdown?: Record<string, number>;
+  updatedAt?: number;
+  notes?: string[];
 }
 
 export interface ExecutionBlotterItem {
