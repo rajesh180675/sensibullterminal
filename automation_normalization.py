@@ -196,7 +196,63 @@ def normalize_broker_results(payload: dict) -> List[dict]:
     return results
 
 
+def is_icici_order_update_payload(payload: dict) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return False
+    return (
+        isinstance(data.get("orders"), list)
+        and any(key in data for key in ("order_status", "status_message", "strategy_id", "strategy_name", "stock_code"))
+    )
+
+
+def normalize_icici_webhook_payload(payload: dict, source: str, normalized_at: float | None = None) -> Dict[str, Any]:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    broker_status_raw = str(data.get("order_status") or "").lower()
+    event_type_raw = str(data.get("event") or "order_update").lower()
+
+    if broker_status_raw in {"rejected", "failed", "cancelled", "canceled", "error"}:
+        status = "error"
+        event_type = "failed"
+    elif broker_status_raw in {"complete", "completed", "executed", "filled", "traded"}:
+        status = "success"
+        event_type = "executed"
+    else:
+        status = "info"
+        event_type = "webhook" if source == "webhook" else "manual"
+
+    message = str(data.get("status_message") or "")
+    if not message:
+        message = f"Broker callback status: {broker_status_raw}." if broker_status_raw else "Broker webhook received."
+
+    symbol = str(data.get("stock_code") or "").upper()
+    meta = {
+        "source": source,
+        "brokerStatus": broker_status_raw,
+        "eventTypeRaw": event_type_raw,
+        "normalizedAt": normalized_at if normalized_at is not None else time.time(),
+        "payload": payload,
+        "normalizer": "icici_order_update",
+    }
+    if symbol:
+        meta["symbol"] = symbol
+
+    return {
+        "ruleId": extract_rule_id_hint(data),
+        "ruleName": str(data.get("strategy_name") or ""),
+        "kind": str(data.get("kind") or "alert"),
+        "eventType": event_type,
+        "status": status,
+        "message": message,
+        "brokerResults": normalize_broker_results({"orders": data.get("orders") or []}),
+        "meta": meta,
+    }
+
+
 def normalize_callback_payload(payload: dict, source: str, normalized_at: float | None = None) -> Dict[str, Any]:
+    if is_icici_order_update_payload(payload):
+        return normalize_icici_webhook_payload(payload, source, normalized_at=normalized_at)
+
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     event_type_raw = str(first_present(data, [
         "eventType",

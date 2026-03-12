@@ -3,8 +3,10 @@ import unittest
 from pathlib import Path
 
 from automation_normalization import (
+    is_icici_order_update_payload,
     match_symbol,
     normalize_callback_payload,
+    normalize_icici_webhook_payload,
     normalize_position_row,
 )
 
@@ -59,6 +61,11 @@ class PositionNormalizationTests(unittest.TestCase):
 
 
 class CallbackNormalizationTests(unittest.TestCase):
+    def test_detects_icici_order_update_fixture_shape(self):
+        payload = json.loads((FIXTURE_DIR / "icici_webhook_order_update.json").read_text())
+
+        self.assertTrue(is_icici_order_update_payload(payload))
+
     def test_normalizes_expected_deployment_shape_fixture(self):
         payload = json.loads((FIXTURE_DIR / "icici_webhook_order_update.json").read_text())
 
@@ -73,6 +80,20 @@ class CallbackNormalizationTests(unittest.TestCase):
         self.assertTrue(all(item["success"] for item in normalized["brokerResults"]))
         self.assertEqual(normalized["meta"]["symbol"], "NIFTY")
         self.assertEqual(normalized["meta"]["normalizedAt"], 1741824000.0)
+        self.assertEqual(normalized["meta"]["normalizer"], "icici_order_update")
+
+    def test_normalizes_nested_icici_webhook_data_payload(self):
+        payload = {
+            "data": json.loads((FIXTURE_DIR / "icici_webhook_order_update.json").read_text()),
+        }
+
+        normalized = normalize_icici_webhook_payload(payload, "webhook", normalized_at=1741824000.5)
+
+        self.assertEqual(normalized["ruleId"], "rule-1741881000000")
+        self.assertEqual(normalized["eventType"], "executed")
+        self.assertEqual(normalized["status"], "success")
+        self.assertEqual(normalized["meta"]["normalizer"], "icici_order_update")
+        self.assertEqual(normalized["meta"]["normalizedAt"], 1741824000.5)
 
     def test_rejection_payload_maps_to_failed_event(self):
         payload = {

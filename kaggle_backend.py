@@ -44,6 +44,7 @@ import logging
 from automation_normalization import (
     extract_rule_id_hint,
     first_present,
+    is_icici_order_update_payload,
     match_symbol,
     normalize_broker_results,
     normalize_callback_payload,
@@ -360,6 +361,7 @@ class AutomationRuleManager:
     def __init__(self, engine: "BreezeEngine", path: str):
         self.engine = engine
         self.store = JsonStateStore(path, lambda: {"rules": [], "callbacks": []})
+        self.webhook_capture_store = ValidationCaptureStore("logs/automation_webhook_samples.jsonl")
         self._lock = threading.Lock()
         self._callbacks = deque(maxlen=200)
         self._state = self.store.load()
@@ -541,6 +543,8 @@ class AutomationRuleManager:
 
     def receive_callback(self, payload: dict, source: str = "manual") -> dict:
         normalized = self._normalise_callback_payload(payload, source)
+        if source == "webhook":
+            self._capture_webhook_sample(payload, normalized)
         rule_id = str(normalized.get("ruleId") or "")
         with self._lock:
             rule = self._find_rule_locked(rule_id) or {
@@ -559,6 +563,20 @@ class AutomationRuleManager:
             self._append_event_locked(event)
             self._persist_locked()
             return event
+
+    def _capture_webhook_sample(self, payload: dict, normalized: dict) -> None:
+        record = {
+            "capturedAt": self._now_ts(),
+            "matchesIciciOrderUpdate": bool(is_icici_order_update_payload(payload)),
+            "ruleId": str(normalized.get("ruleId") or ""),
+            "eventType": str(normalized.get("eventType") or ""),
+            "status": str(normalized.get("status") or ""),
+            "payload": payload,
+        }
+        try:
+            self.webhook_capture_store.append(record)
+        except Exception as exc:
+            log.warning(f"[Automation] webhook capture failed: {exc}")
 
     def _fetch_spot(self, symbol: str) -> float:
         cached = self.engine.tick_store.get_spot_prices().get(symbol.upper())
