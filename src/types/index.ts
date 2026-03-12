@@ -155,6 +155,16 @@ export interface CandleStreamBucket {
   volume: number;
 }
 
+export interface ExecutionChargeSummary {
+  brokerage: number;
+  brokerReportedOtherCharges: number;
+  brokerReportedTurnoverAndSebiCharges: number;
+  taxesAndDuties: number;
+  totalFees: number;
+  componentCharges: Record<string, number>;
+  calculationMode?: 'broker_rollup' | 'component_fallback';
+}
+
 export interface ExecutionPreview {
   estimatedPremium: number;
   estimatedFees: number;
@@ -172,6 +182,7 @@ export interface ExecutionPreview {
   tradeMargin?: number;
   totalBrokerage?: number;
   chargesBreakdown?: Record<string, number>;
+  chargeSummary?: ExecutionChargeSummary;
   updatedAt?: number;
   notes?: string[];
   validation?: ExecutionValidationSummary;

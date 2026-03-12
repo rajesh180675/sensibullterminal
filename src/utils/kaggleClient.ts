@@ -243,6 +243,15 @@ export interface BackendExecutionPreview {
   tradeMargin?: number;
   totalBrokerage?: number;
   chargesBreakdown?: Record<string, number>;
+  chargeSummary?: {
+    brokerage: number;
+    brokerReportedOtherCharges: number;
+    brokerReportedTurnoverAndSebiCharges: number;
+    taxesAndDuties: number;
+    totalFees: number;
+    componentCharges: Record<string, number>;
+    calculationMode?: 'broker_rollup' | 'component_fallback';
+  };
   notes?: string[];
   updated_at?: number;
   validation?: BackendExecutionValidationSummary;

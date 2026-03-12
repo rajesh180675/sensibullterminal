@@ -719,32 +719,71 @@ class BreezeEngine:
             "open_quantity": normalised["quantity"],
         }
 
-    def _sum_known_charge_fields(self, payload: dict) -> tuple[float, float, Dict[str, float]]:
-        charge_keys = {
-            "brokerage": "brokerage",
-            "exchange_turnover_charge": "exchange_turnover_charge",
-            "exchange_turnover_charges": "exchange_turnover_charge",
-            "gst": "gst",
-            "stt": "stt",
-            "stamp_duty": "stamp_duty",
-            "sebi_charges": "sebi_charges",
-            "transaction_charges": "transaction_charges",
-            "ipft": "ipft",
-            "other_charges": "other_charges",
-            "total_charges": "total_charges",
-            "total_tax": "total_tax",
-        }
-        charges: Dict[str, float] = {}
-        for raw_key, canonical_key in charge_keys.items():
-            value = _safe_float(payload.get(raw_key))
-            if value > 0:
-                charges[canonical_key] = charges.get(canonical_key, 0.0) + value
+    def _sum_known_charge_fields(self, payload: dict) -> tuple[float, float, Dict[str, float], Dict[str, Any]]:
+        exchange_turnover = _safe_float(
+            payload.get("exchange_turnover_charge") or payload.get("exchange_turnover_charges")
+        )
+        sebi_charges = _safe_float(payload.get("sebi_charges"))
+        gst = _safe_float(payload.get("gst"))
+        stt = _safe_float(payload.get("stt"))
+        stamp_duty = _safe_float(payload.get("stamp_duty"))
+        transaction_charges = _safe_float(payload.get("transaction_charges"))
+        ipft = _safe_float(payload.get("ipft"))
+        other_charges = _safe_float(payload.get("other_charges"))
+        total_tax = _safe_float(payload.get("total_tax"))
 
-        brokerage = _safe_float(payload.get("brokerage") or payload.get("total_brokerage"))
-        total = _safe_float(payload.get("total_charges") or payload.get("charges"))
-        if total <= 0:
-            total = sum(value for key, value in charges.items() if key != "total_charges")
-        return brokerage, total, charges
+        component_charges = {
+            "exchangeTurnoverCharges": exchange_turnover,
+            "sebiCharges": sebi_charges,
+            "gst": gst,
+            "stt": stt,
+            "stampDuty": stamp_duty,
+            "transactionCharges": transaction_charges,
+            "ipft": ipft,
+            "otherCharges": other_charges,
+            "totalTax": total_tax,
+        }
+        component_charges = {key: value for key, value in component_charges.items() if value > 0}
+
+        turnover_and_sebi = _safe_float(payload.get("total_turnover_and_sebi_charges"))
+        if turnover_and_sebi <= 0:
+            turnover_and_sebi = exchange_turnover + sebi_charges + transaction_charges + ipft
+
+        taxes_and_duties = total_tax
+        if taxes_and_duties <= 0:
+            taxes_and_duties = gst + stt + stamp_duty
+
+        broker_other_charges = _safe_float(payload.get("total_other_charges"))
+        if broker_other_charges <= 0:
+            broker_other_charges = turnover_and_sebi + taxes_and_duties + other_charges
+
+        brokerage = _safe_float(payload.get("brokerage"))
+        total_fees = _safe_float(payload.get("total_brokerage") or payload.get("total_charges") or payload.get("charges"))
+        if total_fees <= 0:
+            total_fees = brokerage + broker_other_charges
+
+        charges = {
+            "brokerage": brokerage,
+            "brokerReportedTurnoverAndSebiCharges": turnover_and_sebi,
+            "brokerReportedOtherCharges": broker_other_charges,
+            "taxesAndDuties": taxes_and_duties,
+            "totalFees": total_fees,
+            **component_charges,
+        }
+        charges = {key: value for key, value in charges.items() if value > 0}
+
+        charge_summary = {
+            "brokerage": brokerage,
+            "brokerReportedOtherCharges": broker_other_charges,
+            "brokerReportedTurnoverAndSebiCharges": turnover_and_sebi,
+            "taxesAndDuties": taxes_and_duties,
+            "totalFees": total_fees,
+            "componentCharges": component_charges,
+            "calculationMode": "broker_rollup"
+            if _safe_float(payload.get("total_other_charges")) > 0 or _safe_float(payload.get("total_brokerage")) > 0
+            else "component_fallback",
+        }
+        return brokerage, total_fees, charges, charge_summary
 
     def calculate_margin(self, legs: List[dict]) -> dict:
         if not self.connected:
@@ -853,6 +892,15 @@ class BreezeEngine:
         total_brokerage = 0.0
         total_charges = 0.0
         charges_breakdown: Dict[str, float] = {}
+        aggregated_charge_summary = {
+            "brokerage": 0.0,
+            "brokerReportedOtherCharges": 0.0,
+            "brokerReportedTurnoverAndSebiCharges": 0.0,
+            "taxesAndDuties": 0.0,
+            "totalFees": 0.0,
+            "componentCharges": {},
+            "calculationMode": "component_fallback",
+        }
         notes: List[str] = []
         estimated_premium = 0.0
         capital_at_risk = 0.0
@@ -885,11 +933,21 @@ class BreezeEngine:
             )
             payload = self._extract_success_payload(response)
             validation_rows.append(self._record_execution_validation("preview", [normalised], response, payload))
-            brokerage, total, charges = self._sum_known_charge_fields(payload)
+            brokerage, total, charges, charge_summary = self._sum_known_charge_fields(payload)
             total_brokerage += brokerage
             total_charges += total
             for key, value in charges.items():
                 charges_breakdown[key] = charges_breakdown.get(key, 0.0) + value
+            aggregated_charge_summary["brokerage"] += _safe_float(charge_summary.get("brokerage"))
+            aggregated_charge_summary["brokerReportedOtherCharges"] += _safe_float(charge_summary.get("brokerReportedOtherCharges"))
+            aggregated_charge_summary["brokerReportedTurnoverAndSebiCharges"] += _safe_float(charge_summary.get("brokerReportedTurnoverAndSebiCharges"))
+            aggregated_charge_summary["taxesAndDuties"] += _safe_float(charge_summary.get("taxesAndDuties"))
+            aggregated_charge_summary["totalFees"] += _safe_float(charge_summary.get("totalFees"))
+            if charge_summary.get("calculationMode") == "broker_rollup":
+                aggregated_charge_summary["calculationMode"] = "broker_rollup"
+            component_bucket = aggregated_charge_summary["componentCharges"]
+            for key, value in charge_summary.get("componentCharges", {}).items():
+                component_bucket[key] = component_bucket.get(key, 0.0) + _safe_float(value)
             error = ""
             if isinstance(response, dict):
                 error = str(response.get("Error") or response.get("error") or "")
@@ -913,6 +971,7 @@ class BreezeEngine:
             "tradeMargin": margin["trade_margin"],
             "totalBrokerage": total_brokerage,
             "chargesBreakdown": charges_breakdown,
+            "chargeSummary": aggregated_charge_summary,
             "notes": notes,
             "updated_at": time.time(),
             "legs": preview_rows,

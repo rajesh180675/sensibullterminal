@@ -3,9 +3,22 @@ import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
 import { fmtPnL } from '../../utils/math';
 
+const CHARGE_LABELS: Record<string, string> = {
+  exchangeTurnoverCharges: 'Exchange turnover',
+  sebiCharges: 'SEBI',
+  gst: 'GST',
+  stt: 'STT',
+  stampDuty: 'Stamp duty',
+  transactionCharges: 'Transaction charges',
+  ipft: 'IPFT',
+  otherCharges: 'Other charges',
+  totalTax: 'Total tax',
+};
+
 export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void }) {
   const { legs, preview, previewStatus, blotter, clearBlotter, executeStrategy, isExecuting } = useExecutionStore();
   const { symbol, spotPrice } = useMarketStore();
+  const componentEntries = Object.entries(preview.chargeSummary?.componentCharges ?? {}).filter(([, value]) => value > 0);
 
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[1.1fr,0.9fr]">
@@ -76,6 +89,19 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
             <div className="rounded-3xl bg-white/5 px-4 py-3">Spot: {spotPrice.toFixed(2)}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">Margin required: {fmtPnL(-preview.marginRequired)}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">SPAN / Block / Order: {fmtPnL(-(preview.spanMargin ?? 0))} / {fmtPnL(-(preview.blockTradeMargin ?? 0))} / {fmtPnL(-(preview.orderMargin ?? 0))}</div>
+            {preview.chargeSummary && (
+              <div className="rounded-3xl border border-white/8 bg-white/5 px-4 py-3">
+                <div>Brokerage / Other / Total fees: {fmtPnL(-(preview.chargeSummary.brokerage ?? 0))} / {fmtPnL(-(preview.chargeSummary.brokerReportedOtherCharges ?? 0))} / {fmtPnL(-(preview.chargeSummary.totalFees ?? preview.estimatedFees))}</div>
+                <div className="mt-1 text-xs text-slate-400">
+                  Turnover+SEBI {fmtPnL(-(preview.chargeSummary.brokerReportedTurnoverAndSebiCharges ?? 0))} · Taxes+duties {fmtPnL(-(preview.chargeSummary.taxesAndDuties ?? 0))} · Source {preview.chargeSummary.calculationMode === 'broker_rollup' ? 'ICICI rollup' : 'Component fallback'}
+                </div>
+                {componentEntries.length > 0 && (
+                  <div className="mt-2 text-xs text-slate-300">
+                    {componentEntries.map(([key, value]) => `${CHARGE_LABELS[key] ?? key}: ${fmtPnL(-value)}`).join(' | ')}
+                  </div>
+                )}
+              </div>
+            )}
             <div className="rounded-3xl bg-white/5 px-4 py-3">Max profit / loss: {fmtPnL(preview.maxProfit)} / {fmtPnL(preview.maxLoss)}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">Breakevens: {preview.breakevens.length > 0 ? preview.breakevens.join(', ') : 'None'}</div>
             {preview.notes && preview.notes.length > 0 && (
