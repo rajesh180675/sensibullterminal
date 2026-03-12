@@ -10,13 +10,12 @@ import {
 import { Trash2, Plus, Zap, Target, BarChart2, BookOpen, ChevronDown, ChevronUp } from 'lucide-react';
 import { OptionLeg, OptionRow, SymbolCode } from '../types/index';
 
-let _sbLid = 0;
-const nextId = () => `leg-sb-${++_sbLid}-${Date.now()}`;
 import { SYMBOL_CONFIG }          from '../config/market';
 import { buildPayoff, combinedGreeks, findBreakevens, maxProfitLoss, fmtPnL, fmtNum } from '../utils/math';
 
 interface Props {
   legs:        OptionLeg[];
+  onAppendLegs: (legs: Array<Omit<OptionLeg, 'id'>>) => void;
   onUpdateLeg: (id: string, u: Partial<OptionLeg>) => void;
   onRemoveLeg: (id: string) => void;
   onExecute:   (legs: OptionLeg[]) => void;
@@ -139,7 +138,7 @@ const GCard: React.FC<{ label: string; value: number; color: string; desc: strin
 );
 
 export const StrategyBuilder: React.FC<Props> = ({
-  legs, onUpdateLeg, onRemoveLeg, onExecute, spotPrice, symbol, chain,
+  legs, onAppendLegs, onUpdateLeg, onRemoveLeg, onExecute, spotPrice, symbol, chain,
 }) => {
   // Live LTP sync: whenever chain ticks update, push current LTP into each leg
   // This keeps the payoff curve and Greeks accurate during a live session
@@ -208,18 +207,14 @@ export const StrategyBuilder: React.FC<Props> = ({
                   onClick={() => {
                     const newLegs = t.build(spotPrice, cfg.strikeStep);
                     const expStr  = legs[0]?.expiry ?? '';
-                    setLegs(prev => [
-                      ...prev,
-                      ...newLegs.map(l => ({
-                        ...l,
-                        id:     nextId(),
-                        symbol,
-                        expiry: expStr,
-                        iv:     14.0,
-                        gamma:  0.0002,
-                        vega:   0.15,
-                      })),
-                    ]);
+                    onAppendLegs(newLegs.map(l => ({
+                      ...l,
+                      symbol,
+                      expiry: expStr,
+                      iv: 14.0,
+                      gamma: 0.0002,
+                      vega: 0.15,
+                    })));
                     setShowTemplates(false);
                   }}
                   className="flex flex-col items-center gap-1 p-2 bg-[#1a1d2e] hover:bg-[#222540] rounded-xl border border-gray-800/40 hover:border-blue-500/20 transition-colors group">
