@@ -50,6 +50,33 @@ export function JournalWorkspace() {
           </div>
         </div>
 
+        <div className="mt-5 grid gap-3">
+          <div className="rounded-3xl border border-white/8 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Execution-linked capture</div>
+            <div className="mt-2 text-sm text-white">{summary.analytics.autoCapturedEntries} entries auto-created from blotter fills</div>
+          </div>
+          <div className="rounded-3xl border border-white/8 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Top structures</div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {summary.analytics.entriesByStructure.map((bucket) => (
+                <div key={bucket.label} className="rounded-full border border-white/10 bg-black/15 px-3 py-2 text-xs text-slate-300">
+                  {bucket.label} · {bucket.count}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-3xl border border-white/8 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Top regimes</div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {summary.analytics.entriesByRegime.map((bucket) => (
+                <div key={bucket.label} className="rounded-full border border-white/10 bg-black/15 px-3 py-2 text-xs text-slate-300">
+                  {bucket.label} · {bucket.count}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
         <div className="mt-5 space-y-3">
           {entries.length === 0 && (
             <div className="rounded-3xl border border-dashed border-white/10 bg-white/5 px-4 py-8 text-center text-sm text-slate-400">
@@ -78,7 +105,7 @@ export function JournalWorkspace() {
               </div>
               <div className="mt-3 flex items-center justify-between text-xs text-slate-400">
                 <span>Credit {fmtPnL(entry.expectedCredit)}</span>
-                <span>Rules {entry.automationRuleIds.length}</span>
+                <span>{entry.source === 'execution' ? `Execution ${entry.executionStatus}` : `Rules ${entry.automationRuleIds.length}`}</span>
               </div>
             </button>
           ))}
@@ -117,6 +144,10 @@ export function JournalWorkspace() {
               <div className="rounded-2xl bg-white/5 px-3 py-3 text-xs text-slate-300">Credit {fmtPnL(selectedEntry.expectedCredit)}</div>
               <div className="rounded-2xl bg-white/5 px-3 py-3 text-xs text-slate-300">Margin {fmtPnL(-selectedEntry.marginEstimate)}</div>
               <div className="rounded-2xl bg-white/5 px-3 py-3 text-xs text-slate-300">Max loss {fmtPnL(selectedEntry.maxLossEstimate)}</div>
+            </div>
+
+            <div className="mt-3 rounded-3xl border border-white/8 bg-white/5 px-4 py-3 text-xs text-slate-300">
+              Source: {selectedEntry.source === 'execution' ? `Execution blotter ${selectedEntry.executionStatus ?? 'captured'}` : 'Manual opportunity capture'}
             </div>
 
             <div className="mt-5 grid gap-3">
@@ -189,6 +220,30 @@ export function JournalWorkspace() {
                   })}
                 </div>
               </label>
+
+              <div className="rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-300">
+                <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Analytics context</div>
+                <div className="mt-3 grid gap-3 lg:grid-cols-3">
+                  <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                    <div className="text-slate-500">Structure cluster</div>
+                    <div className="mt-1 text-white">
+                      {summary.analytics.entriesByStructure.find((bucket) => bucket.label === selectedEntry.structure)?.count ?? 0} similar entries
+                    </div>
+                  </div>
+                  <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                    <div className="text-slate-500">Regime cluster</div>
+                    <div className="mt-1 text-white">
+                      {summary.analytics.entriesByRegime.find((bucket) => bucket.label === selectedEntry.regimeLabel)?.count ?? 0} similar entries
+                    </div>
+                  </div>
+                  <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                    <div className="text-slate-500">Mistake cluster</div>
+                    <div className="mt-1 text-white">
+                      {selectedEntry.mistakeTags.length > 0 ? selectedEntry.mistakeTags.join(' | ') : 'No tags on this review yet'}
+                    </div>
+                  </div>
+                </div>
+              </div>
 
               <label className="rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-300">
                 <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Review notes</div>

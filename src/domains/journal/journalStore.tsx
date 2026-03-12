@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import type { SellerJournalEntry, SellerJournalSummary, SellerOpportunity } from '../../types/index';
+import { useExecutionStore } from '../execution/executionStore';
 import { useSellerIntelligenceStore } from '../seller/sellerIntelligenceStore';
 
 const STORAGE_KEY = 'sensibull.sellerJournal.v1';
@@ -55,8 +56,29 @@ function buildEntryFromOpportunity(opportunity: SellerOpportunity): SellerJourna
       : `Exposure fit ${opportunity.exposureFit}/100`,
     mistakeTags: [],
     automationRuleIds: [],
+    source: 'opportunity',
     sourceOpportunityId: opportunity.id,
   };
+}
+
+function inferStructureFromSummary(summary: string, legCount: number) {
+  if (summary.includes('SELL CE') && summary.includes('SELL PE') && summary.includes('BUY CE') && summary.includes('BUY PE')) {
+    return 'Iron Condor';
+  }
+  if (legCount === 4 && summary.includes('SELL CE') && summary.includes('SELL PE')) return 'Iron Fly';
+  if (legCount === 2 && summary.includes('SELL PE') && summary.includes('BUY PE')) return 'Bull Put Spread';
+  if (legCount === 2 && summary.includes('SELL CE') && summary.includes('BUY CE')) return 'Bear Call Spread';
+  if (legCount === 2 && summary.includes('SELL CE') && summary.includes('SELL PE')) return 'Short Strangle';
+  return `${legCount}-leg execution`;
+}
+
+function tallyBuckets(values: string[]) {
+  const counts = new Map<string, number>();
+  values.forEach((value) => counts.set(value, (counts.get(value) ?? 0) + 1));
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 5)
+    .map(([label, count]) => ({ label, count }));
 }
 
 interface JournalStoreValue {
@@ -75,6 +97,7 @@ const JournalStore = createContext<JournalStoreValue | null>(null);
 
 export function JournalProvider({ children }: { children: React.ReactNode }) {
   const { regime } = useSellerIntelligenceStore();
+  const { blotter } = useExecutionStore();
   const [entries, setEntries] = useState<SellerJournalEntry[]>(() => loadEntries());
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
 
@@ -103,6 +126,12 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
         .sort((left, right) => right[1] - left[1])
         .slice(0, 5)
         .map(([tag, count]) => ({ tag, count })),
+      analytics: {
+        autoCapturedEntries: entries.filter((entry) => entry.source === 'execution').length,
+        entriesByStructure: tallyBuckets(entries.map((entry) => entry.structure)),
+        entriesByRegime: tallyBuckets(entries.map((entry) => entry.regimeLabel)),
+        mistakeClusters: tallyBuckets(entries.flatMap((entry) => entry.mistakeTags)),
+      },
     };
   }, [entries]);
 
@@ -110,6 +139,45 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
     () => entries.find((entry) => entry.id === selectedEntryId) ?? entries[0] ?? null,
     [entries, selectedEntryId],
   );
+
+  useEffect(() => {
+    const filledItems = blotter.filter((item) => item.status === 'sent' || item.status === 'partial');
+    if (filledItems.length === 0) return;
+    setEntries((current) => {
+      const seen = new Set(current.map((entry) => entry.sourceBlotterId).filter(Boolean));
+      const additions = filledItems
+        .filter((item) => !seen.has(item.id))
+        .map((item) => ({
+          id: `journal-exec-${item.id}`,
+          createdAt: item.submittedAt,
+          updatedAt: item.submittedAt,
+          status: 'executed' as const,
+          symbol: item.symbol,
+          title: `Executed ${inferStructureFromSummary(item.summary, item.legCount)}`,
+          structure: inferStructureFromSummary(item.summary, item.legCount),
+          mode: item.legCount >= 4 ? 'defined_risk_only' as const : 'conservative_income' as const,
+          regimeLabel: regime.label,
+          sellerScore: 70,
+          expectedCredit: item.premium,
+          marginEstimate: Math.abs(item.previewSnapshot?.marginRequired ?? 0),
+          maxLossEstimate: item.previewSnapshot?.maxLoss ?? 0,
+          rationale: 'Auto-captured from execution blotter after broker submission.',
+          thesis: item.summary,
+          invalidation: 'Review live risk and position drift after execution.',
+          adjustmentPlan: 'Use the adjustment engine to review challenged short legs or convert undefined risk to defined risk.',
+          notes: item.response,
+          playbookCompliance: 'watch' as const,
+          exposureContext: 'Generated from actual execution event, pending post-trade review.',
+          mistakeTags: [],
+          automationRuleIds: [],
+          source: 'execution' as const,
+          sourceBlotterId: item.id,
+          executionStatus: item.status,
+        }));
+      if (additions.length === 0) return current;
+      return [...additions, ...current];
+    });
+  }, [blotter, regime.label]);
 
   const value = useMemo<JournalStoreValue>(() => ({
     entries,

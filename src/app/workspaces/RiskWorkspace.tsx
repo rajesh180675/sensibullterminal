@@ -1,4 +1,5 @@
-import { AlertTriangle, ShieldAlert, Sigma, Wallet } from 'lucide-react';
+import { AlertTriangle, ShieldAlert, Sigma, WandSparkles, Wallet } from 'lucide-react';
+import { useAdjustmentStore } from '../../domains/adjustment/adjustmentStore';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { usePortfolioStore } from '../../domains/portfolio/portfolioStore';
 import { useRiskStore } from '../../domains/risk/riskStore';
@@ -20,6 +21,7 @@ export function RiskWorkspace() {
   const { snapshot } = useRiskStore();
   const { preview, previewStatus } = useExecutionStore();
   const { summary } = usePortfolioStore();
+  const { suggestions, applySuggestion } = useAdjustmentStore();
   const componentEntries = Object.entries(snapshot.chargeSummary?.componentCharges ?? {}).filter(([, value]) => value > 0);
 
   return (
@@ -100,6 +102,56 @@ export function RiskWorkspace() {
 
       <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
         <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.3em] text-orange-300/70">
+          <WandSparkles size={13} />
+          Adjustment Engine
+        </div>
+        <div className="mt-4 space-y-3">
+          {suggestions.length === 0 && (
+            <div className="rounded-3xl border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm text-slate-400">
+              No live stressed legs detected in active positions right now.
+            </div>
+          )}
+          {suggestions.map((suggestion) => (
+            <div key={suggestion.id} className={`rounded-3xl border px-4 py-4 ${suggestion.severity === 'critical' ? 'border-red-500/25 bg-red-500/8' : suggestion.severity === 'warning' ? 'border-amber-500/25 bg-amber-500/8' : 'border-cyan-500/20 bg-cyan-500/8'}`}>
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-white">{suggestion.title}</div>
+                  <div className="mt-1 text-xs text-slate-400">{suggestion.trigger}</div>
+                </div>
+                <div className="text-[11px] uppercase tracking-[0.2em] text-slate-300">{suggestion.severity}</div>
+              </div>
+              <div className="mt-3 text-sm text-slate-300">{suggestion.rationale}</div>
+              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                  <div className="text-slate-500">Before</div>
+                  <div className="mt-1">Credit {fmtPnL(suggestion.current.netCredit)}</div>
+                  <div>Max loss {fmtPnL(suggestion.current.maxLoss)}</div>
+                  <div>Breakevens {suggestion.current.breakevens.length > 0 ? suggestion.current.breakevens.join(', ') : 'None'}</div>
+                </div>
+                <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                  <div className="text-slate-500">After</div>
+                  <div className="mt-1">Credit {fmtPnL(suggestion.proposed.netCredit)}</div>
+                  <div>Max loss {fmtPnL(suggestion.proposed.maxLoss)}</div>
+                  <div>Breakevens {suggestion.proposed.breakevens.length > 0 ? suggestion.proposed.breakevens.join(', ') : 'Flat'}</div>
+                </div>
+              </div>
+              <div className="mt-3 text-xs text-slate-400">
+                Stressed legs: {suggestion.current.stressedLegs.join(' | ')}
+              </div>
+              <div className="mt-1 text-xs text-slate-400">
+                Repair flow: {suggestion.repairFlow}
+              </div>
+              <button
+                onClick={() => applySuggestion(suggestion)}
+                className="mt-4 rounded-2xl bg-orange-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-orange-400"
+              >
+                Stage repair
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-5 flex items-center gap-2 text-[11px] uppercase tracking-[0.3em] text-orange-300/70">
           <AlertTriangle size={13} />
           Alerts
         </div>

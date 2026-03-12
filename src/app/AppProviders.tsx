@@ -1,4 +1,5 @@
 import React from 'react';
+import { AdjustmentProvider } from '../domains/adjustment/adjustmentStore';
 import { AutomationProvider } from '../domains/automation/automationStore';
 import { SessionProvider } from '../domains/session/sessionStore';
 import { MarketProvider } from '../domains/market/marketStore';
@@ -19,9 +20,11 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
               <RiskProvider>
                 <SellerIntelligenceProvider>
                   <JournalProvider>
-                    <AutomationProvider>
-                      {children}
-                    </AutomationProvider>
+                    <AdjustmentProvider>
+                      <AutomationProvider>
+                        {children}
+                      </AutomationProvider>
+                    </AdjustmentProvider>
                   </JournalProvider>
                 </SellerIntelligenceProvider>
               </RiskProvider>

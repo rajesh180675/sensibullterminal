@@ -217,6 +217,8 @@ export interface ExecutionBlotterItem {
   premium: number;
   status: 'queued' | 'sent' | 'partial' | 'failed';
   response: string;
+  legsSnapshot?: OptionLeg[];
+  previewSnapshot?: ExecutionPreview;
 }
 
 export interface PortfolioSummary {
@@ -389,7 +391,22 @@ export interface SellerJournalEntry {
   exposureContext: string;
   mistakeTags: string[];
   automationRuleIds: string[];
+  source: 'opportunity' | 'execution';
   sourceOpportunityId?: string;
+  sourceBlotterId?: string;
+  executionStatus?: ExecutionBlotterItem['status'];
+}
+
+export interface SellerJournalAnalyticsBucket {
+  label: string;
+  count: number;
+}
+
+export interface SellerJournalAnalytics {
+  autoCapturedEntries: number;
+  entriesByStructure: SellerJournalAnalyticsBucket[];
+  entriesByRegime: SellerJournalAnalyticsBucket[];
+  mistakeClusters: SellerJournalAnalyticsBucket[];
 }
 
 export interface SellerJournalSummary {
@@ -399,6 +416,31 @@ export interface SellerJournalSummary {
   compliantEntries: number;
   complianceRate: number;
   topMistakeTags: Array<{ tag: string; count: number }>;
+  analytics: SellerJournalAnalytics;
+}
+
+export interface AdjustmentSnapshot {
+  netCredit: number;
+  maxProfit: number;
+  maxLoss: number;
+  breakevens: number[];
+  lots: number;
+  stressedLegs: string[];
+}
+
+export interface AdjustmentSuggestion {
+  id: string;
+  positionId: string;
+  title: string;
+  rationale: string;
+  trigger: string;
+  repairFlow: string;
+  severity: 'info' | 'warning' | 'critical';
+  current: AdjustmentSnapshot;
+  proposed: AdjustmentSnapshot;
+  legsBefore: OptionLeg[];
+  legsAfter: OptionLeg[];
+  repairLegs: OptionLeg[];
 }
 
 export interface AutomationRule {

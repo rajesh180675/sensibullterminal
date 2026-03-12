@@ -10,7 +10,7 @@ let executionLegId = 0;
 const nextExecutionLegId = () => `leg-${++executionLegId}-${Date.now()}`;
 const nextBlotterId = () => `blotter-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 
-function buildExecutionPreview(legs: OptionLeg[]): ExecutionPreview {
+export function buildExecutionPreview(legs: OptionLeg[]): ExecutionPreview {
   if (legs.length === 0) {
     return {
       estimatedPremium: 0,
@@ -261,6 +261,8 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
       premium: buildExecutionPreview(selectedLegs).estimatedPremium,
       status: 'queued',
       response: 'Queued for broker dispatch.',
+      legsSnapshot: selectedLegs.map((leg) => ({ ...leg })),
+      previewSnapshot: buildExecutionPreview(selectedLegs),
     };
 
     setBlotter((current) => [blotterBase, ...current].slice(0, 20));
