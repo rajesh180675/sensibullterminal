@@ -66,6 +66,11 @@ class CallbackNormalizationTests(unittest.TestCase):
 
         self.assertTrue(is_icici_order_update_payload(payload))
 
+    def test_detects_promoted_capture_fixture_shape(self):
+        payload = json.loads((FIXTURE_DIR / "icici_webhook_real_capture.json").read_text())
+
+        self.assertTrue(is_icici_order_update_payload(payload))
+
     def test_normalizes_expected_deployment_shape_fixture(self):
         payload = json.loads((FIXTURE_DIR / "icici_webhook_order_update.json").read_text())
 
@@ -81,6 +86,19 @@ class CallbackNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["meta"]["symbol"], "NIFTY")
         self.assertEqual(normalized["meta"]["normalizedAt"], 1741824000.0)
         self.assertEqual(normalized["meta"]["normalizer"], "icici_order_update")
+
+    def test_normalizes_promoted_capture_fixture(self):
+        payload = json.loads((FIXTURE_DIR / "icici_webhook_real_capture.json").read_text())
+
+        normalized = normalize_callback_payload(payload, "webhook", normalized_at=1741824000.25)
+
+        self.assertEqual(normalized["ruleId"], "rule-1741881000000")
+        self.assertEqual(normalized["ruleName"], "NIFTY staged exit")
+        self.assertEqual(normalized["eventType"], "executed")
+        self.assertEqual(normalized["status"], "success")
+        self.assertEqual(normalized["message"], "Order fully executed")
+        self.assertEqual(normalized["meta"]["normalizer"], "icici_order_update")
+        self.assertEqual(normalized["meta"]["normalizedAt"], 1741824000.25)
 
     def test_normalizes_nested_icici_webhook_data_payload(self):
         payload = {

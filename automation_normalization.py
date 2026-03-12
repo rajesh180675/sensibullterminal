@@ -254,15 +254,45 @@ def normalize_callback_payload(payload: dict, source: str, normalized_at: float 
         return normalize_icici_webhook_payload(payload, source, normalized_at=normalized_at)
 
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    event_type_raw = str(first_present(data, [
-        "eventType",
-        "event_type",
-        "callback_type",
-        "callbackType",
-        "update_type",
-        "updateType",
-        "event",
-    ]) or ("webhook" if source == "webhook" else "manual")).lower()
+    if source == "webhook":
+        event_type_keys = [
+            "callback_type",
+            "callbackType",
+            "update_type",
+            "updateType",
+            "event",
+        ]
+        message_keys = [
+            "status_message",
+            "reason",
+            "remarks",
+            "remark",
+            "error_message",
+            "errorMessage",
+            "message",
+        ]
+    else:
+        event_type_keys = [
+            "eventType",
+            "event_type",
+            "callback_type",
+            "callbackType",
+            "update_type",
+            "updateType",
+            "event",
+        ]
+        message_keys = [
+            "message",
+            "status_message",
+            "statusMessage",
+            "reason",
+            "remarks",
+            "remark",
+            "error_message",
+            "errorMessage",
+        ]
+
+    event_type_raw = str(first_present(data, event_type_keys) or ("webhook" if source == "webhook" else "manual")).lower()
     broker_status_raw = str(first_present(data, [
         "status",
         "order_status",
@@ -286,16 +316,7 @@ def normalize_callback_payload(payload: dict, source: str, normalized_at: float 
         status = "info"
         event_type = "webhook" if source == "webhook" else "manual"
 
-    message = str(first_present(data, [
-        "message",
-        "status_message",
-        "statusMessage",
-        "reason",
-        "remarks",
-        "remark",
-        "error_message",
-        "errorMessage",
-    ]) or "")
+    message = str(first_present(data, message_keys) or "")
     if not message:
         if broker_status_raw:
             message = f"Broker callback status: {broker_status_raw}."
