@@ -789,8 +789,11 @@ class BreezeEngine:
         block_trade_margin = _safe_float(
             payload.get("block_trade_margin")
             or payload.get("blockTradeMargin")
+            or payload.get("non_span_margin_required")
             or payload.get("block_margin")
         )
+        if span_margin <= 0:
+            span_margin = _safe_float(payload.get("span_margin_required"))
         margin_required = max(
             order_margin,
             trade_margin,
@@ -865,19 +868,19 @@ class BreezeEngine:
 
             response = self.rate_limiter.enqueue(
                 self.breeze.preview_order,
-                normalised["stock_code"],
-                normalised["exchange_code"],
-                normalised["product"],
-                normalised["order_type"],
-                normalised["price"],
-                normalised["action"],
-                normalised["quantity"],
-                normalised["expiry_date"],
-                normalised["right"],
-                normalised["strike_price"],
-                "",
-                normalised["stoploss"],
-                "N",
+                stock_code=normalised["stock_code"],
+                exchange_code=normalised["exchange_code"],
+                product=normalised["product"],
+                order_type=normalised["order_type"],
+                price=normalised["price"],
+                action=normalised["action"],
+                quantity=normalised["quantity"],
+                expiry_date=normalised["expiry_date"],
+                right=normalised["right"],
+                strike_price=normalised["strike_price"],
+                specialflag="N",
+                stoploss=normalised["stoploss"],
+                order_rate_fresh="",
             )
             payload = self._extract_success_payload(response)
             validation_rows.append(self._record_execution_validation("preview", [normalised], response, payload))
