@@ -1,4 +1,3 @@
-import React from 'react';
 import { Bell, Layers3, Logs } from 'lucide-react';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useNotificationStore } from '../../stores/notificationStore';
@@ -24,7 +23,7 @@ export function BottomDock() {
             <Logs size={12} />
             Workflow
           </div>
-          <div className="mt-2 text-sm text-slate-300">Market -> Strategy -> Execution -> Portfolio</div>
+          <div className="mt-2 text-sm text-slate-300">Market -&gt; Strategy -&gt; Execution -&gt; Portfolio</div>
         </div>
 
         <div className="rounded-2xl border border-white/8 bg-white/5 px-4 py-3">

@@ -1,4 +1,3 @@
-import React from 'react';
 import { AlertTriangle, ShieldAlert, Sigma, Wallet } from 'lucide-react';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { usePortfolioStore } from '../../domains/portfolio/portfolioStore';

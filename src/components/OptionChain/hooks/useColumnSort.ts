@@ -1,7 +1,7 @@
 // components/OptionChain/hooks/useColumnSort.ts
 
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import type { OptionRow, ExpiryDate, SymbolCode } from '../../../types/index';
+import type { OptionRow, SymbolCode } from '../../../types/index';
 import type { SortState, SortableColumn } from '../types';
 import { getRowValue } from '../utils/getRowValue';
 

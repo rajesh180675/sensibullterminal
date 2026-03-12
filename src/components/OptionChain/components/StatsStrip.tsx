@@ -1,6 +1,6 @@
 // components/OptionChain/components/StatsStrip.tsx
 
-import React, { memo, useMemo } from 'react';
+import { memo, useMemo } from 'react';
 import type { ExpiryDate } from '../../../types/index';
 import type { ChainStats, StatItem } from '../types';
 import { fmtOI } from '../../../utils/math';

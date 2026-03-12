@@ -1,7 +1,7 @@
 // components/OptionChain/hooks/useStalenessTimer.ts
 
 import { useState, useEffect } from 'react';
-import { STALE_THRESHOLD_SEC, STALE_CHECK_INTERVAL_MS } from '../constants';
+import { STALE_CHECK_INTERVAL_MS } from '../constants';
 
 /**
  * SPEC-B2: Autonomous Staleness Timer
@@ -14,7 +14,6 @@ import { STALE_THRESHOLD_SEC, STALE_CHECK_INTERVAL_MS } from '../constants';
  */
 export function useStalenessTimer(
   lastUpdate: Date,
-  thresholdSec: number = STALE_THRESHOLD_SEC,
   intervalMs: number = STALE_CHECK_INTERVAL_MS,
 ): number {
   const [staleSec, setStaleSec] = useState(() =>

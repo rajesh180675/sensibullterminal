@@ -1,6 +1,6 @@
 // components/OptionChain/components/ChainHeader.tsx
 
-import React, { memo, useCallback } from 'react';
+import { memo, useCallback } from 'react';
 import type { SortState, SortableColumn } from '../types';
 import { LABELS, TOOLTIPS } from '../constants';
 

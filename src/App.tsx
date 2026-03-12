@@ -1,4 +1,3 @@
-import React from 'react';
 import { AppProviders } from './app/AppProviders';
 import { AppShell } from './app/shell/AppShell';
 import { useWorkspaceRoute } from './app/useWorkspaceRoute';

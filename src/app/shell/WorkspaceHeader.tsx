@@ -1,4 +1,3 @@
-import React from 'react';
 import { Bell, Cable, Command, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import { ALL_SYMBOLS, SYMBOL_CONFIG } from '../../config/market';
 import type { MarketIndex, SymbolCode } from '../../types/index';

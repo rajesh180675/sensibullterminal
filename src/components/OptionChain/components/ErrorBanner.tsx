@@ -1,6 +1,6 @@
 // components/OptionChain/components/ErrorBanner.tsx
 
-import React, { memo } from 'react';
+import { memo } from 'react';
 import { AlertCircle } from 'lucide-react';
 
 interface ErrorBannerProps {

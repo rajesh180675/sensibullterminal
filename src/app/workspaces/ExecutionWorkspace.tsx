@@ -1,4 +1,3 @@
-import React from 'react';
 import { Activity, ArrowRight, ShieldAlert, TimerReset, Wallet } from 'lucide-react';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';

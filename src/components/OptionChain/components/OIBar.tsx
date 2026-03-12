@@ -1,6 +1,6 @@
 // components/OptionChain/components/OIBar.tsx
 
-import React, { memo } from 'react';
+import { memo } from 'react';
 
 interface OIBarProps {
   value: number;

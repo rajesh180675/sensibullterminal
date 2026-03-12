@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import { useEffect } from 'react';
 import { BarChart3, BriefcaseBusiness, RefreshCw } from 'lucide-react';
 import { Positions } from '../../components/Positions';
 import { useExecutionStore } from '../../domains/execution/executionStore';
@@ -110,7 +110,7 @@ export function PortfolioWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
                     <span>{leg.lots} lots</span>
                   </div>
                   <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
-                    <span>Entry {leg.entryPrice.toFixed(2)} -> LTP {leg.currentPrice.toFixed(2)}</span>
+                    <span>Entry {leg.entryPrice.toFixed(2)} -&gt; LTP {leg.currentPrice.toFixed(2)}</span>
                     <span className={leg.pnl >= 0 ? 'text-emerald-300' : 'text-red-300'}>{fmtPnL(leg.pnl)}</span>
                   </div>
                 </div>

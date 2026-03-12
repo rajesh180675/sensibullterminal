@@ -1,4 +1,3 @@
-import React from 'react';
 import { Activity, Cable, Radar, ShieldCheck } from 'lucide-react';
 import { useSessionStore } from '../../domains/session/sessionStore';
 

@@ -1,6 +1,6 @@
 // components/OptionChain/hooks/useFlashCells.ts
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import type { OptionRow } from '../../../types/index';
 import type { FlashEntry } from '../types';
 import { TRACKED_FIELDS, FLASH_DURATION_MS } from '../constants';

@@ -1,6 +1,6 @@
 // components/OptionChain/components/LoadingSkeleton.tsx
 
-import React, { memo } from 'react';
+import { memo } from 'react';
 
 export const LoadingSkeleton = memo(function LoadingSkeleton() {
   return (

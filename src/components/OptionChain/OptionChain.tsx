@@ -1,6 +1,6 @@
 // components/OptionChain/OptionChain.tsx
 
-import React, { useRef, useCallback, useMemo } from 'react';
+import { useRef, useCallback, useMemo, useState } from 'react';
 import { AlertCircle } from 'lucide-react';
 import type { OptionChainProps } from './types';
 import { SYMBOL_CONFIG, getExpiries } from '../../config/market';
@@ -39,7 +39,7 @@ import { OptionChainErrorBoundary } from './OptionChainErrorBoundary';
 const OptionChainInner: React.FC<OptionChainProps> = ({
   symbol, data, spotPrice, selectedExpiry, onExpiryChange,
   onAddLeg, highlightedStrikes, lastUpdate, isLoading, onRefresh,
-  isLive, loadingMsg, error, strikeRange: strikeRangeProp,
+  isLive, loadingMsg, error,
   availableExpiries,  // FIX-5
 }) => {
   // ── Preferences (SPEC-F4) ───────────────────────────────
@@ -121,7 +121,7 @@ const OptionChainInner: React.FC<OptionChainProps> = ({
     [data, onAddLeg, symbol, selectedExpiry.breezeValue],
   );
 
-  const [focusedStrike, setFocusedStrike] = React.useState<number | null>(null);
+  const [focusedStrike, setFocusedStrike] = useState<number | null>(null);
   const handleFocusStrike = useCallback((s: number | null) => setFocusedStrike(s), []);
 
   // Arrow key navigation

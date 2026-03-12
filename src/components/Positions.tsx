@@ -3852,15 +3852,13 @@ const PositionsInner: FC<Props> = ({
   // Symbol/expiry for trade panel
   // FIX: Always show all supported symbols — not just those in existing positions.
   // This allows trading NIFTY or BSESEN (SENSEX) even with no open positions.
-  const symbolChoices: SymbolCode[] = ALL_SYMBOLS;
-
   // FIX: initialise tradeSym to 'NIFTY' (always valid), not symbolChoices[0]
   // which was computed from a memo that may not be populated yet.
   // expiryChoices is now managed inside TradeOptionsPanel via getExpiries(symbol).
-  const [tradeSym, setTradeSym] = useState<SymbolCode>('NIFTY');
+  const [tradeSym] = useState<SymbolCode>('NIFTY');
 
   // FIX: initialise tradeExpiry lazily from the correct symbol's schedule
-  const [tradeExpiry, setTradeExpiry] = useState(
+  const [tradeExpiry] = useState(
     () => getExpiries('NIFTY')[0]?.breezeValue ?? '',
   );
 

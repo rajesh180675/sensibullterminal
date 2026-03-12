@@ -1,4 +1,3 @@
-import React from 'react';
 import { BellPlus, Shield, Zap } from 'lucide-react';
 import { StrategyBuilder } from '../../components/StrategyBuilder';
 import { useAutomationStore } from '../../domains/automation/automationStore';

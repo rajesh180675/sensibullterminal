@@ -1,6 +1,6 @@
 // components/OptionChain/components/EmptyState.tsx
 
-import React, { memo } from 'react';
+import { memo } from 'react';
 import { Target } from 'lucide-react';
 
 interface EmptyStateProps {

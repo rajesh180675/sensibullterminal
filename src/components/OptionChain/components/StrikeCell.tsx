@@ -1,6 +1,6 @@
 // components/OptionChain/components/StrikeCell.tsx
 
-import React, { memo } from 'react';
+import { memo } from 'react';
 import { Zap } from 'lucide-react';
 
 interface StrikeCellProps {

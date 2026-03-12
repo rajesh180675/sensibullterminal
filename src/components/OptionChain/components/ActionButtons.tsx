@@ -1,6 +1,6 @@
 // components/OptionChain/components/ActionButtons.tsx
 
-import React, { memo } from 'react';
+import { memo } from 'react';
 
 interface ActionButtonsProps {
   visible: boolean;

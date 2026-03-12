@@ -1,6 +1,6 @@
 // components/OptionChain/components/ChainFooter.tsx
 
-import React, { memo } from 'react';
+import { memo } from 'react';
 
 interface ChainFooterProps {
   rowCount: number;

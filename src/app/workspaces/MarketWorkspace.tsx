@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import { useMemo } from 'react';
 import { AreaChart, CandlestickChart, Clock3, Layers3, RefreshCw, Star, TrendingUp } from 'lucide-react';
 import { OptionChain } from '../../components/OptionChain';
 import { ALL_SYMBOLS, SYMBOL_CONFIG } from '../../config/market';

@@ -1,4 +1,3 @@
-import React from 'react';
 import { BellRing, Bot, Pause, Play, PlusCircle } from 'lucide-react';
 import { useAutomationStore } from '../../domains/automation/automationStore';
 
