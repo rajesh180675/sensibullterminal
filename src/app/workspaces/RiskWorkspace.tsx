@@ -4,10 +4,23 @@ import { usePortfolioStore } from '../../domains/portfolio/portfolioStore';
 import { useRiskStore } from '../../domains/risk/riskStore';
 import { fmtNum, fmtPnL } from '../../utils/math';
 
+const CHARGE_LABELS: Record<string, string> = {
+  exchangeTurnoverCharges: 'Exchange turnover',
+  sebiCharges: 'SEBI',
+  gst: 'GST',
+  stt: 'STT',
+  stampDuty: 'Stamp duty',
+  transactionCharges: 'Transaction charges',
+  ipft: 'IPFT',
+  otherCharges: 'Other charges',
+  totalTax: 'Total tax',
+};
+
 export function RiskWorkspace() {
   const { snapshot } = useRiskStore();
   const { preview, previewStatus } = useExecutionStore();
   const { summary } = usePortfolioStore();
+  const componentEntries = Object.entries(snapshot.chargeSummary?.componentCharges ?? {}).filter(([, value]) => value > 0);
 
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[1fr,1fr,0.9fr]">
@@ -37,10 +50,24 @@ export function RiskWorkspace() {
 
         <div className="mt-4 rounded-3xl border border-white/8 bg-white/5 px-4 py-4 text-sm text-slate-300">
           Staged margin requirement: {fmtPnL(-preview.marginRequired)}. Estimated capital at risk: {fmtPnL(-preview.capitalAtRisk)}.
+          <div className="mt-2">Staged fee load: {fmtPnL(-snapshot.stagedFees)}.</div>
           <div className="mt-2 text-xs text-slate-400">
             Margin source: {preview.source === 'backend' ? 'broker backend' : 'local estimate'}
             {previewStatus === 'loading' ? ' · refreshing...' : ''}
           </div>
+          {snapshot.chargeSummary && (
+            <div className="mt-3 rounded-2xl border border-white/8 bg-[#0f1728] px-4 py-3 text-xs text-slate-300">
+              <div>Brokerage / Other / Total fees: {fmtPnL(-snapshot.stagedBrokerage)} / {fmtPnL(-snapshot.stagedOtherCharges)} / {fmtPnL(-snapshot.stagedFees)}</div>
+              <div className="mt-1 text-slate-400">
+                Turnover+SEBI {fmtPnL(-(snapshot.chargeSummary.brokerReportedTurnoverAndSebiCharges ?? 0))} · Taxes+duties {fmtPnL(-snapshot.stagedTaxesAndDuties)} · Source {snapshot.chargeSummary.calculationMode === 'broker_rollup' ? 'ICICI rollup' : 'Component fallback'}
+              </div>
+              {componentEntries.length > 0 && (
+                <div className="mt-2 text-slate-300">
+                  {componentEntries.map(([key, value]) => `${CHARGE_LABELS[key] ?? key}: ${fmtPnL(-value)}`).join(' | ')}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </section>
 
@@ -97,6 +124,7 @@ export function RiskWorkspace() {
           {preview.availableMargin !== undefined && (
             <div className="mt-1">Broker available margin: {fmtPnL(preview.availableMargin)}</div>
           )}
+          <div className="mt-1">Staged fees in risk model: {fmtPnL(-snapshot.stagedFees)}</div>
           <div className="mt-1">Utilization: {Math.round(summary.marginUtilization * 100)}%</div>
         </div>
       </section>

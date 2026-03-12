@@ -249,6 +249,11 @@ export interface RiskSnapshot {
   stressLoss2Pct: number;
   marginHeadroom: number;
   concentration: number;
+  stagedFees: number;
+  stagedBrokerage: number;
+  stagedOtherCharges: number;
+  stagedTaxesAndDuties: number;
+  chargeSummary?: ExecutionChargeSummary;
   alerts: RiskAlert[];
 }
 

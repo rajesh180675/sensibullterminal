@@ -24,6 +24,11 @@ export function RiskProvider({ children }: { children: React.ReactNode }) {
     const stagedGreeks = combinedGreeks(legs);
     const positionCount = Math.max(livePositions.length, 1);
     const availableFunds = preview.availableMargin ?? summary.availableFunds;
+    const chargeSummary = preview.chargeSummary;
+    const stagedFees = chargeSummary?.totalFees ?? preview.estimatedFees;
+    const stagedBrokerage = chargeSummary?.brokerage ?? 0;
+    const stagedOtherCharges = chargeSummary?.brokerReportedOtherCharges ?? Math.max(stagedFees - stagedBrokerage, 0);
+    const stagedTaxesAndDuties = chargeSummary?.taxesAndDuties ?? 0;
     const portfolioDelta = stagedGreeks.delta + summary.grossExposure / 100000;
     const portfolioTheta = stagedGreeks.theta - positionCount * 1.8;
     const portfolioGamma = stagedGreeks.gamma + positionCount * 0.0025;
@@ -40,7 +45,7 @@ export function RiskProvider({ children }: { children: React.ReactNode }) {
         title: 'Margin headroom',
         detail: marginHeadroom < 0
           ? 'Staged execution exceeds available funds.'
-          : `Headroom after staged execution is ${Math.round(marginHeadroom).toLocaleString('en-IN')}.`,
+          : `Headroom after staged execution is ${Math.round(marginHeadroom).toLocaleString('en-IN')} with ${Math.round(stagedFees).toLocaleString('en-IN')} in staged fees.`,
       },
       {
         id: 'concentration',
@@ -65,9 +70,14 @@ export function RiskProvider({ children }: { children: React.ReactNode }) {
       stressLoss2Pct,
       marginHeadroom,
       concentration,
+      stagedFees,
+      stagedBrokerage,
+      stagedOtherCharges,
+      stagedTaxesAndDuties,
+      chargeSummary,
       alerts,
     };
-  }, [legs, livePositions.length, preview.availableMargin, preview.capitalAtRisk, preview.marginRequired, summary]);
+  }, [legs, livePositions.length, preview.availableMargin, preview.capitalAtRisk, preview.chargeSummary, preview.estimatedFees, preview.marginRequired, summary]);
 
   const value = useMemo(() => ({ snapshot }), [snapshot]);
   return <RiskStore.Provider value={value}>{children}</RiskStore.Provider>;
