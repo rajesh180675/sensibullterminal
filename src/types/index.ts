@@ -293,6 +293,31 @@ export interface SellerPlaybook {
   noTradeConditions: string[];
 }
 
+export interface SellerOpportunityAutomationPreset {
+  id: string;
+  label: string;
+  description: string;
+  triggerSummary: string;
+  actionSummary: string;
+  triggerConfig: NonNullable<AutomationRule['triggerConfig']>;
+  actionConfig: NonNullable<AutomationRule['actionConfig']>;
+}
+
+export interface SellerExposureSnapshot {
+  activePositions: number;
+  activeShortCallLots: number;
+  activeShortPutLots: number;
+  activeLongCallLots: number;
+  activeLongPutLots: number;
+  netDirectionalDelta: number;
+  netShortGammaProxy: number;
+  marginUtilization: number;
+  unhedgedExposurePct: number;
+  availableFunds: number;
+  dominantBias: 'bullish' | 'bearish' | 'neutral';
+  pressureFlags: string[];
+}
+
 export interface SellerOpportunityLeg {
   symbol: SymbolCode;
   type: 'CE' | 'PE';
@@ -331,7 +356,49 @@ export interface SellerOpportunity {
   warnings: string[];
   tags: string[];
   playbookMatches: string[];
+  preferredPlaybookId?: string;
+  playbookCompliance: 'aligned' | 'watch' | 'violates';
+  exposureFit: number;
+  suppressed: boolean;
+  suppressionReasons: string[];
+  automationPresets: SellerOpportunityAutomationPreset[];
   legs: SellerOpportunityLeg[];
+}
+
+export interface SellerJournalEntry {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  status: 'draft' | 'reviewed' | 'executed';
+  symbol: SymbolCode;
+  title: string;
+  structure: string;
+  mode: SellerOpportunity['mode'];
+  regimeLabel: string;
+  sellerScore: number;
+  expectedCredit: number;
+  marginEstimate: number;
+  maxLossEstimate: number;
+  rationale: string;
+  thesis: string;
+  invalidation: string;
+  adjustmentPlan: string;
+  notes: string;
+  playbookName?: string;
+  playbookCompliance: SellerOpportunity['playbookCompliance'];
+  exposureContext: string;
+  mistakeTags: string[];
+  automationRuleIds: string[];
+  sourceOpportunityId?: string;
+}
+
+export interface SellerJournalSummary {
+  totalEntries: number;
+  reviewedEntries: number;
+  executedEntries: number;
+  compliantEntries: number;
+  complianceRate: number;
+  topMistakeTags: Array<{ tag: string; count: number }>;
 }
 
 export interface AutomationRule {

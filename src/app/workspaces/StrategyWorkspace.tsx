@@ -1,7 +1,8 @@
-import { BellPlus, Shield, Zap } from 'lucide-react';
+import { BellPlus, BookOpenText, Shield, Slash, Zap } from 'lucide-react';
 import { StrategyBuilder } from '../../components/StrategyBuilder';
 import { useAutomationStore } from '../../domains/automation/automationStore';
 import { useExecutionStore } from '../../domains/execution/executionStore';
+import { useJournalStore } from '../../domains/journal/journalStore';
 import { useMarketStore } from '../../domains/market/marketStore';
 import { useRiskStore } from '../../domains/risk/riskStore';
 import { useSellerIntelligenceStore } from '../../domains/seller/sellerIntelligenceStore';
@@ -11,8 +12,9 @@ export function StrategyWorkspace() {
   const { legs, appendLegs, updateLeg, removeLeg, executeStrategy, clearLegs, preview, stageStrategy } = useExecutionStore();
   const { chain, symbol, spotPrice } = useMarketStore();
   const { snapshot } = useRiskStore();
-  const { createRuleFromStrategy } = useAutomationStore();
-  const { regime, opportunities, playbooks } = useSellerIntelligenceStore();
+  const { createRuleFromStrategy, createRuleFromOpportunity } = useAutomationStore();
+  const { attachAutomationRule, captureOpportunity } = useJournalStore();
+  const { regime, opportunities, suppressedOpportunities, playbooks, exposure } = useSellerIntelligenceStore();
 
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[0.95fr,1.45fr]">
@@ -49,6 +51,26 @@ export function StrategyWorkspace() {
         </section>
 
         <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
+          <div className="text-[11px] uppercase tracking-[0.3em] text-orange-300/70">Portfolio Overlay</div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div className="rounded-3xl bg-white/5 px-4 py-4">
+              <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Live exposure</div>
+              <div className="mt-2 text-sm text-white">
+                {exposure.activeShortPutLots} short put lots · {exposure.activeShortCallLots} short call lots
+              </div>
+              <div className="mt-1 text-xs text-slate-400">
+                Delta bias {exposure.dominantBias} · margin {Math.round(exposure.marginUtilization * 100)}%
+              </div>
+            </div>
+            <div className="rounded-3xl bg-white/5 px-4 py-4">
+              <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Pressure flags</div>
+              <div className="mt-2 text-sm text-white">{exposure.pressureFlags[0] ?? 'No material portfolio pressure detected.'}</div>
+              <div className="mt-1 text-xs text-slate-400">Unhedged exposure {Math.round(exposure.unhedgedExposurePct * 100)}%</div>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
           <div className="text-[11px] uppercase tracking-[0.3em] text-orange-300/70">Opportunity Feed</div>
           <div className="mt-4 space-y-3">
             {opportunities.map((idea) => (
@@ -61,6 +83,7 @@ export function StrategyWorkspace() {
                   <div className="rounded-2xl bg-black/20 px-3 py-2 text-right text-xs text-slate-200">
                     <div>Seller {idea.sellerScore}</div>
                     <div>Fit {idea.regimeFit}</div>
+                    <div>Exposure {idea.exposureFit}</div>
                   </div>
                 </div>
                 <div className="mt-3 text-sm text-slate-300">{idea.thesis}</div>
@@ -80,6 +103,9 @@ export function StrategyWorkspace() {
                   {idea.playbookMatches.map((match) => (
                     <span key={match} className="rounded-full bg-orange-500/15 px-3 py-1 text-orange-200">{match}</span>
                   ))}
+                  <span className={`rounded-full px-3 py-1 ${idea.playbookCompliance === 'aligned' ? 'bg-emerald-500/15 text-emerald-200' : idea.playbookCompliance === 'violates' ? 'bg-red-500/15 text-red-200' : 'bg-amber-500/15 text-amber-200'}`}>
+                    {idea.playbookCompliance}
+                  </span>
                 </div>
                 {idea.warnings.length > 0 && (
                   <div className="mt-3 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
@@ -88,12 +114,39 @@ export function StrategyWorkspace() {
                 )}
                 <div className="mt-3 text-xs text-slate-400">Invalidation: {idea.invalidation}</div>
                 <div className="mt-1 text-xs text-slate-400">Adjustment: {idea.adjustmentPlan}</div>
+                <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                  {idea.automationPresets.map((preset) => (
+                    <span key={preset.id} className="rounded-full border border-cyan-400/15 bg-cyan-400/10 px-3 py-1 text-cyan-100">
+                      {preset.label}
+                    </span>
+                  ))}
+                </div>
                 <div className="mt-4 flex gap-3">
                   <button
                     onClick={() => stageStrategy(idea.legs)}
                     className="rounded-2xl bg-orange-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-orange-400"
                   >
                     Stage idea
+                  </button>
+                  <button
+                    onClick={() => captureOpportunity(idea)}
+                    className="rounded-2xl border border-white/10 px-4 py-2 text-sm text-white transition hover:bg-white/10"
+                  >
+                    <span className="inline-flex items-center gap-2"><BookOpenText size={14} /> Journal</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      void (async () => {
+                        const entry = captureOpportunity(idea);
+                        const rule = await createRuleFromOpportunity(idea);
+                        if (entry && rule) {
+                          attachAutomationRule(entry.id, rule.id);
+                        }
+                      })();
+                    }}
+                    className="rounded-2xl border border-cyan-400/20 px-4 py-2 text-sm text-cyan-100 transition hover:bg-cyan-400/10"
+                  >
+                    <span className="inline-flex items-center gap-2"><BellPlus size={14} /> Automation</span>
                   </button>
                   <div className="rounded-2xl border border-white/10 px-4 py-2 text-xs text-slate-300">
                     Breakevens {idea.breakevens.length > 0 ? idea.breakevens.join(', ') : 'None'}
@@ -103,6 +156,29 @@ export function StrategyWorkspace() {
             ))}
           </div>
         </section>
+
+        {suppressedOpportunities.length > 0 && (
+          <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
+            <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.3em] text-orange-300/70">
+              <Slash size={13} />
+              Suppressed Ideas
+            </div>
+            <div className="mt-4 space-y-3">
+              {suppressedOpportunities.map((idea) => (
+                <div key={idea.id} className="rounded-3xl border border-red-500/15 bg-red-500/5 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-white">{idea.title}</div>
+                      <div className="mt-1 text-xs text-slate-400">{idea.structure} · exposure fit {idea.exposureFit}</div>
+                    </div>
+                    <div className="text-xs text-red-200">suppressed</div>
+                  </div>
+                  <div className="mt-3 text-xs text-red-100">{idea.suppressionReasons.join(' | ')}</div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
 
         <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
           <div className="text-[11px] uppercase tracking-[0.3em] text-orange-300/70">Playbooks</div>

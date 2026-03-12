@@ -11,6 +11,7 @@ import { WorkspaceNav } from './WorkspaceNav';
 import { type WorkspacePath } from '../router';
 import { MarketWorkspace } from '../workspaces/MarketWorkspace';
 import { StrategyWorkspace } from '../workspaces/StrategyWorkspace';
+import { JournalWorkspace } from '../workspaces/JournalWorkspace';
 import { ExecutionWorkspace } from '../workspaces/ExecutionWorkspace';
 import { PortfolioWorkspace } from '../workspaces/PortfolioWorkspace';
 import { RiskWorkspace } from '../workspaces/RiskWorkspace';
@@ -61,6 +62,9 @@ export function AppShell({
       break;
     case '/strategy':
       content = <StrategyWorkspace />;
+      break;
+    case '/journal':
+      content = <JournalWorkspace />;
       break;
     case '/execution':
       content = <ExecutionWorkspace onOpenStrategy={() => onNavigate('/strategy')} />;

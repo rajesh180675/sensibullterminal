@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import type { AutomationCallbackEvent, AutomationRule, SymbolCode } from '../../types/index';
+import type { AutomationCallbackEvent, AutomationRule, SellerOpportunity, SymbolCode } from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { useExecutionStore } from '../execution/executionStore';
@@ -33,7 +33,8 @@ interface AutomationStoreValue {
   rules: AutomationRule[];
   callbacks: AutomationCallbackEvent[];
   syncStatus: 'idle' | 'loading' | 'ready' | 'fallback';
-  createRuleFromStrategy: () => Promise<void>;
+  createRuleFromStrategy: () => Promise<AutomationRule | null>;
+  createRuleFromOpportunity: (opportunity: SellerOpportunity, presetId?: string) => Promise<AutomationRule | null>;
   saveRule: (rule: AutomationRule) => Promise<void>;
   deleteRule: (id: string) => Promise<void>;
   toggleRuleStatus: (id: string) => Promise<void>;
@@ -85,6 +86,41 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
     void loadBackendState();
   }, [loadBackendState]);
 
+  const persistRule = useCallback(async (draftRule: AutomationRule) => {
+    if (!session || !backendReady) {
+      setRules((current) => [draftRule, ...current]);
+      setSyncStatus('fallback');
+      notify({
+        title: 'Automation draft created',
+        message: draftRule.name,
+        tone: 'success',
+      });
+      return draftRule;
+    }
+
+    const result = await brokerGatewayClient.automation.createRule(session, draftRule as unknown as Record<string, unknown>);
+    if (!result.ok || !result.rule) {
+      notify({
+        title: 'Automation rule failed',
+        message: result.error || 'Could not persist automation rule to backend.',
+        tone: 'error',
+      });
+      return null;
+    }
+
+    setRules((current) => [result.rule as AutomationRule, ...current.filter((rule) => rule.id !== result.rule?.id)]);
+    notify({
+      title: 'Automation rule created',
+      message: result.rule.name,
+      tone: 'success',
+    });
+    const callbackResult = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
+    if (callbackResult.ok) {
+      setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
+    }
+    return result.rule as AutomationRule;
+  }, [backendReady, notify, session]);
+
   const createRuleFromStrategy = useCallback(async () => {
     if (legs.length === 0) {
       notify({
@@ -92,7 +128,7 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
         message: 'Build or load a strategy before creating an automation rule.',
         tone: 'warning',
       });
-      return;
+      return null;
     }
 
     const lowerPrice = Math.max(1, Math.round(spotPrice * 0.995));
@@ -136,39 +172,40 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
       runCount: 0,
       updatedAt: Date.now(),
     };
+    return persistRule(draftRule);
+  }, [backendReady, legs, notify, persistRule, spotPrice, symbol]);
 
-    if (!session || !backendReady) {
-      setRules((current) => [draftRule, ...current]);
-      setSyncStatus('fallback');
+  const createRuleFromOpportunity = useCallback(async (opportunity: SellerOpportunity, presetId?: string) => {
+    const preset = opportunity.automationPresets.find((item) => item.id === presetId) ?? opportunity.automationPresets[0];
+    if (!preset) {
       notify({
-        title: 'Automation draft created',
-        message: draftRule.name,
-        tone: 'success',
+        title: 'No automation preset',
+        message: 'This seller idea does not have an automation preset yet.',
+        tone: 'warning',
       });
-      return;
+      return null;
     }
 
-    const result = await brokerGatewayClient.automation.createRule(session, draftRule as unknown as Record<string, unknown>);
-    if (!result.ok || !result.rule) {
-      notify({
-        title: 'Automation rule failed',
-        message: result.error || 'Could not persist automation rule to backend.',
-        tone: 'error',
-      });
-      return;
-    }
+    const draftRule: AutomationRule = {
+      id: `rule-${Date.now()}`,
+      name: `${opportunity.title} · ${preset.label}`,
+      kind: preset.actionConfig.type === 'execute_strategy' ? 'gtt' : 'alert',
+      status: backendReady ? 'active' : 'draft',
+      scope: `${opportunity.structure} · ${opportunity.playbookMatches[0] ?? 'seller idea'}`,
+      trigger: preset.triggerSummary,
+      action: preset.actionSummary,
+      lastRun: 'Never',
+      nextRun: backendReady ? 'Live' : 'Pending review',
+      notes: `Generated from seller opportunity ${opportunity.title}.`,
+      symbol: opportunity.legs[0]?.symbol,
+      triggerConfig: preset.triggerConfig,
+      actionConfig: preset.actionConfig,
+      runCount: 0,
+      updatedAt: Date.now(),
+    };
 
-    setRules((current) => [result.rule as AutomationRule, ...current.filter((rule) => rule.id !== result.rule?.id)]);
-    notify({
-      title: 'Automation rule created',
-      message: result.rule.name,
-      tone: 'success',
-    });
-    const callbackResult = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
-    if (callbackResult.ok) {
-      setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
-    }
-  }, [backendReady, legs, notify, session, spotPrice, symbol]);
+    return persistRule(draftRule);
+  }, [backendReady, notify, persistRule]);
 
   const saveRule = useCallback(async (rule: AutomationRule) => {
     if (!rule.name.trim()) {
@@ -303,11 +340,12 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
     callbacks,
     syncStatus,
     createRuleFromStrategy,
+    createRuleFromOpportunity,
     saveRule,
     deleteRule,
     toggleRuleStatus,
     evaluateRules,
-  }), [rules, callbacks, syncStatus, createRuleFromStrategy, saveRule, deleteRule, toggleRuleStatus, evaluateRules]);
+  }), [rules, callbacks, syncStatus, createRuleFromOpportunity, createRuleFromStrategy, saveRule, deleteRule, toggleRuleStatus, evaluateRules]);
 
   return <AutomationStore.Provider value={value}>{children}</AutomationStore.Provider>;
 }

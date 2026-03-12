@@ -2,7 +2,10 @@ import React, { createContext, useContext, useMemo } from 'react';
 import { SYMBOL_CONFIG } from '../../config/market';
 import type {
   OptionRow,
+  Position,
+  SellerExposureSnapshot,
   SellerOpportunity,
+  SellerOpportunityAutomationPreset,
   SellerOpportunityLeg,
   SellerPlaybook,
   SellerRegime,
@@ -15,7 +18,9 @@ import { useRiskStore } from '../risk/riskStore';
 interface SellerIntelligenceStoreValue {
   regime: SellerRegime;
   opportunities: SellerOpportunity[];
+  suppressedOpportunities: SellerOpportunity[];
   playbooks: SellerPlaybook[];
+  exposure: SellerExposureSnapshot;
 }
 
 const SellerIntelligenceStore = createContext<SellerIntelligenceStoreValue | null>(null);
@@ -235,6 +240,205 @@ function buildPlaybooks(): SellerPlaybook[] {
   ];
 }
 
+function buildExposure(positions: Position[], summary: { marginUtilization: number; grossExposure: number; hedgedExposure: number; availableFunds: number }): SellerExposureSnapshot {
+  const base = positions.reduce((acc, position) => {
+    position.legs.forEach((leg) => {
+      if (leg.type === 'CE') {
+        if (leg.action === 'SELL') acc.activeShortCallLots += leg.lots;
+        else acc.activeLongCallLots += leg.lots;
+      } else {
+        if (leg.action === 'SELL') acc.activeShortPutLots += leg.lots;
+        else acc.activeLongPutLots += leg.lots;
+      }
+      const deltaUnit = leg.type === 'CE' ? 0.4 : -0.4;
+      const signedAction = leg.action === 'BUY' ? 1 : -1;
+      acc.netDirectionalDelta += deltaUnit * signedAction * leg.lots;
+      const gammaUnit = leg.action === 'SELL' ? 1 : -0.8;
+      acc.netShortGammaProxy += gammaUnit * leg.lots;
+    });
+    return acc;
+  }, {
+    activeShortCallLots: 0,
+    activeShortPutLots: 0,
+    activeLongCallLots: 0,
+    activeLongPutLots: 0,
+    netDirectionalDelta: 0,
+    netShortGammaProxy: 0,
+  });
+
+  const pressureFlags: string[] = [];
+  if (summary.marginUtilization >= 0.72) pressureFlags.push('Margin utilization is already elevated.');
+  if (base.activeShortPutLots > base.activeLongPutLots + 2) pressureFlags.push('Portfolio is already carrying heavy downside short premium.');
+  if (base.activeShortCallLots > base.activeLongCallLots + 2) pressureFlags.push('Portfolio is already carrying heavy upside short premium.');
+  if (summary.grossExposure > 0 && (summary.grossExposure - summary.hedgedExposure) / summary.grossExposure >= 0.68) {
+    pressureFlags.push('Unhedged exposure is elevated.');
+  }
+
+  return {
+    activePositions: positions.filter((position) => position.status === 'ACTIVE').length,
+    ...base,
+    marginUtilization: summary.marginUtilization,
+    unhedgedExposurePct: summary.grossExposure === 0 ? 0 : (summary.grossExposure - summary.hedgedExposure) / summary.grossExposure,
+    availableFunds: summary.availableFunds,
+    dominantBias: base.netDirectionalDelta >= 1.5 ? 'bullish' : base.netDirectionalDelta <= -1.5 ? 'bearish' : 'neutral',
+    pressureFlags,
+  };
+}
+
+function derivePlaybookCompliance(
+  structure: string,
+  regime: SellerRegime,
+  playbooks: SellerPlaybook[],
+  marginUtilization: number,
+) {
+  const aligned = playbooks.find((playbook) => (
+    playbook.targetRegimes.includes(regime.id) && playbook.allowedStructures.includes(structure)
+  ));
+  if (!aligned) return { compliance: 'watch' as const, preferredPlaybookId: undefined };
+  if (marginUtilization * 100 > aligned.riskBudgetPct * 4.8) {
+    return { compliance: 'violates' as const, preferredPlaybookId: aligned.id };
+  }
+  return { compliance: 'aligned' as const, preferredPlaybookId: aligned.id };
+}
+
+function createAutomationPresets(
+  idea: Pick<SellerOpportunity, 'id' | 'title' | 'structure' | 'expectedCredit' | 'marginEstimate' | 'breakevens' | 'legs'>,
+  playbook: SellerPlaybook | undefined,
+  spotPrice: number,
+): SellerOpportunityAutomationPreset[] {
+  const lowerGuard = idea.breakevens[0] ?? Math.round(spotPrice * 0.995);
+  const upperGuard = idea.breakevens[idea.breakevens.length - 1] ?? Math.round(spotPrice * 1.005);
+  const drawdownLimit = -Math.max(2500, Math.round(Math.max(Math.abs(idea.marginEstimate), Math.abs(idea.expectedCredit)) * 0.22));
+  const profitTarget = Math.max(1800, Math.round(Math.abs(idea.expectedCredit) * 0.45));
+  const triggerDirection = playbook?.style === 'directional_credit'
+    ? (idea.structure === 'Bull Put Spread' ? 'down' : 'up')
+    : 'either';
+  const triggerPrice = playbook?.style === 'directional_credit'
+    ? (idea.structure === 'Bull Put Spread' ? lowerGuard : upperGuard)
+    : spotPrice;
+
+  return [
+    {
+      id: `${idea.id}-range-guard`,
+      label: 'Range guard exit',
+      description: 'Exit or alert when price leaves the expected seller corridor.',
+      triggerSummary: `Spot leaves ${Math.round(lowerGuard)} to ${Math.round(upperGuard)}`,
+      actionSummary: 'Execute staged exit strategy',
+      triggerConfig: {
+        type: playbook?.style === 'directional_credit'
+          ? (idea.structure === 'Bull Put Spread' ? 'spot_cross_below' : 'spot_cross_above')
+          : 'spot_range_break',
+        lowerPrice: Math.round(lowerGuard),
+        upperPrice: Math.round(upperGuard),
+        thresholdPrice: Math.round(triggerPrice),
+        referencePrice: Math.round(spotPrice),
+        direction: triggerDirection,
+      },
+      actionConfig: {
+        type: 'execute_strategy',
+        legs: idea.legs.map((leg) => ({
+          symbol: leg.symbol,
+          type: leg.type,
+          strike: leg.strike,
+          action: leg.action === 'SELL' ? 'BUY' : 'SELL',
+          lots: leg.lots,
+          expiry: leg.expiry,
+          orderType: leg.orderType ?? 'market',
+          limitPrice: leg.limitPrice,
+        })),
+        message: `${idea.title}: close structure if the idea invalidates.`,
+      },
+    },
+    {
+      id: `${idea.id}-drawdown-stop`,
+      label: 'MTM drawdown stop',
+      description: 'Pause the idea when live PnL deterioration exceeds the seller budget.',
+      triggerSummary: `Live MTM <= ${drawdownLimit}`,
+      actionSummary: 'Notify and suggest hedge/defense review',
+      triggerConfig: {
+        type: 'mtm_drawdown',
+        maxDrawdown: drawdownLimit,
+      },
+      actionConfig: {
+        type: 'suggest_hedge',
+        message: `${idea.title}: drawdown stop triggered. Review hedge or close the tested side.`,
+      },
+    },
+    {
+      id: `${idea.id}-profit-lock`,
+      label: playbook?.style === 'expiry_decay' ? 'Expiry decay capture' : 'Profit lock',
+      description: 'Lock gains once the target premium has decayed enough.',
+      triggerSummary: `Live MTM >= ${profitTarget}`,
+      actionSummary: 'Notify for profit booking discipline',
+      triggerConfig: {
+        type: 'mtm_profit_target',
+        profitTarget,
+      },
+      actionConfig: {
+        type: 'notify',
+        message: `${idea.title}: profit objective reached. Review closure or partial exit.`,
+      },
+    },
+  ];
+}
+
+function applyPortfolioSuppression(
+  idea: SellerOpportunity,
+  playbooks: SellerPlaybook[],
+  regime: SellerRegime,
+  exposure: SellerExposureSnapshot,
+  spotPrice: number,
+) {
+  const suppressionReasons: string[] = [];
+  const shortCallLots = idea.legs.filter((leg) => leg.action === 'SELL' && leg.type === 'CE').reduce((sum, leg) => sum + leg.lots, 0);
+  const shortPutLots = idea.legs.filter((leg) => leg.action === 'SELL' && leg.type === 'PE').reduce((sum, leg) => sum + leg.lots, 0);
+  const undefinedRisk = !idea.structure.includes('Condor') && !idea.structure.includes('Spread') && !idea.structure.includes('Fly');
+
+  if (shortPutLots > 0 && exposure.activeShortPutLots > exposure.activeLongPutLots + 2) {
+    suppressionReasons.push('Live book already has concentrated downside short premium.');
+  }
+  if (shortCallLots > 0 && exposure.activeShortCallLots > exposure.activeLongCallLots + 2) {
+    suppressionReasons.push('Live book already has concentrated upside short premium.');
+  }
+  if (idea.structure === 'Bull Put Spread' && exposure.dominantBias === 'bullish' && exposure.netDirectionalDelta >= 2.5) {
+    suppressionReasons.push('Bullish portfolio delta is already extended.');
+  }
+  if (idea.structure === 'Bear Call Spread' && exposure.dominantBias === 'bearish' && exposure.netDirectionalDelta <= -2.5) {
+    suppressionReasons.push('Bearish portfolio delta is already extended.');
+  }
+  if (undefinedRisk && exposure.marginUtilization >= 0.7) {
+    suppressionReasons.push('Margin utilization is too high for adding undefined-risk premium.');
+  }
+  if (undefinedRisk && exposure.unhedgedExposurePct >= 0.68) {
+    suppressionReasons.push('Unhedged exposure is already elevated for naked premium.');
+  }
+  if (regime.id === 'volatile_expansion' && undefinedRisk) {
+    suppressionReasons.push('Volatile expansion regime blocks additional naked short gamma.');
+  }
+
+  const compliance = derivePlaybookCompliance(idea.structure, regime, playbooks, exposure.marginUtilization);
+  if (compliance.compliance === 'violates') {
+    suppressionReasons.push('Playbook risk budget would be exceeded by the current portfolio state.');
+  }
+
+  const exposurePenalty = suppressionReasons.length * 10
+    + (exposure.marginUtilization > 0.7 ? 8 : 0)
+    + (exposure.unhedgedExposurePct > 0.65 ? 6 : 0);
+  const exposureFit = clamp(92 - exposurePenalty, 8, 96);
+  const playbook = playbooks.find((item) => item.id === compliance.preferredPlaybookId);
+
+  return {
+    ...idea,
+    preferredPlaybookId: compliance.preferredPlaybookId,
+    playbookCompliance: compliance.compliance,
+    exposureFit,
+    suppressed: suppressionReasons.length > 0,
+    suppressionReasons,
+    sellerScore: clamp(idea.sellerScore - Math.round((100 - exposureFit) * 0.35), 8, 98),
+    automationPresets: createAutomationPresets(idea, playbook, spotPrice),
+  };
+}
+
 function estimateOpportunity(
   id: string,
   title: string,
@@ -311,6 +515,12 @@ function estimateOpportunity(
     playbookMatches: playbooks
       .filter((playbook) => playbook.targetRegimes.includes(regime.id) && playbook.allowedStructures.includes(structure))
       .map((playbook) => playbook.name),
+    preferredPlaybookId: undefined,
+    playbookCompliance: 'watch',
+    exposureFit: 100,
+    suppressed: false,
+    suppressionReasons: [],
+    automationPresets: [],
     legs,
   };
 }
@@ -322,6 +532,7 @@ function buildOpportunities(
   expiry: string,
   regime: SellerRegime,
   playbooks: SellerPlaybook[],
+  exposure: SellerExposureSnapshot,
 ) {
   if (chain.length === 0) return [];
   const step = SYMBOL_CONFIG[symbol].strikeStep;
@@ -429,13 +640,13 @@ function buildOpportunities(
       playbooks,
     ),
   ]
-    .filter((idea) => !(regime.restrictedStructures.includes(idea.structure) && idea.structure === 'Short Strangle'))
+    .map((idea) => applyPortfolioSuppression(idea, playbooks, regime, exposure, spotPrice))
     .sort((left, right) => right.sellerScore - left.sellerScore);
 }
 
 export function SellerIntelligenceProvider({ children }: { children: React.ReactNode }) {
   const { chain, spotPrice, historical, expiry, symbol, watchlist } = useMarketStore();
-  const { summary } = usePortfolioStore();
+  const { summary, livePositions } = usePortfolioStore();
   const { snapshot } = useRiskStore();
 
   const value = useMemo<SellerIntelligenceStoreValue>(() => {
@@ -444,18 +655,17 @@ export function SellerIntelligenceProvider({ children }: { children: React.React
       - Math.sign(summary.marginUtilization - 0.5);
     const regime = buildRegime(chain, historical, spotPrice, expiry.daysToExpiry, breadthSignal);
     const playbooks = buildPlaybooks();
-    const opportunities = buildOpportunities(chain, spotPrice, symbol, expiry.breezeValue, regime, playbooks)
-      .map((idea) => ({
-        ...idea,
-        sellerScore: clamp(idea.sellerScore - (summary.marginUtilization > 0.7 ? 4 : 0), 10, 98),
-      }));
+    const exposure = buildExposure(livePositions, summary);
+    const opportunities = buildOpportunities(chain, spotPrice, symbol, expiry.breezeValue, regime, playbooks, exposure);
 
     return {
       regime,
-      opportunities,
+      opportunities: opportunities.filter((idea) => !idea.suppressed),
+      suppressedOpportunities: opportunities.filter((idea) => idea.suppressed),
       playbooks,
+      exposure,
     };
-  }, [chain, expiry.breezeValue, expiry.daysToExpiry, historical, snapshot.portfolioDelta, spotPrice, summary.marginUtilization, symbol, watchlist]);
+  }, [chain, expiry.breezeValue, expiry.daysToExpiry, historical, livePositions, snapshot.portfolioDelta, spotPrice, summary, symbol, watchlist]);
 
   return <SellerIntelligenceStore.Provider value={value}>{children}</SellerIntelligenceStore.Provider>;
 }

@@ -1,10 +1,11 @@
 import React from 'react';
-import { Activity, Bot, Cable, ChartCandlestick, FolderKanban, ShieldAlert, Wallet } from 'lucide-react';
+import { Activity, BookOpenText, Bot, Cable, ChartCandlestick, FolderKanban, ShieldAlert, Wallet } from 'lucide-react';
 import { WORKSPACE_ROUTES, type WorkspacePath } from '../router';
 
 const routeIcons: Record<WorkspacePath, React.ReactNode> = {
   '/market': <ChartCandlestick size={16} />,
   '/strategy': <FolderKanban size={16} />,
+  '/journal': <BookOpenText size={16} />,
   '/execution': <Activity size={16} />,
   '/portfolio': <Wallet size={16} />,
   '/risk': <ShieldAlert size={16} />,

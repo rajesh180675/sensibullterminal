@@ -6,6 +6,7 @@ import type { WorkspacePath } from '../router';
 const TITLES: Record<WorkspacePath, { title: string; subtitle: string }> = {
   '/market': { title: 'Market Workspace', subtitle: 'Option chain, expiries, live spot, and streaming depth.' },
   '/strategy': { title: 'Strategy Lab', subtitle: 'Build, template, and monitor multi-leg structures.' },
+  '/journal': { title: 'Journal and Review', subtitle: 'Capture rationale, mistake tags, and playbook compliance.' },
   '/execution': { title: 'Execution Desk', subtitle: 'Preflight active legs before submitting to Breeze.' },
   '/portfolio': { title: 'Portfolio Cockpit', subtitle: 'Live positions, orders, trades, and funds.' },
   '/risk': { title: 'Risk Console', subtitle: 'Planned margin, exposure, and alert surface.' },

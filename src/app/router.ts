@@ -1,6 +1,7 @@
 export const WORKSPACE_ROUTES = [
   { path: '/market', label: 'Market', shortLabel: 'MKT' },
   { path: '/strategy', label: 'Strategy', shortLabel: 'STR' },
+  { path: '/journal', label: 'Journal', shortLabel: 'JNL' },
   { path: '/execution', label: 'Execution', shortLabel: 'EXE' },
   { path: '/portfolio', label: 'Portfolio', shortLabel: 'PFO' },
   { path: '/risk', label: 'Risk', shortLabel: 'RSK' },
