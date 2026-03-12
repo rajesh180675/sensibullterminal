@@ -1,0 +1,21 @@
+{
+  "event": "order_update",
+  "order_status": "Executed",
+  "status_message": "Order fully executed",
+  "strategy_id": "prod:rule-1741881000000",
+  "strategy_name": "NIFTY staged exit",
+  "kind": "gtt",
+  "stock_code": "NIFTY",
+  "orders": [
+    {
+      "legIndex": 0,
+      "exchange_order_id": "202603120001",
+      "execution_status": "Executed"
+    },
+    {
+      "legIndex": 1,
+      "exchange_order_id": "202603120002",
+      "execution_status": "Executed"
+    }
+  ]
+}

@@ -41,6 +41,16 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Callable
 from collections import deque
 import logging
+from automation_normalization import (
+    extract_rule_id_hint,
+    first_present,
+    match_symbol,
+    normalize_broker_results,
+    normalize_callback_payload,
+    normalize_position_row,
+    row_symbol,
+    safe_float,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("BreezeEngine")
@@ -585,16 +595,11 @@ class AutomationRuleManager:
 
     @staticmethod
     def _parse_numeric(value: Any) -> float:
-        if isinstance(value, str):
-            value = value.replace(",", "").strip()
-        return _safe_float(value)
+        return safe_float(value)
 
     @staticmethod
     def _first_present(payload: dict, keys: List[str]) -> Any:
-        for key in keys:
-            if key in payload and payload.get(key) not in (None, ""):
-                return payload.get(key)
-        return None
+        return first_present(payload, keys)
 
     @staticmethod
     def _symbol_aliases(symbol: str) -> set[str]:
@@ -607,238 +612,30 @@ class AutomationRuleManager:
         return aliases
 
     def _row_symbol(self, row: dict) -> str:
-        value = self._first_present(row, [
-            "stock_code",
-            "stockCode",
-            "stock",
-            "symbol",
-            "trading_symbol",
-            "tradingsymbol",
-            "underlying",
-        ])
-        return str(value or "").upper()
+        return row_symbol(row)
 
     def _match_symbol(self, row: dict, symbol: str) -> bool:
-        row_symbol = self._row_symbol(row)
-        if not row_symbol:
-            return True
-        return row_symbol in self._symbol_aliases(symbol)
+        return match_symbol(row, symbol)
 
     def _normalise_position_quantity(self, row: dict) -> float:
-        direct = self._first_present(row, [
-            "net_quantity",
-            "net_qty",
-            "netQuantity",
-            "quantity",
-            "open_quantity",
-            "openQuantity",
-        ])
-        quantity = self._parse_numeric(direct)
-        if quantity == 0:
-            buy_qty = self._parse_numeric(self._first_present(row, ["buy_quantity", "buy_qty", "buyQuantity"]))
-            sell_qty = self._parse_numeric(self._first_present(row, ["sell_quantity", "sell_qty", "sellQuantity"]))
-            if buy_qty or sell_qty:
-                quantity = buy_qty - sell_qty
-        action = str(self._first_present(row, ["action", "transaction_type", "side"]) or "").lower()
-        if quantity > 0 and action in {"sell", "short"} and not any(key in row for key in ("buy_quantity", "buy_qty", "sell_quantity", "sell_qty", "net_quantity", "net_qty", "netQuantity")):
-            quantity *= -1
-        return quantity
+        return _safe_float(normalize_position_row(row).get("quantity"))
 
     def _normalise_position_mtm(self, row: dict, quantity: float) -> float:
-        direct_fields = [
-            "pnl",
-            "mtm",
-            "m2m",
-            "mark_to_market",
-            "markToMarket",
-            "unrealized_profit_loss",
-            "unrealised_profit_loss",
-            "unrealized_pnl",
-            "unrealised_pnl",
-            "total_pnl",
-            "totalPnl",
-        ]
-        for field in direct_fields:
-            if field not in row:
-                continue
-            value = self._parse_numeric(row.get(field))
-            if value != 0:
-                return value
-
-        booked = self._parse_numeric(self._first_present(row, [
-            "booked_pnl",
-            "realized_pnl",
-            "realised_pnl",
-            "realized_profit_loss",
-            "realised_profit_loss",
-        ]))
-        unrealized = self._parse_numeric(self._first_present(row, [
-            "unrealized_profit_loss",
-            "unrealised_profit_loss",
-            "unrealized_pnl",
-            "unrealised_pnl",
-        ]))
-        if booked or unrealized:
-            return booked + unrealized
-
-        avg_price = self._parse_numeric(self._first_present(row, [
-            "average_price",
-            "avg_price",
-            "averagePrice",
-            "cost_price",
-            "costPrice",
-        ]))
-        ltp = self._parse_numeric(self._first_present(row, [
-            "ltp",
-            "last_traded_price",
-            "last_price",
-            "market_price",
-            "marketPrice",
-            "close_price",
-        ]))
-        if quantity != 0 and (avg_price > 0 or ltp > 0):
-            return (ltp - avg_price) * quantity
-        return 0.0
+        normalized = normalize_position_row(row)
+        return _safe_float(normalized.get("mtm"))
 
     def _normalise_position_row(self, row: dict) -> dict:
-        quantity = self._normalise_position_quantity(row)
-        mtm = self._normalise_position_mtm(row, quantity)
-        return {
-            "symbol": self._row_symbol(row),
-            "quantity": quantity,
-            "mtm": mtm,
-            "averagePrice": self._parse_numeric(self._first_present(row, ["average_price", "avg_price", "averagePrice", "cost_price"])),
-            "ltp": self._parse_numeric(self._first_present(row, ["ltp", "last_traded_price", "last_price", "market_price"])),
-            "raw": row,
-        }
+        return normalize_position_row(row)
 
     @staticmethod
     def _extract_rule_id_hint(payload: dict) -> str:
-        candidates = [
-            payload.get("ruleId"),
-            payload.get("rule_id"),
-            payload.get("strategy_id"),
-            payload.get("strategyId"),
-            payload.get("client_order_id"),
-            payload.get("clientOrderId"),
-            payload.get("correlation_id"),
-            payload.get("correlationId"),
-            payload.get("tag"),
-            payload.get("user_remark"),
-            payload.get("userRemark"),
-        ]
-        for value in candidates:
-            text = str(value or "")
-            match = re.search(r"(rule-[A-Za-z0-9_-]+)", text)
-            if match:
-                return match.group(1)
-            if text.startswith("rule-"):
-                return text
-        return ""
+        return extract_rule_id_hint(payload)
 
     def _normalise_broker_results(self, payload: dict) -> List[dict]:
-        rows = payload.get("brokerResults") or payload.get("broker_results") or payload.get("orders") or payload.get("legs") or payload.get("trades")
-        if isinstance(rows, dict):
-            rows = [rows]
-        if not isinstance(rows, list):
-            single_order_id = self._first_present(payload, ["order_id", "orderId", "exchange_order_id", "exchangeOrderId"])
-            if single_order_id:
-                rows = [payload]
-            else:
-                return []
-
-        results: List[dict] = []
-        for index, row in enumerate(rows):
-            if not isinstance(row, dict):
-                continue
-            raw_status = str(self._first_present(row, ["status", "order_status", "orderStatus", "execution_status", "executionStatus"]) or "").lower()
-            success = raw_status in {"success", "ok", "complete", "completed", "executed", "filled", "traded"}
-            if not raw_status:
-                success = not bool(self._first_present(row, ["error", "error_message", "reason", "reject_reason"]))
-            results.append({
-                "leg_index": int(self._parse_numeric(self._first_present(row, ["leg_index", "legIndex"]) or index)),
-                "success": success,
-                "order_id": str(self._first_present(row, ["order_id", "orderId", "exchange_order_id", "exchangeOrderId"]) or ""),
-                "error": str(self._first_present(row, ["error", "error_message", "errorMessage", "reason", "reject_reason"]) or ""),
-            })
-        return results
+        return normalize_broker_results(payload)
 
     def _normalise_callback_payload(self, payload: dict, source: str) -> dict:
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        event_type_raw = str(self._first_present(data, [
-            "eventType",
-            "event_type",
-            "callback_type",
-            "callbackType",
-            "update_type",
-            "updateType",
-            "event",
-        ]) or ("webhook" if source == "webhook" else "manual")).lower()
-        broker_status_raw = str(self._first_present(data, [
-            "status",
-            "order_status",
-            "orderStatus",
-            "execution_status",
-            "executionStatus",
-            "trade_status",
-            "tradeStatus",
-        ]) or "").lower()
-
-        if any(token in event_type_raw for token in ("reject", "fail", "cancel", "error")) or broker_status_raw in {"rejected", "failed", "cancelled", "canceled", "error"}:
-            status = "error"
-            event_type = "failed"
-        elif any(token in event_type_raw for token in ("trigger", "alert")):
-            status = "warning"
-            event_type = "triggered"
-        elif any(token in event_type_raw for token in ("fill", "trade", "exec", "complete")) or broker_status_raw in {"success", "ok", "complete", "completed", "executed", "filled", "traded"}:
-            status = "success"
-            event_type = "executed"
-        else:
-            status = "info"
-            event_type = "webhook" if source == "webhook" else "manual"
-
-        message = str(self._first_present(data, [
-            "message",
-            "status_message",
-            "statusMessage",
-            "reason",
-            "remarks",
-            "remark",
-            "error_message",
-            "errorMessage",
-        ]) or "")
-        if not message:
-            if broker_status_raw:
-                message = f"Broker callback status: {broker_status_raw}."
-            elif source == "webhook":
-                message = "Broker webhook received."
-            else:
-                message = "Manual automation callback received."
-
-        rule_id = self._extract_rule_id_hint(data)
-        rule_name = str(self._first_present(data, ["ruleName", "rule_name", "strategy_name", "strategyName"]) or "")
-        kind = str(self._first_present(data, ["kind", "ruleKind", "rule_kind"]) or "alert")
-        broker_results = self._normalise_broker_results(data)
-        meta = {
-            "source": source,
-            "brokerStatus": broker_status_raw,
-            "eventTypeRaw": event_type_raw,
-            "normalizedAt": self._now_ts(),
-            "payload": payload,
-        }
-        symbol = str(self._first_present(data, ["stock_code", "stockCode", "symbol", "underlying"]) or "").upper()
-        if symbol:
-            meta["symbol"] = symbol
-        return {
-            "ruleId": rule_id,
-            "ruleName": rule_name,
-            "kind": kind,
-            "eventType": event_type,
-            "status": status,
-            "message": message,
-            "brokerResults": broker_results,
-            "meta": meta,
-        }
+        return normalize_callback_payload(payload, source, normalized_at=self._now_ts())
 
     def _fetch_position_metrics(self, symbol: str) -> dict:
         snapshot = {"symbol": symbol.upper(), "mtm": 0.0, "netQuantity": 0.0, "positionsCount": 0, "matchedRows": []}
