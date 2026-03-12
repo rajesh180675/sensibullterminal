@@ -1,11 +1,19 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { MARKET_INDICES, SPOT_PRICES, SYMBOL_CONFIG, getExpiries } from '../../config/market';
 import { generateChain, simulateTick } from '../../data/mock';
-import type { ExpiryDate, MarketIndex, OptionRow, SymbolCode } from '../../types/index';
-import type { TickUpdate } from '../../utils/breezeWs';
+import type {
+  ExpiryDate,
+  MarketDepthSnapshot,
+  MarketIndex,
+  OptionRow,
+  SymbolCode,
+  WatchlistItem,
+} from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { UnifiedStreamingManager } from '../../services/streaming/unifiedStreamingManager';
 import { useNotificationStore } from '../../stores/notificationStore';
+import type { HistoricalCandle } from '../../utils/kaggleClient';
+import type { TickUpdate } from '../../utils/breezeWs';
 import { useSessionStore } from '../session/sessionStore';
 import {
   applyTicksToChain,
@@ -13,6 +21,7 @@ import {
   mergeQuotesToChain,
   updateIndicesWithSpot,
 } from './marketTransforms';
+import { buildDepthFromChain, buildSyntheticCandles, buildWatchlist } from './marketDerived';
 
 interface MarketStoreValue {
   symbol: SymbolCode;
@@ -24,14 +33,46 @@ interface MarketStoreValue {
   isLoading: boolean;
   chainError: string | null;
   liveIndices: MarketIndex[];
+  watchlist: WatchlistItem[];
+  marketDepth: MarketDepthSnapshot;
+  historical: HistoricalCandle[];
+  chartInterval: string;
+  isHistoricalLoading: boolean;
   setSymbol: (symbol: SymbolCode) => void;
   setExpiry: (expiry: ExpiryDate) => void;
+  setChartInterval: (interval: string) => void;
   refreshMarket: () => Promise<void>;
+  refreshHistorical: () => Promise<void>;
 }
 
 const DEFAULT_SYMBOL: SymbolCode = 'NIFTY';
+const DEFAULT_INTERVAL = '5minute';
 const streamingManager = new UnifiedStreamingManager();
 const MarketStore = createContext<MarketStoreValue | null>(null);
+
+function emptyDepth(): MarketDepthSnapshot {
+  return {
+    bids: [],
+    asks: [],
+    spread: 0,
+    imbalance: 0,
+    updatedAt: Date.now(),
+  };
+}
+
+function chartRange(interval: string) {
+  const now = new Date();
+  const from = new Date(now);
+  if (interval === '1minute') from.setHours(now.getHours() - 1);
+  else if (interval === '5minute') from.setHours(now.getHours() - 6);
+  else if (interval === '30minute') from.setDate(now.getDate() - 4);
+  else from.setDate(now.getDate() - 10);
+
+  return {
+    fromDate: from.toISOString().slice(0, 19).replace('T', ' '),
+    toDate: now.toISOString().slice(0, 19).replace('T', ' '),
+  };
+}
 
 export function MarketProvider({ children }: { children: React.ReactNode }) {
   const { notify } = useNotificationStore();
@@ -45,6 +86,11 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(false);
   const [chainError, setChainError] = useState<string | null>(null);
   const [liveIndices, setLiveIndices] = useState<MarketIndex[]>(MARKET_INDICES);
+  const [watchlist, setWatchlist] = useState<WatchlistItem[]>([]);
+  const [marketDepth, setMarketDepth] = useState<MarketDepthSnapshot>(() => emptyDepth());
+  const [historical, setHistorical] = useState<HistoricalCandle[]>(() => buildSyntheticCandles(SPOT_PRICES[DEFAULT_SYMBOL], DEFAULT_INTERVAL, DEFAULT_SYMBOL));
+  const [chartInterval, setChartInterval] = useState(DEFAULT_INTERVAL);
+  const [isHistoricalLoading, setIsHistoricalLoading] = useState(false);
 
   const currentChain = useRef<OptionRow[]>(chain);
   const currentSymbol = useRef<SymbolCode>(symbol);
@@ -64,6 +110,38 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     setLiveIndices((current) => updateIndicesWithSpot(current, nextSymbol, nextSpot, dayOpenBySymbol.current[nextSymbol]));
   }, []);
 
+  const refreshHistorical = useCallback(async () => {
+    setIsHistoricalLoading(true);
+    try {
+      if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) {
+        setHistorical(buildSyntheticCandles(currentSpot.current, chartInterval, symbol));
+        return;
+      }
+
+      const { fromDate, toDate } = chartRange(chartInterval);
+      const result = await brokerGatewayClient.market.fetchHistorical(symbol, session, {
+        interval: chartInterval,
+        fromDate,
+        toDate,
+      });
+
+      if (result.ok && result.data.length > 0) {
+        setHistorical(result.data);
+      } else {
+        setHistorical(buildSyntheticCandles(currentSpot.current, chartInterval, symbol));
+      }
+    } catch (error) {
+      setHistorical(buildSyntheticCandles(currentSpot.current, chartInterval, symbol));
+      notify({
+        title: 'Historical reload fallback',
+        message: error instanceof Error ? error.message : String(error),
+        tone: 'warning',
+      });
+    } finally {
+      setIsHistoricalLoading(false);
+    }
+  }, [chartInterval, notify, session, symbol]);
+
   const fetchAndSetSpot = useCallback(async (nextSymbol: SymbolCode, nextSession: NonNullable<typeof session>) => {
     const fallback = SPOT_PRICES[nextSymbol];
     try {
@@ -76,11 +154,11 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
         return result.spot;
       }
     } catch {
-      // handled via fallback below
+      // fallback below
     }
     updateSpot(fallback, nextSymbol);
     return fallback;
-  }, [session, updateSpot]);
+  }, [updateSpot]);
 
   const fetchLiveExpiries = useCallback(async (nextSymbol: SymbolCode, nextSession: NonNullable<typeof session>) => {
     if (!brokerGatewayClient.session.isBackend(nextSession.proxyBase)) {
@@ -101,7 +179,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
         return liveExpiries;
       }
     } catch {
-      // fall through
+      // fallback below
     }
 
     const fallback = getExpiries(nextSymbol);
@@ -190,7 +268,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setIsLoading(false);
     }
-  }, [notify, setStatusMessage, session]);
+  }, [notify, setStatusMessage]);
 
   const initializeLiveSession = useCallback(async (nextSymbol: SymbolCode, nextSession: NonNullable<typeof session>) => {
     if (!brokerGatewayClient.session.isBackend(nextSession.proxyBase)) {
@@ -220,22 +298,20 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       await fetchLiveChain(nextSymbol, firstExpiry, nextSession, liveSpot);
     }
 
-    if (brokerGatewayClient.session.isBackend(nextSession.proxyBase)) {
-      setWsStatus('connecting');
-      streamingManager.connect(nextSession.proxyBase, handleTickUpdate, (status) => {
-        setWsStatus(status);
-        setStatusMessage(
-          status === 'connected'
-            ? 'Streaming live market data'
-            : status === 'reconnecting'
-              ? 'Reconnecting market stream'
-              : status === 'error'
-                ? 'WebSocket unavailable. REST polling fallback active.'
-                : 'Market stream disconnected'
-        );
-      });
-    }
-  }, [fetchAndSetSpot, fetchLiveExpiries, fetchLiveChain, handleTickUpdate, setStatusMessage, setWsStatus, session]);
+    setWsStatus('connecting');
+    streamingManager.connect(nextSession.proxyBase, handleTickUpdate, (status) => {
+      setWsStatus(status);
+      setStatusMessage(
+        status === 'connected'
+          ? 'Streaming live market data'
+          : status === 'reconnecting'
+            ? 'Reconnecting market stream'
+            : status === 'error'
+              ? 'WebSocket unavailable. REST polling fallback active.'
+              : 'Market stream disconnected'
+      );
+    });
+  }, [fetchAndSetSpot, fetchLiveExpiries, fetchLiveChain, handleTickUpdate, setStatusMessage, setWsStatus, updateSpot]);
 
   const resetToDemo = useCallback((nextSymbol: SymbolCode) => {
     streamingManager.disconnect();
@@ -277,10 +353,20 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  useEffect(() => {
+    setWatchlist((current) => buildWatchlist(symbol, spotPrice, current));
+    setMarketDepth(buildDepthFromChain(chain, spotPrice));
+  }, [chain, spotPrice, symbol]);
+
+  useEffect(() => {
+    void refreshHistorical();
+  }, [refreshHistorical]);
+
   const refreshMarket = useCallback(async () => {
     if (!session?.isConnected) {
       setChain(generateChain(symbol, spotPrice));
       setLastUpdate(new Date());
+      await refreshHistorical();
       return;
     }
 
@@ -288,12 +374,14 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       setChain(generateChain(symbol, spotPrice));
       setLastUpdate(new Date());
       setStatusMessage('Browser-direct mode refreshed from static market seed.');
+      await refreshHistorical();
       return;
     }
 
     const liveSpot = await fetchAndSetSpot(symbol, session);
     await fetchLiveChain(symbol, expiry, session, liveSpot);
-  }, [session, symbol, spotPrice, expiry, fetchAndSetSpot, fetchLiveChain]);
+    await refreshHistorical();
+  }, [session, symbol, spotPrice, expiry, fetchAndSetSpot, fetchLiveChain, refreshHistorical, setStatusMessage]);
 
   useEffect(() => {
     if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) return;
@@ -302,7 +390,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     void fetchLiveChain(symbol, expiry, session, currentSpot.current);
-  }, [expiry.breezeValue]);
+  }, [expiry.breezeValue, fetchLiveChain, session, symbol, expiry]);
 
   const value = useMemo(() => ({
     symbol,
@@ -314,10 +402,34 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     isLoading,
     chainError,
     liveIndices,
+    watchlist,
+    marketDepth,
+    historical,
+    chartInterval,
+    isHistoricalLoading,
     setSymbol: setSymbolState,
     setExpiry: setExpiryState,
+    setChartInterval,
     refreshMarket,
-  }), [symbol, expiry, availableExpiries, chain, spotPrice, lastUpdate, isLoading, chainError, liveIndices, refreshMarket]);
+    refreshHistorical,
+  }), [
+    symbol,
+    expiry,
+    availableExpiries,
+    chain,
+    spotPrice,
+    lastUpdate,
+    isLoading,
+    chainError,
+    liveIndices,
+    watchlist,
+    marketDepth,
+    historical,
+    chartInterval,
+    isHistoricalLoading,
+    refreshMarket,
+    refreshHistorical,
+  ]);
 
   return <MarketStore.Provider value={value}>{children}</MarketStore.Provider>;
 }

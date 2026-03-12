@@ -1,8 +1,10 @@
 import React from 'react';
+import { AutomationProvider } from '../domains/automation/automationStore';
 import { SessionProvider } from '../domains/session/sessionStore';
 import { MarketProvider } from '../domains/market/marketStore';
 import { PortfolioProvider } from '../domains/portfolio/portfolioStore';
 import { ExecutionProvider } from '../domains/execution/executionStore';
+import { RiskProvider } from '../domains/risk/riskStore';
 import { NotificationProvider } from '../stores/notificationStore';
 
 export function AppProviders({ children }: { children: React.ReactNode }) {
@@ -12,7 +14,11 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
         <MarketProvider>
           <PortfolioProvider>
             <ExecutionProvider>
-              {children}
+              <RiskProvider>
+                <AutomationProvider>
+                  {children}
+                </AutomationProvider>
+              </RiskProvider>
             </ExecutionProvider>
           </PortfolioProvider>
         </MarketProvider>

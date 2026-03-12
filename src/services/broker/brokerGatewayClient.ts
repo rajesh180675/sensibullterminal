@@ -4,10 +4,14 @@ import { extractApiSession, placeLegOrder, validateSession } from '../../utils/b
 import {
   checkBackendHealth,
   connectToBreeze,
+  fetchFunds,
   fetchExpiryDates,
+  fetchHistorical,
   fetchOptionChain,
+  fetchOrderBook,
   fetchPositions,
   fetchSpotPrice,
+  fetchTradeBook,
   isKaggleBackend,
   setTerminalAuthToken,
 } from '../../utils/kaggleClient';
@@ -134,10 +138,34 @@ export const brokerGatewayClient = {
         strikes,
       );
     },
+    async fetchHistorical(symbol: SymbolCode, session: BreezeSession, params: {
+      interval: string;
+      fromDate: string;
+      toDate: string;
+      expiryDate?: string;
+      right?: 'call' | 'put';
+      strikePrice?: string;
+    }) {
+      const cfg = SYMBOL_CONFIG[symbol];
+      return fetchHistorical(session.proxyBase, {
+        stockCode: cfg.breezeStockCode,
+        exchangeCode: cfg.breezeExchangeCode,
+        ...params,
+      });
+    },
   },
   portfolio: {
     async fetchPositions(session: BreezeSession) {
       return fetchPositions(session.proxyBase);
+    },
+    async fetchFunds(session: BreezeSession) {
+      return fetchFunds(session.proxyBase);
+    },
+    async fetchOrders(session: BreezeSession) {
+      return fetchOrderBook(session.proxyBase);
+    },
+    async fetchTrades(session: BreezeSession) {
+      return fetchTradeBook(session.proxyBase);
     },
   },
   orders: {

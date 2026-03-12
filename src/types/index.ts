@@ -118,6 +118,99 @@ export interface MarketIndex {
   dayOpen: number;  // FIX: track day-open for accurate change%
 }
 
+export interface WatchlistItem {
+  id: string;
+  symbol: SymbolCode;
+  label: string;
+  price: number;
+  change: number;
+  pct: number;
+  volume: number;
+  updatedAt: number;
+}
+
+export interface DepthLevel {
+  price: number;
+  quantity: number;
+  orders: number;
+}
+
+export interface MarketDepthSnapshot {
+  bids: DepthLevel[];
+  asks: DepthLevel[];
+  spread: number;
+  imbalance: number;
+  updatedAt: number;
+}
+
+export interface ExecutionPreview {
+  estimatedPremium: number;
+  estimatedFees: number;
+  slippage: number;
+  capitalAtRisk: number;
+  marginRequired: number;
+  maxProfit: number;
+  maxLoss: number;
+  breakevens: number[];
+}
+
+export interface ExecutionBlotterItem {
+  id: string;
+  submittedAt: number;
+  symbol: SymbolCode;
+  legCount: number;
+  summary: string;
+  premium: number;
+  status: 'queued' | 'sent' | 'partial' | 'failed';
+  response: string;
+}
+
+export interface PortfolioSummary {
+  totalMtm: number;
+  totalMaxProfit: number;
+  totalMaxLoss: number;
+  activePositions: number;
+  winners: number;
+  losers: number;
+  grossExposure: number;
+  hedgedExposure: number;
+  availableFunds: number;
+  marginUsed: number;
+  marginUtilization: number;
+}
+
+export interface RiskAlert {
+  id: string;
+  severity: 'info' | 'warning' | 'critical';
+  title: string;
+  detail: string;
+}
+
+export interface RiskSnapshot {
+  portfolioDelta: number;
+  portfolioTheta: number;
+  portfolioGamma: number;
+  portfolioVega: number;
+  stressLoss1Pct: number;
+  stressLoss2Pct: number;
+  marginHeadroom: number;
+  concentration: number;
+  alerts: RiskAlert[];
+}
+
+export interface AutomationRule {
+  id: string;
+  name: string;
+  kind: 'gtt' | 'alert' | 'hedge' | 'rebalance';
+  status: 'active' | 'paused' | 'draft';
+  scope: string;
+  trigger: string;
+  action: string;
+  lastRun: string;
+  nextRun: string;
+  notes?: string;
+}
+
 // ── Breeze session (browser state — no backend) ─────────────
 export interface BreezeCredentials {
   apiKey:       string;
