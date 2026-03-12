@@ -1,9 +1,11 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
-import type { SellerJournalEntry, SellerJournalSummary, SellerOpportunity } from '../../types/index';
+import type { OrderBookRow, TradeBookRow } from '../../utils/kaggleClient';
+import type { OptionLeg, Position, SellerJournalEntry, SellerJournalSummary, SellerOpportunity } from '../../types/index';
 import { useExecutionStore } from '../execution/executionStore';
+import { usePortfolioStore } from '../portfolio/portfolioStore';
 import { useSellerIntelligenceStore } from '../seller/sellerIntelligenceStore';
 
-const STORAGE_KEY = 'sensibull.sellerJournal.v1';
+const STORAGE_KEY = 'sensibull.sellerJournal.v2';
 
 const DEFAULT_MISTAKE_TAGS = [
   'over-sized',
@@ -58,6 +60,17 @@ function buildEntryFromOpportunity(opportunity: SellerOpportunity): SellerJourna
     automationRuleIds: [],
     source: 'opportunity',
     sourceOpportunityId: opportunity.id,
+    legsSnapshot: opportunity.legs.map((leg) => ({ ...leg, id: `idea-${opportunity.id}-${leg.type}-${leg.strike}` })),
+    linkedPositionIds: [],
+    linkedOrderIds: [],
+    linkedTradeIds: [],
+    linkedPositionStatus: 'unlinked',
+    realizedPnl: 0,
+    unrealizedPnl: 0,
+    netPnl: 0,
+    outcome: 'pending',
+    adjustmentCount: 0,
+    adjustmentEffectiveness: 'unreviewed',
   };
 }
 
@@ -74,11 +87,66 @@ function inferStructureFromSummary(summary: string, legCount: number) {
 
 function tallyBuckets(values: string[]) {
   const counts = new Map<string, number>();
-  values.forEach((value) => counts.set(value, (counts.get(value) ?? 0) + 1));
+  values.filter(Boolean).forEach((value) => counts.set(value, (counts.get(value) ?? 0) + 1));
   return [...counts.entries()]
     .sort((left, right) => right[1] - left[1])
     .slice(0, 5)
     .map(([label, count]) => ({ label, count }));
+}
+
+function tallyPnlBuckets(entries: SellerJournalEntry[]) {
+  const totals = new Map<string, number>();
+  entries.forEach((entry) => totals.set(entry.structure, (totals.get(entry.structure) ?? 0) + entry.netPnl));
+  return [...totals.entries()]
+    .sort((left, right) => Math.abs(right[1]) - Math.abs(left[1]))
+    .slice(0, 5)
+    .map(([label, value]) => ({ label, value }));
+}
+
+function legMatchesRow(leg: OptionLeg, row: Record<string, unknown>) {
+  const right = String(row.right || '').toUpperCase();
+  const strike = Number(row.strike_price ?? 0);
+  const expiry = String(row.expiry_date || '');
+  const action = String(row.action || row.transaction_type || '').toUpperCase();
+  const normalizedAction = action.startsWith('B') ? 'BUY' : action.startsWith('S') ? 'SELL' : '';
+  return leg.type === right && leg.strike === strike && leg.expiry === expiry && normalizedAction === leg.action;
+}
+
+function matchesPosition(entry: SellerJournalEntry, position: Position) {
+  if (entry.symbol !== position.symbol) return false;
+  if (!entry.legsSnapshot || entry.legsSnapshot.length === 0) return false;
+  return entry.legsSnapshot.some((leg) => position.legs.some((candidate) => (
+    candidate.type === leg.type
+    && candidate.strike === leg.strike
+    && candidate.action === leg.action
+  )));
+}
+
+function matchesOrder(entry: SellerJournalEntry, row: OrderBookRow | TradeBookRow) {
+  if (entry.symbol !== (String(row.stock_code || '').includes('SENSEX') ? 'BSESEN' : 'NIFTY')) return false;
+  if (!entry.legsSnapshot || entry.legsSnapshot.length === 0) return false;
+  return entry.legsSnapshot.some((leg) => legMatchesRow(leg, row));
+}
+
+function deriveOutcome(entry: SellerJournalEntry, hasLinkedPositions: boolean): SellerJournalEntry['outcome'] {
+  if (hasLinkedPositions) return entry.netPnl === 0 ? 'open' : 'open';
+  if (entry.linkedTradeIds.length === 0 && entry.linkedOrderIds.length === 0) return 'pending';
+  if (entry.netPnl > 0) return 'closed_win';
+  if (entry.netPnl < 0) return 'closed_loss';
+  return 'flat';
+}
+
+function deriveAdjustmentCount(entry: SellerJournalEntry, positions: Position[]) {
+  const currentLegCount = positions.reduce((sum, position) => sum + position.legs.length, 0);
+  const originalLegCount = entry.legsSnapshot?.length ?? 0;
+  return Math.max(0, currentLegCount - originalLegCount);
+}
+
+function deriveAdjustmentEffectiveness(entry: SellerJournalEntry, priorNetPnl: number) {
+  if (entry.adjustmentCount === 0) return 'unreviewed';
+  const delta = entry.netPnl - priorNetPnl;
+  if (Math.abs(delta) < 1) return 'flat';
+  return delta > 0 ? 'improving' : 'worsening';
 }
 
 interface JournalStoreValue {
@@ -98,6 +166,7 @@ const JournalStore = createContext<JournalStoreValue | null>(null);
 export function JournalProvider({ children }: { children: React.ReactNode }) {
   const { regime } = useSellerIntelligenceStore();
   const { blotter } = useExecutionStore();
+  const { livePositions, orders, trades } = usePortfolioStore();
   const [entries, setEntries] = useState<SellerJournalEntry[]>(() => loadEntries());
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
 
@@ -131,6 +200,9 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
         entriesByStructure: tallyBuckets(entries.map((entry) => entry.structure)),
         entriesByRegime: tallyBuckets(entries.map((entry) => entry.regimeLabel)),
         mistakeClusters: tallyBuckets(entries.flatMap((entry) => entry.mistakeTags)),
+        entriesByOutcome: tallyBuckets(entries.map((entry) => entry.outcome)),
+        adjustmentEffectiveness: tallyBuckets(entries.map((entry) => entry.adjustmentEffectiveness)),
+        netPnlByStructure: tallyPnlBuckets(entries),
       },
     };
   }, [entries]);
@@ -173,11 +245,63 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
           source: 'execution' as const,
           sourceBlotterId: item.id,
           executionStatus: item.status,
+          legsSnapshot: item.legsSnapshot,
+          linkedPositionIds: [],
+          linkedOrderIds: [],
+          linkedTradeIds: [],
+          linkedPositionStatus: 'unlinked' as const,
+          realizedPnl: 0,
+          unrealizedPnl: 0,
+          netPnl: 0,
+          outcome: 'pending' as const,
+          adjustmentCount: 0,
+          adjustmentEffectiveness: 'unreviewed' as const,
         }));
       if (additions.length === 0) return current;
       return [...additions, ...current];
     });
   }, [blotter, regime.label]);
+
+  useEffect(() => {
+    if (entries.length === 0) return;
+    setEntries((current) => current.map((entry) => {
+      const matchedPositions = livePositions.filter((position) => matchesPosition(entry, position));
+      const matchedOrders = orders.filter((row) => matchesOrder(entry, row));
+      const matchedTrades = trades.filter((row) => matchesOrder(entry, row));
+      const realizedPnl = matchedPositions.reduce((sum, position) => sum + (position.realizedPnl ?? 0), 0);
+      const unrealizedPnl = matchedPositions.reduce((sum, position) => sum + (position.unrealizedPnl ?? position.mtmPnl), 0);
+      const netPnl = realizedPnl + unrealizedPnl;
+      const linkedPositionStatus = matchedPositions.length > 0 ? 'open' as const : (
+        (matchedOrders.length > 0 || matchedTrades.length > 0) ? 'closed' as const : 'unlinked' as const
+      );
+      const nextAdjustmentCount = deriveAdjustmentCount(entry, matchedPositions);
+      const nextEntry: SellerJournalEntry = {
+        ...entry,
+        linkedPositionIds: matchedPositions.map((position) => position.id),
+        linkedOrderIds: matchedOrders.map((row) => row.order_id),
+        linkedTradeIds: matchedTrades.map((row) => row.order_id),
+        linkedPositionStatus,
+        realizedPnl,
+        unrealizedPnl,
+        netPnl,
+        outcome: deriveOutcome({
+          ...entry,
+          linkedOrderIds: matchedOrders.map((row) => row.order_id),
+          linkedTradeIds: matchedTrades.map((row) => row.order_id),
+          netPnl,
+        }, matchedPositions.length > 0),
+        closedAt: matchedPositions.length === 0 && (matchedOrders.length > 0 || matchedTrades.length > 0)
+          ? (entry.closedAt ?? Date.now())
+          : undefined,
+        lastSyncedAt: Date.now(),
+        adjustmentCount: nextAdjustmentCount,
+      };
+      return {
+        ...nextEntry,
+        adjustmentEffectiveness: deriveAdjustmentEffectiveness(nextEntry, entry.netPnl),
+      };
+    }));
+  }, [entries.length, livePositions, orders, trades]);
 
   const value = useMemo<JournalStoreValue>(() => ({
     entries,

@@ -97,7 +97,7 @@ function mergeValidation(
   };
 }
 
-function buildBackendLegPayload(legs: OptionLeg[]) {
+export function buildBackendLegPayload(legs: OptionLeg[]) {
   const cfg = SYMBOL_CONFIG[legs[0].symbol];
   return legs.map((leg) => ({
     stock_code: cfg.breezeStockCode,

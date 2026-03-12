@@ -75,6 +75,21 @@ export function JournalWorkspace() {
               ))}
             </div>
           </div>
+          <div className="rounded-3xl border border-white/8 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Outcomes and repairs</div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {summary.analytics.entriesByOutcome.map((bucket) => (
+                <div key={bucket.label} className="rounded-full border border-white/10 bg-black/15 px-3 py-2 text-xs text-slate-300">
+                  {bucket.label} · {bucket.count}
+                </div>
+              ))}
+              {summary.analytics.adjustmentEffectiveness.map((bucket) => (
+                <div key={bucket.label} className="rounded-full border border-white/10 bg-black/15 px-3 py-2 text-xs text-slate-300">
+                  repair {bucket.label} · {bucket.count}
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
 
         <div className="mt-5 space-y-3">
@@ -106,6 +121,10 @@ export function JournalWorkspace() {
               <div className="mt-3 flex items-center justify-between text-xs text-slate-400">
                 <span>Credit {fmtPnL(entry.expectedCredit)}</span>
                 <span>{entry.source === 'execution' ? `Execution ${entry.executionStatus}` : `Rules ${entry.automationRuleIds.length}`}</span>
+              </div>
+              <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
+                <span>Outcome {entry.outcome}</span>
+                <span>Net {fmtPnL(entry.netPnl)}</span>
               </div>
             </button>
           ))}
@@ -148,6 +167,27 @@ export function JournalWorkspace() {
 
             <div className="mt-3 rounded-3xl border border-white/8 bg-white/5 px-4 py-3 text-xs text-slate-300">
               Source: {selectedEntry.source === 'execution' ? `Execution blotter ${selectedEntry.executionStatus ?? 'captured'}` : 'Manual opportunity capture'}
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-3">
+              <div className="rounded-2xl bg-white/5 px-3 py-3 text-xs text-slate-300">
+                <div className="text-slate-500">Linked positions / orders / trades</div>
+                <div className="mt-1 text-white">
+                  {selectedEntry.linkedPositionIds.length} / {selectedEntry.linkedOrderIds.length} / {selectedEntry.linkedTradeIds.length}
+                </div>
+                <div className="mt-1 text-slate-400">{selectedEntry.linkedPositionStatus}</div>
+              </div>
+              <div className="rounded-2xl bg-white/5 px-3 py-3 text-xs text-slate-300">
+                <div className="text-slate-500">P&L sync</div>
+                <div className="mt-1 text-white">Realized {fmtPnL(selectedEntry.realizedPnl)}</div>
+                <div className="text-white">Unrealized {fmtPnL(selectedEntry.unrealizedPnl)}</div>
+                <div className="text-slate-400">Net {fmtPnL(selectedEntry.netPnl)}</div>
+              </div>
+              <div className="rounded-2xl bg-white/5 px-3 py-3 text-xs text-slate-300">
+                <div className="text-slate-500">Adjustments</div>
+                <div className="mt-1 text-white">{selectedEntry.adjustmentCount} detected</div>
+                <div className="text-slate-400">{selectedEntry.adjustmentEffectiveness}</div>
+              </div>
             </div>
 
             <div className="mt-5 grid gap-3">
@@ -240,6 +280,26 @@ export function JournalWorkspace() {
                     <div className="text-slate-500">Mistake cluster</div>
                     <div className="mt-1 text-white">
                       {selectedEntry.mistakeTags.length > 0 ? selectedEntry.mistakeTags.join(' | ') : 'No tags on this review yet'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-300">
+                <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Outcome analytics</div>
+                <div className="mt-3 grid gap-3 lg:grid-cols-3">
+                  <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                    <div className="text-slate-500">Outcome</div>
+                    <div className="mt-1 text-white">{selectedEntry.outcome}</div>
+                  </div>
+                  <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                    <div className="text-slate-500">Adjustment effectiveness</div>
+                    <div className="mt-1 text-white">{selectedEntry.adjustmentEffectiveness}</div>
+                  </div>
+                  <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                    <div className="text-slate-500">Last synced</div>
+                    <div className="mt-1 text-white">
+                      {selectedEntry.lastSyncedAt ? new Date(selectedEntry.lastSyncedAt).toLocaleString() : 'Not synced yet'}
                     </div>
                   </div>
                 </div>

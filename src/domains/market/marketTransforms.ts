@@ -152,49 +152,123 @@ export function mapBreezePositions(data: unknown): Position[] {
   const payload = data as { positions?: unknown[] } | null;
   if (!payload?.positions) return [];
 
-  const positions: Position[] = [];
-  (payload.positions as Array<Record<string, string>>).forEach((position, index) => {
+  const grouped = new Map<string, Position>();
+  const numeric = (value: unknown, fallback = 0) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const readFirst = (row: Record<string, unknown>, keys: string[], fallback = 0) => {
+    const match = keys.find((key) => row[key] !== undefined && row[key] !== null && row[key] !== '');
+    return numeric(match ? row[match] : undefined, fallback);
+  };
+
+  (payload.positions as Array<Record<string, unknown>>).forEach((position, index) => {
     const isOptions = !!(position.right || position.strike_price);
     if (!isOptions) return;
+    const stockCode = String(position.stock_code || '');
+    const rawAction = String(position.action || position.transaction_type || '');
+    const rawRight = String(position.right || '');
 
     const symbol: SymbolCode =
-      (position.stock_code || '').includes('SENSEX') || (position.stock_code || '').includes('BSESEN')
+      stockCode.includes('SENSEX') || stockCode.includes('BSESEN')
         ? 'BSESEN'
         : 'NIFTY';
 
-    const action = (position.action || position.transaction_type || '').toLowerCase().startsWith('b') ? 'BUY' : 'SELL';
-    const type: 'CE' | 'PE' = (position.right || '').toLowerCase().startsWith('c') ? 'CE' : 'PE';
-    const strike = parseFloat(position.strike_price || '0');
-    const entryPrice = parseFloat(position.average_price || '0');
-    const currentPrice = parseFloat(position.ltp || position.current_price || String(entryPrice));
-    const quantity = parseInt(position.quantity || '1', 10);
+    const action: 'BUY' | 'SELL' = rawAction.toLowerCase().startsWith('b') ? 'BUY' : 'SELL';
+    const type: 'CE' | 'PE' = rawRight.toLowerCase().startsWith('c') ? 'CE' : 'PE';
+    const strike = numeric(position.strike_price);
+    const entryPrice = readFirst(position, ['average_price', 'avg_price']);
+    const currentPrice = readFirst(position, ['ltp', 'current_price', 'close_price'], entryPrice);
+    const quantity = Math.max(1, Math.abs(Math.round(readFirst(position, ['quantity', 'net_quantity', 'net_qty'], 1))));
     const lotSize = SYMBOL_CONFIG[symbol].lotSize;
     const lots = Math.max(1, Math.round(quantity / lotSize));
-    const pnl = (action === 'BUY' ? 1 : -1) * (currentPrice - entryPrice) * quantity;
-
-    positions.push({
-      id: `live-${index}`,
+    const realizedPnl = readFirst(position, ['realised_pnl', 'realized_pnl', 'booked_profit_loss', 'realized_mtm']);
+    const unrealizedPnl = readFirst(
+      position,
+      ['unrealised_pnl', 'unrealized_pnl', 'open_profit_loss', 'open_mtm'],
+      (action === 'BUY' ? 1 : -1) * (currentPrice - entryPrice) * quantity,
+    );
+    const pnl = readFirst(position, ['pnl', 'mtm', 'total_pnl'], realizedPnl + unrealizedPnl);
+    const expiry = String(position.expiry_date || '');
+    const bucketKey = [
       symbol,
-      expiry: position.expiry_date || '',
-      strategy: `${symbol} ${type} ${strike}`,
-      entryDate: position.order_date || new Date().toISOString().slice(0, 10),
-      status: 'ACTIVE',
-      mtmPnl: Math.round(pnl),
-      maxProfit: Infinity,
-      maxLoss: -Infinity,
-      legs: [{
-        type,
-        strike,
-        action,
-        lots,
-        entryPrice,
-        currentPrice,
-        pnl: Math.round(pnl),
-      }],
-    });
+      expiry,
+      position.product || 'options',
+      position.strategy_id || position.position_set || position.client_order_id || 'group',
+    ].join('|');
+    const brokerOrderId = String(position.order_id || position.parent_order_id || '');
+    const brokerTradeId = String(position.trade_id || '');
+
+    const existing = grouped.get(bucketKey);
+    const nextLeg = {
+      id: `live-leg-${index}`,
+      type,
+      strike,
+      action,
+      lots,
+      quantity,
+      entryPrice,
+      currentPrice,
+      pnl: Math.round(pnl),
+      realizedPnl: Math.round(realizedPnl),
+      unrealizedPnl: Math.round(unrealizedPnl),
+      brokerLegKey: String(position.position_key || position.leg_id || `${bucketKey}-${type}-${strike}-${action}`),
+      orderId: brokerOrderId || undefined,
+      tradeId: brokerTradeId || undefined,
+    };
+
+    if (!existing) {
+      grouped.set(bucketKey, {
+        id: `live-${bucketKey.replace(/[^a-zA-Z0-9]+/g, '-').toLowerCase()}`,
+        symbol,
+        expiry,
+        strategy: `${symbol} ${expiry || 'live'} strategy`,
+        entryDate: String(position.order_date || position.trade_date || new Date().toISOString().slice(0, 10)),
+        status: 'ACTIVE',
+        mtmPnl: Math.round(pnl),
+        realizedPnl: Math.round(realizedPnl),
+        unrealizedPnl: Math.round(unrealizedPnl),
+        brokerPositionKey: bucketKey,
+        brokerOrderIds: brokerOrderId ? [brokerOrderId] : [],
+        brokerTradeIds: brokerTradeId ? [brokerTradeId] : [],
+        maxProfit: Infinity,
+        maxLoss: -Infinity,
+        legs: [nextLeg],
+      });
+      return;
+    }
+
+    existing.legs.push(nextLeg);
+    existing.mtmPnl += Math.round(pnl);
+    existing.realizedPnl = (existing.realizedPnl ?? 0) + Math.round(realizedPnl);
+    existing.unrealizedPnl = (existing.unrealizedPnl ?? 0) + Math.round(unrealizedPnl);
+    if (brokerOrderId && !existing.brokerOrderIds?.includes(brokerOrderId)) {
+      existing.brokerOrderIds = [...(existing.brokerOrderIds ?? []), brokerOrderId];
+    }
+    if (brokerTradeId && !existing.brokerTradeIds?.includes(brokerTradeId)) {
+      existing.brokerTradeIds = [...(existing.brokerTradeIds ?? []), brokerTradeId];
+    }
   });
 
-  return positions;
+  return [...grouped.values()].map((position) => ({
+    ...position,
+    strategy: inferStrategyName(position),
+  }));
+}
+
+function inferStrategyName(position: Position) {
+  const sellCalls = position.legs.filter((leg) => leg.action === 'SELL' && leg.type === 'CE').length;
+  const sellPuts = position.legs.filter((leg) => leg.action === 'SELL' && leg.type === 'PE').length;
+  const buyCalls = position.legs.filter((leg) => leg.action === 'BUY' && leg.type === 'CE').length;
+  const buyPuts = position.legs.filter((leg) => leg.action === 'BUY' && leg.type === 'PE').length;
+
+  if (sellCalls > 0 && sellPuts > 0 && buyCalls > 0 && buyPuts > 0) return 'Iron Condor';
+  if (sellCalls > 0 && sellPuts > 0 && buyCalls === 0 && buyPuts === 0) return 'Short Strangle';
+  if (sellCalls > 0 && buyCalls > 0 && sellPuts === 0 && buyPuts === 0) return 'Bear Call Spread';
+  if (sellPuts > 0 && buyPuts > 0 && sellCalls === 0 && buyCalls === 0) return 'Bull Put Spread';
+  if (sellCalls > 0 && buyCalls === 0 && sellPuts === 0 && buyPuts === 0) return 'Short Call';
+  if (sellPuts > 0 && buyPuts === 0 && sellCalls === 0 && buyCalls === 0) return 'Short Put';
+  return `${position.legs.length}-leg live structure`;
 }
 
 export function updateIndicesWithSpot(indices: MarketIndex[], symbol: SymbolCode, spotPrice: number, dayOpen: number | undefined): MarketIndex[] {

@@ -95,19 +95,31 @@ export interface Position {
   entryDate: string;
   status:    'ACTIVE' | 'DRAFT' | 'CLOSED';
   mtmPnl:    number;
+  realizedPnl?: number;
+  unrealizedPnl?: number;
+  brokerPositionKey?: string;
+  brokerOrderIds?: string[];
+  brokerTradeIds?: string[];
   maxProfit: number;
   maxLoss:   number;
   legs:      PositionLeg[];
 }
 
 export interface PositionLeg {
+  id?:          string;
   type:         'CE' | 'PE';
   strike:       number;
   action:       'BUY' | 'SELL';
   lots:         number;
+  quantity?:    number;
   entryPrice:   number;
   currentPrice: number;
   pnl:          number;
+  realizedPnl?: number;
+  unrealizedPnl?: number;
+  brokerLegKey?: string;
+  orderId?: string;
+  tradeId?: string;
 }
 
 export interface MarketIndex {
@@ -395,6 +407,19 @@ export interface SellerJournalEntry {
   sourceOpportunityId?: string;
   sourceBlotterId?: string;
   executionStatus?: ExecutionBlotterItem['status'];
+  legsSnapshot?: OptionLeg[];
+  linkedPositionIds: string[];
+  linkedOrderIds: string[];
+  linkedTradeIds: string[];
+  linkedPositionStatus: 'unlinked' | 'open' | 'closed';
+  realizedPnl: number;
+  unrealizedPnl: number;
+  netPnl: number;
+  closedAt?: number;
+  lastSyncedAt?: number;
+  outcome: 'pending' | 'open' | 'closed_win' | 'closed_loss' | 'flat';
+  adjustmentCount: number;
+  adjustmentEffectiveness: 'unreviewed' | 'improving' | 'worsening' | 'flat';
 }
 
 export interface SellerJournalAnalyticsBucket {
@@ -407,6 +432,9 @@ export interface SellerJournalAnalytics {
   entriesByStructure: SellerJournalAnalyticsBucket[];
   entriesByRegime: SellerJournalAnalyticsBucket[];
   mistakeClusters: SellerJournalAnalyticsBucket[];
+  entriesByOutcome: SellerJournalAnalyticsBucket[];
+  adjustmentEffectiveness: SellerJournalAnalyticsBucket[];
+  netPnlByStructure: Array<{ label: string; value: number }>;
 }
 
 export interface SellerJournalSummary {
@@ -426,11 +454,27 @@ export interface AdjustmentSnapshot {
   breakevens: number[];
   lots: number;
   stressedLegs: string[];
+  realizedPnl?: number;
+  unrealizedPnl?: number;
+  netPnl?: number;
+}
+
+export interface AdjustmentPreviewDelta {
+  status: 'idle' | 'loading' | 'ready' | 'fallback';
+  source: 'backend' | 'estimated';
+  premiumDelta: number;
+  feeDelta: number;
+  marginDelta: number;
+  resultingMargin: number;
+  resultingMaxLoss: number;
+  notes: string[];
 }
 
 export interface AdjustmentSuggestion {
   id: string;
   positionId: string;
+  strategyFamily: 'short_strangle' | 'short_straddle' | 'iron_condor' | 'vertical_spread' | 'single_leg_short' | 'custom';
+  repairType: 'roll_tested_side' | 'roll_spread_wider' | 'add_wings' | 'close_tested_side' | 'flatten_all' | 'recenter_structure' | 'reduce_winning_side';
   title: string;
   rationale: string;
   trigger: string;
@@ -441,6 +485,7 @@ export interface AdjustmentSuggestion {
   legsBefore: OptionLeg[];
   legsAfter: OptionLeg[];
   repairLegs: OptionLeg[];
+  previewDelta: AdjustmentPreviewDelta;
 }
 
 export interface AutomationRule {

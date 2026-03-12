@@ -126,14 +126,31 @@ export function RiskWorkspace() {
                   <div className="text-slate-500">Before</div>
                   <div className="mt-1">Credit {fmtPnL(suggestion.current.netCredit)}</div>
                   <div>Max loss {fmtPnL(suggestion.current.maxLoss)}</div>
+                  <div>MTM {fmtPnL(suggestion.current.netPnl ?? 0)}</div>
                   <div>Breakevens {suggestion.current.breakevens.length > 0 ? suggestion.current.breakevens.join(', ') : 'None'}</div>
                 </div>
                 <div className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
                   <div className="text-slate-500">After</div>
                   <div className="mt-1">Credit {fmtPnL(suggestion.proposed.netCredit)}</div>
                   <div>Max loss {fmtPnL(suggestion.proposed.maxLoss)}</div>
+                  <div>MTM carry {fmtPnL(suggestion.proposed.netPnl ?? 0)}</div>
                   <div>Breakevens {suggestion.proposed.breakevens.length > 0 ? suggestion.proposed.breakevens.join(', ') : 'Flat'}</div>
                 </div>
+              </div>
+              <div className="mt-3 rounded-2xl border border-white/8 bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                <div className="text-slate-500">Repair delta</div>
+                <div className="mt-1">
+                  Premium {fmtPnL(suggestion.previewDelta.premiumDelta)} · Fees {fmtPnL(-suggestion.previewDelta.feeDelta)} · Margin {fmtPnL(-suggestion.previewDelta.marginDelta)}
+                </div>
+                <div className="mt-1">
+                  Resulting margin {fmtPnL(-suggestion.previewDelta.resultingMargin)} · Resulting max loss {fmtPnL(suggestion.previewDelta.resultingMaxLoss)}
+                </div>
+                <div className="mt-1 text-slate-400">
+                  Source {suggestion.previewDelta.source === 'backend' ? 'broker preview' : 'local estimate'} · Status {suggestion.previewDelta.status}
+                </div>
+                {suggestion.previewDelta.notes.length > 0 && (
+                  <div className="mt-2 text-slate-400">{suggestion.previewDelta.notes.join(' | ')}</div>
+                )}
               </div>
               <div className="mt-3 text-xs text-slate-400">
                 Stressed legs: {suggestion.current.stressedLegs.join(' | ')}
