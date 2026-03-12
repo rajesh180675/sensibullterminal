@@ -270,11 +270,25 @@ export interface AutomationRule {
   notes?: string;
   symbol?: SymbolCode;
   triggerConfig?: {
-    type: 'spot_range_break' | 'mtm_drawdown' | 'manual';
+    type:
+      | 'spot_range_break'
+      | 'spot_cross_above'
+      | 'spot_cross_below'
+      | 'spot_pct_move'
+      | 'mtm_drawdown'
+      | 'mtm_profit_target'
+      | 'position_net_quantity_below'
+      | 'position_net_quantity_above'
+      | 'manual';
     referencePrice?: number;
     lowerPrice?: number;
     upperPrice?: number;
+    thresholdPrice?: number;
+    movePercent?: number;
+    direction?: 'up' | 'down' | 'either';
     maxDrawdown?: number;
+    profitTarget?: number;
+    netQuantity?: number;
   };
   actionConfig?: {
     type: 'execute_strategy' | 'notify' | 'suggest_hedge';
@@ -299,7 +313,7 @@ export interface AutomationCallbackEvent {
   ruleId: string;
   ruleName: string;
   kind: AutomationRule['kind'];
-  eventType: 'triggered' | 'executed' | 'failed' | 'status_changed' | 'created' | 'manual';
+  eventType: 'triggered' | 'executed' | 'failed' | 'status_changed' | 'created' | 'updated' | 'deleted' | 'manual' | 'webhook';
   status: 'success' | 'warning' | 'error' | 'info';
   message: string;
   timestamp: number;

@@ -394,6 +394,10 @@ class AutomationRuleManager:
                 return rule
         return None
 
+    @staticmethod
+    def _normalise_status(status: str) -> str:
+        return status if status in {"active", "paused", "draft"} else "draft"
+
     def _build_event(
         self,
         rule: dict,
@@ -424,44 +428,108 @@ class AutomationRuleManager:
         with self._lock:
             return list(self._callbacks)[: max(1, min(limit, len(self._callbacks) or 1))]
 
-    def create_rule(self, payload: dict) -> dict:
+    def _sanitize_trigger_config(self, trigger_config: Any) -> dict:
+        if not isinstance(trigger_config, dict):
+            return {"type": "manual"}
+        trigger_type = str(trigger_config.get("type") or "manual")
+        config = {"type": trigger_type}
+        for key in (
+            "referencePrice",
+            "lowerPrice",
+            "upperPrice",
+            "thresholdPrice",
+            "movePercent",
+            "maxDrawdown",
+            "profitTarget",
+            "netQuantity",
+        ):
+            if key in trigger_config:
+                config[key] = _safe_float(trigger_config.get(key))
+        if "direction" in trigger_config:
+            config["direction"] = str(trigger_config.get("direction") or "either")
+        return config
+
+    def _sanitize_action_config(self, action_config: Any) -> dict:
+        if not isinstance(action_config, dict):
+            return {"type": "notify"}
+        config = {
+            "type": str(action_config.get("type") or "notify"),
+        }
+        if "message" in action_config:
+            config["message"] = str(action_config.get("message") or "")
+        if isinstance(action_config.get("legs"), list):
+            config["legs"] = action_config.get("legs")
+        return config
+
+    def _build_rule(self, payload: dict, existing: Optional[dict] = None) -> dict:
         now = self._now_ts()
-        rule = {
-            "id": str(payload.get("id") or f"rule-{int(now * 1000)}"),
-            "name": str(payload.get("name") or "Automation rule"),
-            "kind": str(payload.get("kind") or "gtt"),
-            "status": str(payload.get("status") or "draft"),
-            "scope": str(payload.get("scope") or "Strategy workspace"),
-            "trigger": str(payload.get("trigger") or "Manual review required"),
-            "action": str(payload.get("action") or "Notify operator"),
-            "lastRun": str(payload.get("lastRun") or "Never"),
-            "nextRun": str(payload.get("nextRun") or "Live"),
-            "notes": str(payload.get("notes") or ""),
-            "symbol": str(payload.get("symbol") or ""),
-            "triggerConfig": payload.get("triggerConfig") or {"type": "manual"},
-            "actionConfig": payload.get("actionConfig") or {"type": "notify"},
-            "runCount": int(payload.get("runCount") or 0),
+        prior = existing or {}
+        symbol = str(payload.get("symbol") or prior.get("symbol") or "NIFTY").upper()
+        return {
+            "id": str(payload.get("id") or prior.get("id") or f"rule-{int(now * 1000)}"),
+            "name": str(payload.get("name") or prior.get("name") or "Automation rule"),
+            "kind": str(payload.get("kind") or prior.get("kind") or "gtt"),
+            "status": self._normalise_status(str(payload.get("status") or prior.get("status") or "draft")),
+            "scope": str(payload.get("scope") or prior.get("scope") or "Strategy workspace"),
+            "trigger": str(payload.get("trigger") or prior.get("trigger") or "Manual review required"),
+            "action": str(payload.get("action") or prior.get("action") or "Notify operator"),
+            "lastRun": str(payload.get("lastRun") or prior.get("lastRun") or "Never"),
+            "nextRun": str(payload.get("nextRun") or prior.get("nextRun") or "Live"),
+            "notes": str(payload.get("notes") or prior.get("notes") or ""),
+            "symbol": symbol,
+            "triggerConfig": self._sanitize_trigger_config(payload.get("triggerConfig", prior.get("triggerConfig"))),
+            "actionConfig": self._sanitize_action_config(payload.get("actionConfig", prior.get("actionConfig"))),
+            "runCount": int(payload.get("runCount") or prior.get("runCount") or 0),
             "updatedAt": now,
         }
+
+    def create_rule(self, payload: dict) -> dict:
+        rule = self._build_rule(payload)
         with self._lock:
             self._state.setdefault("rules", []).insert(0, rule)
             self._append_event_locked(self._build_event(rule, "created", "info", "Automation rule created."))
             self._persist_locked()
             return dict(rule)
 
+    def update_rule(self, rule_id: str, payload: dict) -> Optional[dict]:
+        with self._lock:
+            rule = self._find_rule_locked(rule_id)
+            if not rule:
+                return None
+            updated = self._build_rule(payload, rule)
+            rule.clear()
+            rule.update(updated)
+            self._append_event_locked(self._build_event(rule, "updated", "info", "Automation rule updated."))
+            self._persist_locked()
+            return dict(rule)
+
+    def delete_rule(self, rule_id: str) -> Optional[dict]:
+        with self._lock:
+            rules = self._state.setdefault("rules", [])
+            for index, rule in enumerate(rules):
+                if str(rule.get("id")) != rule_id:
+                    continue
+                removed = rules.pop(index)
+                tombstone = dict(removed)
+                tombstone["status"] = "paused"
+                self._append_event_locked(self._build_event(tombstone, "deleted", "info", "Automation rule deleted."))
+                self._persist_locked()
+                return dict(removed)
+        return None
+
     def update_rule_status(self, rule_id: str, status: str) -> Optional[dict]:
         with self._lock:
             rule = self._find_rule_locked(rule_id)
             if not rule:
                 return None
-            rule["status"] = status
+            rule["status"] = self._normalise_status(status)
             rule["updatedAt"] = self._now_ts()
             rule["nextRun"] = "Live" if status == "active" else "Paused"
             self._append_event_locked(self._build_event(rule, "status_changed", "info", f"Rule status changed to {status}.", meta={"status": status}))
             self._persist_locked()
             return dict(rule)
 
-    def receive_callback(self, payload: dict) -> dict:
+    def receive_callback(self, payload: dict, source: str = "manual") -> dict:
         rule_id = str(payload.get("ruleId") or payload.get("rule_id") or "")
         with self._lock:
             rule = self._find_rule_locked(rule_id) or {
@@ -471,11 +539,15 @@ class AutomationRuleManager:
             }
             event = self._build_event(
                 rule,
-                str(payload.get("eventType") or payload.get("event_type") or "manual"),
+                str(payload.get("eventType") or payload.get("event_type") or ("webhook" if source == "webhook" else "manual")),
                 str(payload.get("status") or "info"),
                 str(payload.get("message") or "Manual automation callback received."),
                 broker_results=payload.get("brokerResults") or payload.get("broker_results") or [],
-                meta=payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
+                meta={
+                    **(payload.get("meta") if isinstance(payload.get("meta"), dict) else {}),
+                    "source": source,
+                    "payload": payload,
+                },
             )
             self._append_event_locked(event)
             self._persist_locked()
@@ -514,6 +586,47 @@ class AutomationRuleManager:
             log.warning(f"[Automation] spot fetch failed: {exc}")
         return 0.0
 
+    @staticmethod
+    def _parse_numeric(value: Any) -> float:
+        return _safe_float(value)
+
+    def _fetch_position_metrics(self, symbol: str) -> dict:
+        snapshot = {"symbol": symbol.upper(), "mtm": 0.0, "netQuantity": 0.0, "positionsCount": 0}
+        if not self.engine.connected:
+            return snapshot
+        try:
+            positions_payload = self.engine.get_positions()
+        except Exception as exc:
+            log.warning(f"[Automation] positions fetch failed: {exc}")
+            return snapshot
+
+        positions = positions_payload.get("positions", []) if isinstance(positions_payload, dict) else []
+        for row in positions:
+            if not isinstance(row, dict):
+                continue
+            stock_code = str(row.get("stock_code") or row.get("stockCode") or row.get("stock") or "").upper()
+            if stock_code and stock_code != symbol.upper():
+                continue
+            mtm = 0.0
+            for field in ("pnl", "mtm", "m2m", "unrealized_profit_loss", "booked_pnl"):
+                value = self._parse_numeric(row.get(field))
+                if value != 0:
+                    mtm = value
+                    break
+            quantity = 0.0
+            for field in ("quantity", "net_quantity", "net_qty", "open_quantity"):
+                value = self._parse_numeric(row.get(field))
+                if value != 0:
+                    quantity = value
+                    break
+            action = str(row.get("action") or row.get("transaction_type") or "").lower()
+            if quantity > 0 and action == "sell":
+                quantity *= -1
+            snapshot["mtm"] += mtm
+            snapshot["netQuantity"] += quantity
+            snapshot["positionsCount"] += 1
+        return snapshot
+
     def _trigger_status(self, rule: dict) -> tuple[bool, str, dict]:
         trigger = rule.get("triggerConfig") or {}
         trigger_type = str(trigger.get("type") or "manual")
@@ -531,10 +644,66 @@ class AutomationRuleManager:
             if upper_price > 0 and spot >= upper_price:
                 return True, f"Spot {spot:.2f} broke above {upper_price:.2f}.", {"spot": spot, "threshold": upper_price, "direction": "up"}
             return False, f"Spot {spot:.2f} remains inside rule range.", {"spot": spot, "lowerPrice": lower_price, "upperPrice": upper_price}
+        if trigger_type == "spot_cross_above":
+            spot = self._fetch_spot(symbol)
+            threshold = _safe_float(trigger.get("thresholdPrice"))
+            if spot <= 0:
+                return False, "Spot price unavailable.", {"spot": spot}
+            return (
+                threshold > 0 and spot >= threshold,
+                f"Spot {spot:.2f} vs cross-above level {threshold:.2f}.",
+                {"spot": spot, "threshold": threshold, "direction": "up"},
+            )
+        if trigger_type == "spot_cross_below":
+            spot = self._fetch_spot(symbol)
+            threshold = _safe_float(trigger.get("thresholdPrice"))
+            if spot <= 0:
+                return False, "Spot price unavailable.", {"spot": spot}
+            return (
+                threshold > 0 and spot <= threshold,
+                f"Spot {spot:.2f} vs cross-below level {threshold:.2f}.",
+                {"spot": spot, "threshold": threshold, "direction": "down"},
+            )
+        if trigger_type == "spot_pct_move":
+            spot = self._fetch_spot(symbol)
+            reference = _safe_float(trigger.get("referencePrice"))
+            move_percent = abs(_safe_float(trigger.get("movePercent")))
+            direction = str(trigger.get("direction") or "either").lower()
+            if spot <= 0 or reference <= 0 or move_percent <= 0:
+                return False, "Spot move reference unavailable.", {"spot": spot, "referencePrice": reference}
+            pct_move = ((spot - reference) / reference) * 100
+            hit = abs(pct_move) >= move_percent
+            if direction == "up":
+                hit = pct_move >= move_percent
+            elif direction == "down":
+                hit = pct_move <= -move_percent
+            return hit, f"Spot move {pct_move:.2f}% vs threshold {move_percent:.2f}%.", {
+                "spot": spot,
+                "referencePrice": reference,
+                "movePercent": move_percent,
+                "actualMovePercent": pct_move,
+                "direction": direction,
+            }
         if trigger_type == "mtm_drawdown":
+            metrics = self._fetch_position_metrics(symbol)
             threshold = _safe_float(trigger.get("maxDrawdown"))
-            current = _safe_float(trigger.get("currentMtm"))
-            return current <= threshold, f"Estimated MTM {current:.2f} vs threshold {threshold:.2f}.", {"estimatedMtm": current, "threshold": threshold}
+            current = _safe_float(metrics.get("mtm"))
+            return current <= threshold, f"Live MTM {current:.2f} vs drawdown threshold {threshold:.2f}.", {**metrics, "threshold": threshold}
+        if trigger_type == "mtm_profit_target":
+            metrics = self._fetch_position_metrics(symbol)
+            threshold = _safe_float(trigger.get("profitTarget"))
+            current = _safe_float(metrics.get("mtm"))
+            return current >= threshold, f"Live MTM {current:.2f} vs profit target {threshold:.2f}.", {**metrics, "threshold": threshold}
+        if trigger_type == "position_net_quantity_below":
+            metrics = self._fetch_position_metrics(symbol)
+            threshold = _safe_float(trigger.get("netQuantity"))
+            current = _safe_float(metrics.get("netQuantity"))
+            return current <= threshold, f"Live net quantity {current:.0f} vs floor {threshold:.0f}.", {**metrics, "threshold": threshold}
+        if trigger_type == "position_net_quantity_above":
+            metrics = self._fetch_position_metrics(symbol)
+            threshold = _safe_float(trigger.get("netQuantity"))
+            current = _safe_float(metrics.get("netQuantity"))
+            return current >= threshold, f"Live net quantity {current:.0f} vs ceiling {threshold:.0f}.", {**metrics, "threshold": threshold}
         return False, f"Unsupported trigger type {trigger_type}.", {"triggerType": trigger_type}
 
     def _normalise_action_legs(self, rule: dict) -> List[dict]:
@@ -1576,6 +1745,7 @@ engine = BreezeEngine()
 # Default (no env var) → open, tunnel URL is the only "secret".
 BACKEND_AUTH_TOKEN = os.environ.get("TERMINAL_AUTH_TOKEN", "")
 AUTH_ENABLED       = bool(BACKEND_AUTH_TOKEN)
+AUTOMATION_WEBHOOK_SECRET = os.environ.get("BREEZE_AUTOMATION_WEBHOOK_SECRET", "")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1605,6 +1775,18 @@ def _is_authed(request: Request) -> bool:
     return token == BACKEND_AUTH_TOKEN
 
 
+def _is_webhook_authed(request: Request) -> bool:
+    if not AUTOMATION_WEBHOOK_SECRET:
+        return False
+    token = (
+        request.headers.get("x-automation-webhook-secret") or
+        request.headers.get("X-Automation-Webhook-Secret") or
+        request.query_params.get("secret") or
+        ""
+    )
+    return token == AUTOMATION_WEBHOOK_SECRET
+
+
 @app.middleware("http")
 async def cors_everywhere(request: Request, call_next):
     if request.method == "OPTIONS":
@@ -1618,7 +1800,13 @@ async def cors_everywhere(request: Request, call_next):
             },
         )
 
-    if request.url.path.startswith("/api/") and not _is_authed(request):
+    if request.url.path.startswith("/api/automation/callbacks/webhook"):
+        if not (_is_authed(request) or _is_webhook_authed(request)):
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "error": "Unauthorized — missing automation webhook secret"},
+            )
+    elif request.url.path.startswith("/api/") and not _is_authed(request):
         return JSONResponse(
             status_code=401,
             content={"success": False, "error": "Unauthorized — missing/invalid X-Terminal-Auth"},
@@ -2066,6 +2254,26 @@ async def api_automation_create_rule(request: Request):
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
+@app.put("/api/automation/rules/{rule_id}")
+async def api_automation_update_rule(rule_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+    rule = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.update_rule, rule_id, body)
+    if not rule:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Rule not found"})
+    return {"success": True, "rule": rule}
+
+
+@app.delete("/api/automation/rules/{rule_id}")
+async def api_automation_delete_rule(rule_id: str):
+    rule = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.delete_rule, rule_id)
+    if not rule:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Rule not found"})
+    return {"success": True, "rule": rule}
+
+
 @app.post("/api/automation/rules/{rule_id}/status")
 async def api_automation_update_rule_status(rule_id: str, request: Request):
     try:
@@ -2103,6 +2311,19 @@ async def api_automation_receive_callback(request: Request):
         return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
     try:
         event = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.receive_callback, body)
+        return {"success": True, "event": event}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+@app.post("/api/automation/callbacks/webhook")
+async def api_automation_receive_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+    try:
+        event = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.receive_callback, body, "webhook")
         return {"success": True, "event": event}
     except Exception as exc:
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})

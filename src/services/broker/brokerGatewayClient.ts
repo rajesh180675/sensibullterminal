@@ -5,6 +5,7 @@ import {
   checkBackendHealth,
   connectToBreeze,
   createAutomationRule,
+  deleteAutomationRule,
   evaluateAutomationRules,
   fetchAutomationCallbacks,
   fetchAutomationRules,
@@ -21,6 +22,7 @@ import {
   fetchTradeBook,
   isKaggleBackend,
   setTerminalAuthToken,
+  updateAutomationRule,
   updateAutomationRuleStatus,
 } from '../../utils/kaggleClient';
 import { setWsAuthToken, subscribeOptionChain } from '../../utils/breezeWs';
@@ -220,6 +222,12 @@ export const brokerGatewayClient = {
     },
     async createRule(session: BreezeSession, payload: Record<string, unknown>) {
       return createAutomationRule(session.proxyBase, payload);
+    },
+    async updateRule(session: BreezeSession, ruleId: string, payload: Record<string, unknown>) {
+      return updateAutomationRule(session.proxyBase, ruleId, payload);
+    },
+    async deleteRule(session: BreezeSession, ruleId: string) {
+      return deleteAutomationRule(session.proxyBase, ruleId);
     },
     async updateRuleStatus(session: BreezeSession, ruleId: string, status: 'active' | 'paused' | 'draft') {
       return updateAutomationRuleStatus(session.proxyBase, ruleId, status);

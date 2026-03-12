@@ -290,11 +290,25 @@ export interface BackendAutomationRule {
   notes?: string;
   symbol?: string;
   triggerConfig?: {
-    type: 'spot_range_break' | 'mtm_drawdown' | 'manual';
+    type:
+      | 'spot_range_break'
+      | 'spot_cross_above'
+      | 'spot_cross_below'
+      | 'spot_pct_move'
+      | 'mtm_drawdown'
+      | 'mtm_profit_target'
+      | 'position_net_quantity_below'
+      | 'position_net_quantity_above'
+      | 'manual';
     referencePrice?: number;
     lowerPrice?: number;
     upperPrice?: number;
+    thresholdPrice?: number;
+    movePercent?: number;
+    direction?: 'up' | 'down' | 'either';
     maxDrawdown?: number;
+    profitTarget?: number;
+    netQuantity?: number;
   };
   actionConfig?: {
     type: 'execute_strategy' | 'notify' | 'suggest_hedge';
@@ -310,7 +324,7 @@ export interface BackendAutomationCallbackEvent {
   ruleId: string;
   ruleName: string;
   kind: BackendAutomationRule['kind'];
-  eventType: 'triggered' | 'executed' | 'failed' | 'status_changed' | 'created' | 'manual';
+  eventType: 'triggered' | 'executed' | 'failed' | 'status_changed' | 'created' | 'updated' | 'deleted' | 'manual' | 'webhook';
   status: 'success' | 'warning' | 'error' | 'info';
   message: string;
   timestamp: number;
@@ -785,6 +799,39 @@ export async function createAutomationRule(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+    });
+    return data.success ? { ok: true, rule: data.rule } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function updateAutomationRule(
+  backendUrl: string,
+  ruleId: string,
+  payload: Record<string, unknown>,
+): Promise<{ ok: boolean; rule?: BackendAutomationRule; error?: string }> {
+  const url = apiUrl(backendUrl, `/api/automation/rules/${encodeURIComponent(ruleId)}`);
+  try {
+    const data = await fetchJson<{ success: boolean; rule?: BackendAutomationRule; error?: string }>(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return data.success ? { ok: true, rule: data.rule } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function deleteAutomationRule(
+  backendUrl: string,
+  ruleId: string,
+): Promise<{ ok: boolean; rule?: BackendAutomationRule; error?: string }> {
+  const url = apiUrl(backendUrl, `/api/automation/rules/${encodeURIComponent(ruleId)}`);
+  try {
+    const data = await fetchJson<{ success: boolean; rule?: BackendAutomationRule; error?: string }>(url, {
+      method: 'DELETE',
     });
     return data.success ? { ok: true, rule: data.rule } : { ok: false, error: data.error };
   } catch (e) {

@@ -34,6 +34,8 @@ interface AutomationStoreValue {
   callbacks: AutomationCallbackEvent[];
   syncStatus: 'idle' | 'loading' | 'ready' | 'fallback';
   createRuleFromStrategy: () => Promise<void>;
+  saveRule: (rule: AutomationRule) => Promise<void>;
+  deleteRule: (id: string) => Promise<void>;
   toggleRuleStatus: (id: string) => Promise<void>;
   evaluateRules: () => Promise<void>;
 }
@@ -110,8 +112,10 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
         : 'Created locally. Connect a backend session to persist and evaluate it.',
       symbol,
       triggerConfig: {
-        type: 'spot_range_break',
+        type: 'spot_pct_move',
         referencePrice: spotPrice,
+        movePercent: 0.5,
+        direction: 'either',
         lowerPrice,
         upperPrice,
       },
@@ -165,6 +169,79 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
       setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
     }
   }, [backendReady, legs, notify, session, spotPrice, symbol]);
+
+  const saveRule = useCallback(async (rule: AutomationRule) => {
+    if (!rule.name.trim()) {
+      notify({
+        title: 'Rule name required',
+        message: 'Provide a rule name before saving.',
+        tone: 'warning',
+      });
+      return;
+    }
+
+    if (!session || !backendReady) {
+      setRules((existing) => {
+        const found = existing.some((item) => item.id === rule.id);
+        return found ? existing.map((item) => (item.id === rule.id ? rule : item)) : [rule, ...existing];
+      });
+      setSyncStatus('fallback');
+      return;
+    }
+
+    const result = await brokerGatewayClient.automation.updateRule(session, rule.id, rule as unknown as Record<string, unknown>);
+    if (!result.ok || !result.rule) {
+      notify({
+        title: 'Automation save failed',
+        message: result.error || 'Could not save automation rule.',
+        tone: 'error',
+      });
+      return;
+    }
+
+    setRules((existing) => existing.map((item) => (item.id === rule.id ? result.rule as AutomationRule : item)));
+    const callbackResult = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
+    if (callbackResult.ok) {
+      setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
+    }
+    notify({
+      title: 'Automation rule saved',
+      message: result.rule.name,
+      tone: 'success',
+    });
+  }, [backendReady, notify, session]);
+
+  const deleteRule = useCallback(async (id: string) => {
+    const current = rules.find((rule) => rule.id === id);
+    if (!current) return;
+
+    if (!session || !backendReady) {
+      setRules((existing) => existing.filter((rule) => rule.id !== id));
+      setSyncStatus('fallback');
+      return;
+    }
+
+    const result = await brokerGatewayClient.automation.deleteRule(session, id);
+    if (!result.ok) {
+      notify({
+        title: 'Automation delete failed',
+        message: result.error || 'Could not delete automation rule.',
+        tone: 'error',
+      });
+      return;
+    }
+
+    setRules((existing) => existing.filter((rule) => rule.id !== id));
+    const callbackResult = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
+    if (callbackResult.ok) {
+      setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
+    }
+    notify({
+      title: 'Automation rule deleted',
+      message: current.name,
+      tone: 'success',
+    });
+  }, [backendReady, notify, rules, session]);
 
   const toggleRuleStatus = useCallback(async (id: string) => {
     const current = rules.find((rule) => rule.id === id);
@@ -226,9 +303,11 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
     callbacks,
     syncStatus,
     createRuleFromStrategy,
+    saveRule,
+    deleteRule,
     toggleRuleStatus,
     evaluateRules,
-  }), [rules, callbacks, syncStatus, createRuleFromStrategy, toggleRuleStatus, evaluateRules]);
+  }), [rules, callbacks, syncStatus, createRuleFromStrategy, saveRule, deleteRule, toggleRuleStatus, evaluateRules]);
 
   return <AutomationStore.Provider value={value}>{children}</AutomationStore.Provider>;
 }
