@@ -12,7 +12,7 @@ import type {
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { UnifiedStreamingManager } from '../../services/streaming/unifiedStreamingManager';
 import { useNotificationStore } from '../../stores/notificationStore';
-import type { HistoricalCandle } from '../../utils/kaggleClient';
+import type { BackendMarketDepth, HistoricalCandle } from '../../utils/kaggleClient';
 import type { TickUpdate } from '../../utils/breezeWs';
 import { useSessionStore } from '../session/sessionStore';
 import {
@@ -21,7 +21,7 @@ import {
   mergeQuotesToChain,
   updateIndicesWithSpot,
 } from './marketTransforms';
-import { buildDepthFromChain, buildSyntheticCandles, buildWatchlist } from './marketDerived';
+import { buildWatchlist } from './marketDerived';
 
 interface MarketStoreValue {
   symbol: SymbolCode;
@@ -50,13 +50,14 @@ const DEFAULT_INTERVAL = '5minute';
 const streamingManager = new UnifiedStreamingManager();
 const MarketStore = createContext<MarketStoreValue | null>(null);
 
-function emptyDepth(): MarketDepthSnapshot {
+function emptyDepth(source: MarketDepthSnapshot['source'] = 'unavailable'): MarketDepthSnapshot {
   return {
     bids: [],
     asks: [],
     spread: 0,
     imbalance: 0,
     updatedAt: Date.now(),
+    source,
   };
 }
 
@@ -74,6 +75,50 @@ function chartRange(interval: string) {
   };
 }
 
+function mergeHistorical(existing: HistoricalCandle[], incoming: HistoricalCandle[]) {
+  const merged = new Map<string, HistoricalCandle>();
+  for (const candle of existing) merged.set(candle.datetime, candle);
+  for (const candle of incoming) merged.set(candle.datetime, candle);
+  return Array.from(merged.values())
+    .sort((left, right) => new Date(left.datetime).getTime() - new Date(right.datetime).getTime())
+    .slice(-240);
+}
+
+function resolveFocalDepthContract(chain: OptionRow[], spotPrice: number) {
+  if (chain.length === 0) return null;
+  const nearest = chain.reduce((best, row) => (
+    Math.abs(row.strike - spotPrice) < Math.abs(best.strike - spotPrice) ? row : best
+  ));
+  const useCall = nearest.ce_volume >= nearest.pe_volume;
+  return {
+    strikePrice: String(nearest.strike),
+    right: useCall ? 'call' as const : 'put' as const,
+    label: `${nearest.strike} ${useCall ? 'CE' : 'PE'}`,
+  };
+}
+
+function normalizeDepth(depth: BackendMarketDepth | undefined, fallbackLabel: string): MarketDepthSnapshot {
+  if (!depth) return emptyDepth();
+  return {
+    bids: (depth.bids ?? []).map((level) => ({
+      price: level.price,
+      quantity: level.quantity,
+      orders: level.orders ?? 1,
+    })),
+    asks: (depth.asks ?? []).map((level) => ({
+      price: level.price,
+      quantity: level.quantity,
+      orders: level.orders ?? 1,
+    })),
+    spread: depth.spread ?? 0,
+    imbalance: depth.imbalance ?? 0,
+    updatedAt: depth.updated_at ?? Date.now(),
+    instrumentLabel: depth.instrument_label ?? fallbackLabel,
+    contractKey: depth.contract_key,
+    source: 'backend',
+  };
+}
+
 export function MarketProvider({ children }: { children: React.ReactNode }) {
   const { notify } = useNotificationStore();
   const { session, setStatusMessage, setWsStatus } = useSessionStore();
@@ -88,20 +133,23 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
   const [liveIndices, setLiveIndices] = useState<MarketIndex[]>(MARKET_INDICES);
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([]);
   const [marketDepth, setMarketDepth] = useState<MarketDepthSnapshot>(() => emptyDepth());
-  const [historical, setHistorical] = useState<HistoricalCandle[]>(() => buildSyntheticCandles(SPOT_PRICES[DEFAULT_SYMBOL], DEFAULT_INTERVAL, DEFAULT_SYMBOL));
+  const [historical, setHistorical] = useState<HistoricalCandle[]>([]);
   const [chartInterval, setChartInterval] = useState(DEFAULT_INTERVAL);
   const [isHistoricalLoading, setIsHistoricalLoading] = useState(false);
 
   const currentChain = useRef<OptionRow[]>(chain);
   const currentSymbol = useRef<SymbolCode>(symbol);
   const currentSpot = useRef<number>(spotPrice);
+  const currentInterval = useRef<string>(chartInterval);
   const dayOpenBySymbol = useRef<Partial<Record<SymbolCode, number>>>({});
   const demoTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const skipNextExpiryReload = useRef<string | null>(null);
+  const lastDepthRefresh = useRef<number>(0);
 
   useEffect(() => { currentChain.current = chain; }, [chain]);
   useEffect(() => { currentSymbol.current = symbol; }, [symbol]);
   useEffect(() => { currentSpot.current = spotPrice; }, [spotPrice]);
+  useEffect(() => { currentInterval.current = chartInterval; }, [chartInterval]);
 
   const updateSpot = useCallback((nextSpot: number, nextSymbol = currentSymbol.current) => {
     SPOT_PRICES[nextSymbol] = nextSpot;
@@ -114,33 +162,80 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     setIsHistoricalLoading(true);
     try {
       if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) {
-        setHistorical(buildSyntheticCandles(currentSpot.current, chartInterval, symbol));
+        setHistorical([]);
         return;
       }
 
-      const { fromDate, toDate } = chartRange(chartInterval);
-      const result = await brokerGatewayClient.market.fetchHistorical(symbol, session, {
-        interval: chartInterval,
+      const { fromDate, toDate } = chartRange(currentInterval.current);
+      const result = await brokerGatewayClient.market.fetchHistorical(currentSymbol.current, session, {
+        interval: currentInterval.current,
         fromDate,
         toDate,
       });
 
-      if (result.ok && result.data.length > 0) {
+      if (result.ok) {
         setHistorical(result.data);
-      } else {
-        setHistorical(buildSyntheticCandles(currentSpot.current, chartInterval, symbol));
+        return;
       }
-    } catch (error) {
-      setHistorical(buildSyntheticCandles(currentSpot.current, chartInterval, symbol));
+
+      setHistorical([]);
       notify({
-        title: 'Historical reload fallback',
+        title: 'Historical unavailable',
+        message: result.error || 'No backend historical candles were returned.',
+        tone: 'warning',
+      });
+    } catch (error) {
+      setHistorical([]);
+      notify({
+        title: 'Historical reload failed',
         message: error instanceof Error ? error.message : String(error),
         tone: 'warning',
       });
     } finally {
       setIsHistoricalLoading(false);
     }
-  }, [chartInterval, notify, session, symbol]);
+  }, [notify, session]);
+
+  const refreshMarketDepth = useCallback(async (
+    force = false,
+    options?: { sessionOverride?: NonNullable<typeof session>; symbolOverride?: SymbolCode; expiryOverride?: ExpiryDate; chainOverride?: OptionRow[]; spotOverride?: number },
+  ) => {
+    const activeSession = options?.sessionOverride ?? session;
+    const activeSymbol = options?.symbolOverride ?? currentSymbol.current;
+    const activeExpiry = options?.expiryOverride ?? expiry;
+    const activeChain = options?.chainOverride ?? currentChain.current;
+    const activeSpot = options?.spotOverride ?? currentSpot.current;
+
+    if (!activeSession?.isConnected || !brokerGatewayClient.session.isBackend(activeSession.proxyBase)) {
+      setMarketDepth(emptyDepth());
+      return;
+    }
+
+    const now = Date.now();
+    if (!force && now - lastDepthRefresh.current < 12000) return;
+    const focal = resolveFocalDepthContract(activeChain, activeSpot);
+    if (!focal) {
+      setMarketDepth(emptyDepth());
+      return;
+    }
+
+    lastDepthRefresh.current = now;
+    const result = await brokerGatewayClient.market.fetchMarketDepth(activeSymbol, activeSession, {
+      expiryDate: activeExpiry.breezeValue,
+      right: focal.right,
+      strikePrice: focal.strikePrice,
+    });
+
+    if (result.ok && result.data) {
+      setMarketDepth(normalizeDepth(result.data, `${activeSymbol} ${activeExpiry.label} ${focal.label}`));
+      return;
+    }
+
+    setMarketDepth({
+      ...emptyDepth(),
+      instrumentLabel: `${activeSymbol} ${activeExpiry.label} ${focal.label}`,
+    });
+  }, [expiry.breezeValue, expiry.label, session]);
 
   const fetchAndSetSpot = useCallback(async (nextSymbol: SymbolCode, nextSession: NonNullable<typeof session>) => {
     const fallback = SPOT_PRICES[nextSymbol];
@@ -199,16 +294,20 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       const diff = Math.abs(broadcastSpot - currentSpot.current);
       if (diff < currentSpot.current * 0.15) {
         if (diff > 0.5) updateSpot(broadcastSpot, nextSymbol);
-        return;
+      }
+    } else {
+      const derivedSpot = deriveSpotFromMedian(updatedChain);
+      if (derivedSpot && derivedSpot > 1000) {
+        const diff = Math.abs(derivedSpot - currentSpot.current);
+        if (diff > 1 && diff < currentSpot.current * 0.15) {
+          updateSpot(derivedSpot, nextSymbol);
+        }
       }
     }
 
-    const derivedSpot = deriveSpotFromMedian(updatedChain);
-    if (derivedSpot && derivedSpot > 1000) {
-      const diff = Math.abs(derivedSpot - currentSpot.current);
-      if (diff > 1 && diff < currentSpot.current * 0.15) {
-        updateSpot(derivedSpot, nextSymbol);
-      }
+    const streamedCandles = update.candle_streams?.[nextSymbol]?.[currentInterval.current];
+    if (streamedCandles && streamedCandles.length > 0) {
+      setHistorical((current) => mergeHistorical(current, streamedCandles));
     }
   }, [updateSpot]);
 
@@ -253,6 +352,14 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
         setStatusMessage(subscription.ok
           ? `Live subscription active for ${subscription.subscribed ?? 0} feeds`
           : `Snapshot loaded. Stream subscribe failed: ${subscription.error}`);
+
+        await refreshMarketDepth(true, {
+          sessionOverride: nextSession,
+          symbolOverride: nextSymbol,
+          expiryOverride: nextExpiry,
+          chainOverride: merged,
+          spotOverride: nextSpot,
+        });
       } else {
         setStatusMessage('No option chain data returned.');
       }
@@ -268,7 +375,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setIsLoading(false);
     }
-  }, [notify, setStatusMessage]);
+  }, [notify, refreshMarketDepth, setStatusMessage]);
 
   const initializeLiveSession = useCallback(async (nextSymbol: SymbolCode, nextSession: NonNullable<typeof session>) => {
     if (!brokerGatewayClient.session.isBackend(nextSession.proxyBase)) {
@@ -282,10 +389,12 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       setExpiryState(staticExpiries[0]);
       updateSpot(SPOT_PRICES[nextSymbol], nextSymbol);
       setChain(generateChain(nextSymbol));
+      setHistorical([]);
+      setMarketDepth(emptyDepth());
       setChainError(null);
       setLastUpdate(new Date());
       setWsStatus('disconnected');
-      setStatusMessage('Browser-direct session connected. Backend-only streaming is disabled.');
+      setStatusMessage('Browser-direct session connected. Backend-native depth and candles are unavailable.');
       return;
     }
 
@@ -298,12 +407,14 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       await fetchLiveChain(nextSymbol, firstExpiry, nextSession, liveSpot);
     }
 
+    await refreshHistorical();
+
     setWsStatus('connecting');
     streamingManager.connect(nextSession.proxyBase, handleTickUpdate, (status) => {
       setWsStatus(status);
       setStatusMessage(
         status === 'connected'
-          ? 'Streaming live market data'
+          ? 'Streaming live market data and candles'
           : status === 'reconnecting'
             ? 'Reconnecting market stream'
             : status === 'error'
@@ -311,7 +422,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
               : 'Market stream disconnected'
       );
     });
-  }, [fetchAndSetSpot, fetchLiveExpiries, fetchLiveChain, handleTickUpdate, setStatusMessage, setWsStatus, updateSpot]);
+  }, [fetchAndSetSpot, fetchLiveExpiries, fetchLiveChain, handleTickUpdate, refreshHistorical, setStatusMessage, setWsStatus, updateSpot]);
 
   const resetToDemo = useCallback((nextSymbol: SymbolCode) => {
     streamingManager.disconnect();
@@ -321,6 +432,8 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     setExpiryState(expiries[0]);
     updateSpot(SPOT_PRICES[nextSymbol], nextSymbol);
     setChain(generateChain(nextSymbol));
+    setHistorical([]);
+    setMarketDepth(emptyDepth());
     setChainError(null);
     setLastUpdate(new Date());
     demoTickRef.current = setInterval(() => {
@@ -346,42 +459,54 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     };
   }, [symbol, session, initializeLiveSession, resetToDemo]);
 
-  useEffect(() => {
-    return () => {
-      streamingManager.disconnect();
-      if (demoTickRef.current) clearInterval(demoTickRef.current);
-    };
+  useEffect(() => () => {
+    streamingManager.disconnect();
+    if (demoTickRef.current) clearInterval(demoTickRef.current);
   }, []);
 
   useEffect(() => {
     setWatchlist((current) => buildWatchlist(symbol, spotPrice, current));
-    setMarketDepth(buildDepthFromChain(chain, spotPrice));
-  }, [chain, spotPrice, symbol]);
+  }, [spotPrice, symbol]);
 
   useEffect(() => {
     void refreshHistorical();
-  }, [refreshHistorical]);
+  }, [refreshHistorical, chartInterval, symbol]);
+
+  useEffect(() => {
+    if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) return;
+    void refreshMarketDepth(true);
+  }, [expiry.breezeValue, refreshMarketDepth, session, symbol]);
+
+  useEffect(() => {
+    if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) return;
+    const timer = setInterval(() => {
+      void refreshMarketDepth();
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [refreshMarketDepth, session]);
 
   const refreshMarket = useCallback(async () => {
     if (!session?.isConnected) {
       setChain(generateChain(symbol, spotPrice));
+      setHistorical([]);
+      setMarketDepth(emptyDepth());
       setLastUpdate(new Date());
-      await refreshHistorical();
       return;
     }
 
     if (!brokerGatewayClient.session.isBackend(session.proxyBase)) {
       setChain(generateChain(symbol, spotPrice));
+      setHistorical([]);
+      setMarketDepth(emptyDepth());
       setLastUpdate(new Date());
       setStatusMessage('Browser-direct mode refreshed from static market seed.');
-      await refreshHistorical();
       return;
     }
 
     const liveSpot = await fetchAndSetSpot(symbol, session);
     await fetchLiveChain(symbol, expiry, session, liveSpot);
-    await refreshHistorical();
-  }, [session, symbol, spotPrice, expiry, fetchAndSetSpot, fetchLiveChain, refreshHistorical, setStatusMessage]);
+    await Promise.all([refreshHistorical(), refreshMarketDepth(true)]);
+  }, [session, symbol, spotPrice, expiry, fetchAndSetSpot, fetchLiveChain, refreshHistorical, refreshMarketDepth, setStatusMessage]);
 
   useEffect(() => {
     if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) return;

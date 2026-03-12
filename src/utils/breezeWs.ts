@@ -39,6 +39,31 @@ export interface TickData {
   last_updated: number;
 }
 
+export interface StreamDepthLevel {
+  price: number;
+  quantity: number;
+  orders?: number;
+}
+
+export interface StreamDepthSnapshot {
+  bids: StreamDepthLevel[];
+  asks: StreamDepthLevel[];
+  spread?: number;
+  imbalance?: number;
+  updated_at?: number;
+  instrument_label?: string;
+  contract_key?: string;
+}
+
+export interface StreamCandle {
+  datetime: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
 export interface TickUpdate {
   type:         'tick_update' | 'heartbeat';
   version:      number;
@@ -51,6 +76,8 @@ export interface TickUpdate {
    * This is the most reliable spot source — use before put-call parity derivation.
    */
   spot_prices?: Record<string, number>;
+  depth_snapshots?: Record<string, StreamDepthSnapshot>;
+  candle_streams?: Record<string, Record<string, StreamCandle[]>>;
 }
 
 export type TickCallback    = (update: TickUpdate) => void;
@@ -310,11 +337,13 @@ export function startTickPolling(
         headers: pollHeaders,
       });
       const data = await res.json() as {
-        changed:      boolean;
-        version:      number;
-        ticks?:       TickData[];
-        ws_live?:     boolean;
-        spot_prices?: Record<string, number>;
+        changed:         boolean;
+        version:         number;
+        ticks?:          TickData[];
+        ws_live?:        boolean;
+        spot_prices?:    Record<string, number>;
+        depth_snapshots?: Record<string, StreamDepthSnapshot>;
+        candle_streams?: Record<string, Record<string, StreamCandle[]>>;
       };
 
       if (data.changed && data.ticks) {
@@ -326,6 +355,8 @@ export function startTickPolling(
           ts:          Date.now() / 1000,
           ws_live:     data.ws_live ?? false,
           spot_prices: data.spot_prices,
+          depth_snapshots: data.depth_snapshots,
+          candle_streams: data.candle_streams,
         });
       }
     } catch { /* silent — network may be briefly unavailable */ }

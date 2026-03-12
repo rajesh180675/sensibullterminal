@@ -214,6 +214,22 @@ export interface HistoricalCandle {
   volume:   number;
 }
 
+export interface BackendDepthLevel {
+  price: number;
+  quantity: number;
+  orders?: number;
+}
+
+export interface BackendMarketDepth {
+  bids: BackendDepthLevel[];
+  asks: BackendDepthLevel[];
+  spread?: number;
+  imbalance?: number;
+  updated_at?: number;
+  instrument_label?: string;
+  contract_key?: string;
+}
+
 // ── Health check ──────────────────────────────────────────────────────────────
 // FIX (Bug #5): Improved messages — clearly distinguish:
 //   ok:true  + connected:false  = "Backend reachable, click Validate Live to connect Breeze"
@@ -576,6 +592,36 @@ export async function fetchHistorical(
       : { ok: false, data: [], error: data.error };
   } catch (e) {
     return { ok: false, data: [], error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// ── Fetch Market Depth ────────────────────────────────────────────────────────
+
+export async function fetchMarketDepth(
+  backendUrl: string,
+  params: {
+    stockCode: string;
+    exchangeCode: string;
+    expiryDate: string;
+    right: string;
+    strikePrice: string;
+  },
+): Promise<{ ok: boolean; data?: BackendMarketDepth; error?: string }> {
+  const qs = new URLSearchParams({
+    stock_code: params.stockCode,
+    exchange_code: params.exchangeCode,
+    expiry_date: params.expiryDate,
+    right: params.right,
+    strike_price: params.strikePrice,
+  });
+  const url = apiUrl(backendUrl, `/api/depth?${qs}`);
+  try {
+    const data = await fetchJson<{ success: boolean; data?: BackendMarketDepth; error?: string }>(url);
+    return data.success
+      ? { ok: true, data: data.data }
+      : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 

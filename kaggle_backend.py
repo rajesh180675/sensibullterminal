@@ -205,6 +205,100 @@ class TickStore:
             return result
 
 
+def _safe_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bucket_epoch(ts: float, interval: str) -> int:
+    dt = datetime.fromtimestamp(ts)
+    if interval == "1minute":
+        return int(dt.replace(second=0, microsecond=0).timestamp())
+    if interval == "5minute":
+        minute = dt.minute - (dt.minute % 5)
+        return int(dt.replace(minute=minute, second=0, microsecond=0).timestamp())
+    if interval == "30minute":
+        minute = dt.minute - (dt.minute % 30)
+        return int(dt.replace(minute=minute, second=0, microsecond=0).timestamp())
+    return int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+class CandleStore:
+    INTERVALS = ("1minute", "5minute", "30minute", "1day")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._candles: Dict[str, Dict[str, Dict[int, dict]]] = {}
+
+    def clear(self) -> None:
+        with self._lock:
+            self._candles.clear()
+
+    def seed(self, symbol: str, interval: str, candles: List[dict]) -> None:
+        if interval not in self.INTERVALS:
+            return
+        with self._lock:
+            symbol_store = self._candles.setdefault(symbol, {})
+            bucket_store = symbol_store.setdefault(interval, {})
+            for candle in candles:
+                dt_raw = candle.get("datetime")
+                price = _safe_float(candle.get("close"))
+                if not dt_raw or price <= 0:
+                    continue
+                try:
+                    bucket = int(datetime.fromisoformat(str(dt_raw).replace("Z", "+00:00")).timestamp())
+                except ValueError:
+                    try:
+                        bucket = int(datetime.strptime(str(dt_raw), "%Y-%m-%d %H:%M:%S").timestamp())
+                    except ValueError:
+                        continue
+                bucket_store[bucket] = {
+                    "datetime": str(dt_raw),
+                    "open": _safe_float(candle.get("open"), price),
+                    "high": _safe_float(candle.get("high"), price),
+                    "low": _safe_float(candle.get("low"), price),
+                    "close": price,
+                    "volume": _safe_float(candle.get("volume")),
+                }
+
+    def update(self, symbol: str, price: float, volume: float = 0.0, ts: Optional[float] = None) -> None:
+        if price <= 0:
+            return
+        now = ts or time.time()
+        with self._lock:
+            symbol_store = self._candles.setdefault(symbol, {})
+            for interval in self.INTERVALS:
+                bucket = _bucket_epoch(now, interval)
+                interval_store = symbol_store.setdefault(interval, {})
+                candle = interval_store.get(bucket)
+                if candle is None:
+                    interval_store[bucket] = {
+                        "datetime": datetime.fromtimestamp(bucket).strftime("%Y-%m-%d %H:%M:%S"),
+                        "open": price,
+                        "high": price,
+                        "low": price,
+                        "close": price,
+                        "volume": volume,
+                    }
+                    continue
+                candle["high"] = max(candle["high"], price)
+                candle["low"] = min(candle["low"], price)
+                candle["close"] = price
+                candle["volume"] += volume
+
+    def to_stream_payload(self, limit: int = 2) -> Dict[str, Dict[str, List[dict]]]:
+        with self._lock:
+            payload: Dict[str, Dict[str, List[dict]]] = {}
+            for symbol, interval_map in self._candles.items():
+                for interval, bucket_map in interval_map.items():
+                    recent = [bucket_map[key] for key in sorted(bucket_map.keys())[-limit:]]
+                    if recent:
+                        payload.setdefault(symbol, {})[interval] = recent
+            return payload
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BreezeEngine
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -220,6 +314,7 @@ class BreezeEngine:
         self.subscribed   = set()
         self.rate_limiter = RateLimiter()
         self.tick_store   = TickStore()
+        self.candle_store = CandleStore()
         self._ws_thread   = None
         self._ws_lock     = threading.Lock()
         log.info("[BreezeEngine] initialised")
@@ -237,6 +332,7 @@ class BreezeEngine:
         self.session_key = b.session_key
         self.connected   = True
         self.tick_store.clear()
+        self.candle_store.clear()
         log.info(f"[Engine] connected — session:{self.session_key[:12]}...")
 
         user_info = {}
@@ -265,6 +361,7 @@ class BreezeEngine:
         self.connected   = False
         self.subscribed.clear()
         self.tick_store.clear()
+        self.candle_store.clear()
         log.info("[Engine] disconnected")
 
     # ── Checksum ──────────────────────────────────────────────────────────────
@@ -555,7 +652,83 @@ class BreezeEngine:
             return self.breeze.get_historical_data_v2(**kwargs)
 
         result = self.rate_limiter.enqueue(_call)
-        return result.get("Success", []) if isinstance(result, dict) else []
+        candles = result.get("Success", []) if isinstance(result, dict) else []
+        if candles and not expiry_date:
+            self.candle_store.seed(stock_code.upper(), interval, candles)
+        return candles
+
+    def get_market_depth(
+        self,
+        stock_code: str,
+        exchange_code: str,
+        expiry_date: str,
+        right: str,
+        strike_price: str,
+    ) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+
+        right_norm = "Call" if right.lower().startswith("c") else "Put"
+
+        def _call():
+            return self.breeze.get_market_depth(
+                stock_code=stock_code,
+                exchange_code=exchange_code,
+                product_type="options",
+                expiry_date=expiry_date,
+                right=right_norm,
+                strike_price=strike_price,
+            )
+
+        result = self.rate_limiter.enqueue(_call)
+        rows = result.get("Success") if isinstance(result, dict) else []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not rows:
+            return {
+                "bids": [],
+                "asks": [],
+                "spread": 0,
+                "imbalance": 0,
+                "updated_at": time.time(),
+                "instrument_label": f"{stock_code} {expiry_date} {strike_price} {right_norm}",
+                "contract_key": f"{stock_code}:{strike_price}:{'CE' if right_norm == 'Call' else 'PE'}",
+            }
+
+        row = rows[0]
+        bids: List[dict] = []
+        asks: List[dict] = []
+        for level in range(1, 6):
+            bid_price = _safe_float(
+                row.get(f"best_bid_price_{level}") or row.get(f"buy_price_{level}") or row.get(f"BidPrice{level}")
+            )
+            bid_qty = _safe_float(
+                row.get(f"best_bid_quantity_{level}") or row.get(f"buy_quantity_{level}") or row.get(f"BidQty{level}")
+            )
+            ask_price = _safe_float(
+                row.get(f"best_offer_price_{level}") or row.get(f"sell_price_{level}") or row.get(f"AskPrice{level}")
+            )
+            ask_qty = _safe_float(
+                row.get(f"best_offer_quantity_{level}") or row.get(f"sell_quantity_{level}") or row.get(f"AskQty{level}")
+            )
+            if bid_price > 0:
+                bids.append({"price": bid_price, "quantity": bid_qty, "orders": 1})
+            if ask_price > 0:
+                asks.append({"price": ask_price, "quantity": ask_qty, "orders": 1})
+
+        total_bid = sum(level["quantity"] for level in bids)
+        total_ask = sum(level["quantity"] for level in asks)
+        spread = max(0.0, (asks[0]["price"] - bids[0]["price"])) if bids and asks else 0.0
+        imbalance = ((total_bid - total_ask) / (total_bid + total_ask)) if (total_bid + total_ask) else 0.0
+        return {
+            "bids": bids,
+            "asks": asks,
+            "spread": spread,
+            "imbalance": imbalance,
+            "updated_at": time.time(),
+            "instrument_label": f"{stock_code} {expiry_date} {strike_price} {right_norm}",
+            "contract_key": f"{stock_code}:{strike_price}:{'CE' if right_norm == 'Call' else 'PE'}",
+        }
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
 
@@ -607,6 +780,11 @@ class BreezeEngine:
                         "is_spot":  True,
                         "source":   "ws_tick",
                     })
+                    self.candle_store.update(
+                        stock,
+                        underlying,
+                        _safe_float(tick.get("total_quantity_traded") or tick.get("volume")),
+                    )
                     log.debug(f"[WS spot] {stock} underlying={underlying}")
 
             except Exception as exc:
@@ -677,7 +855,7 @@ class BreezeEngine:
                         strike_price=str(strike),
                         right=right_norm,
                         get_exchange_quotes=True,
-                        get_market_depth=False,
+                        get_market_depth=True,
                     )
                     self.subscribed.add(sub_key)
                     count += 1
@@ -1042,20 +1220,22 @@ async def ws_ticks(websocket: WebSocket):
             if current_version == last_version:
                 if heartbeat_counter % 10 == 0:
                     await websocket.send_json({
-                        "type":    "heartbeat",
-                        "ts":      time.time(),
-                        "ws_live": engine.ws_running,
+                        "type":           "heartbeat",
+                        "ts":             time.time(),
+                        "ws_live":        engine.ws_running,
+                        "candle_streams": engine.candle_store.to_stream_payload(limit=2),
                     })
                 continue
 
             last_version = current_version
             await websocket.send_json({
-                "type":        "tick_update",
-                "version":     current_version,
-                "ticks":       engine.tick_store.to_option_chain_delta(),
-                "spot_prices": engine.tick_store.get_spot_prices(),
-                "ts":          time.time(),
-                "ws_live":     engine.ws_running,
+                "type":           "tick_update",
+                "version":        current_version,
+                "ticks":          engine.tick_store.to_option_chain_delta(),
+                "spot_prices":    engine.tick_store.get_spot_prices(),
+                "candle_streams": engine.candle_store.to_stream_payload(limit=2),
+                "ts":             time.time(),
+                "ws_live":        engine.ws_running,
             })
     except WebSocketDisconnect:
         log.info("[WS] frontend disconnected")
@@ -1071,11 +1251,12 @@ async def api_ticks(since_version: int = Query(0)):
     if data["version"] <= since_version:
         return {"changed": False, "version": data["version"]}
     return {
-        "changed":     True,
-        "version":     data["version"],
-        "ticks":       engine.tick_store.to_option_chain_delta(),
-        "spot_prices": engine.tick_store.get_spot_prices(),
-        "ws_live":     engine.ws_running,
+        "changed":        True,
+        "version":        data["version"],
+        "ticks":          engine.tick_store.to_option_chain_delta(),
+        "spot_prices":    engine.tick_store.get_spot_prices(),
+        "candle_streams": engine.candle_store.to_stream_payload(limit=2),
+        "ws_live":        engine.ws_running,
     }
 
 
@@ -1270,6 +1451,27 @@ async def api_historical(
             engine.get_historical,
             stock_code, exchange_code, interval, from_date, to_date,
             expiry_date, right, strike_price,
+        )
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+@app.get("/api/depth")
+async def api_depth(
+    stock_code: str = Query(...),
+    exchange_code: str = Query(...),
+    expiry_date: str = Query(...),
+    right: str = Query(...),
+    strike_price: str = Query(...),
+):
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None,
+            engine.get_market_depth,
+            stock_code, exchange_code, expiry_date, right, strike_price,
         )
         return {"success": True, "data": data}
     except Exception as exc:

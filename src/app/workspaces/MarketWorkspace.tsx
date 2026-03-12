@@ -48,6 +48,9 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
     };
   }, [historical, spotPrice]);
 
+  const depthReady = marketDepth.bids.length > 0 || marketDepth.asks.length > 0;
+  const candlesReady = historical.length > 0;
+
   return (
     <div className="flex h-full flex-col gap-4 p-4">
       <div className="grid gap-4 xl:grid-cols-[0.9fr,1.1fr,0.8fr]">
@@ -134,23 +137,29 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
               <span>{historical.length} candles</span>
               <span>{isHistoricalLoading ? 'Refreshing historical...' : `Range ${priceRange.low.toFixed(0)} - ${priceRange.high.toFixed(0)}`}</span>
             </div>
-            <div className="flex h-56 items-end gap-1">
-              {historical.slice(-36).map((candle) => {
-                const isUp = candle.close >= candle.open;
-                const base = Math.max(priceRange.high - priceRange.low, 1);
-                const bodyHeight = Math.max(10, ((Math.abs(candle.close - candle.open) / base) * 180));
-                const wickHeight = Math.max(bodyHeight + 8, (((candle.high - candle.low) / base) * 190));
-                return (
-                  <div key={candle.datetime} className="flex flex-1 flex-col items-center justify-end">
-                    <div className={`w-px rounded-full ${isUp ? 'bg-emerald-400/70' : 'bg-red-400/70'}`} style={{ height: `${wickHeight}px` }} />
-                    <div
-                      className={`w-full rounded-md ${isUp ? 'bg-emerald-400/75' : 'bg-red-400/75'}`}
-                      style={{ height: `${bodyHeight}px`, maxWidth: '10px', marginTop: `${-bodyHeight}px` }}
-                    />
-                  </div>
-                );
-              })}
-            </div>
+            {candlesReady ? (
+              <div className="flex h-56 items-end gap-1">
+                {historical.slice(-36).map((candle) => {
+                  const isUp = candle.close >= candle.open;
+                  const base = Math.max(priceRange.high - priceRange.low, 1);
+                  const bodyHeight = Math.max(10, ((Math.abs(candle.close - candle.open) / base) * 180));
+                  const wickHeight = Math.max(bodyHeight + 8, (((candle.high - candle.low) / base) * 190));
+                  return (
+                    <div key={candle.datetime} className="flex flex-1 flex-col items-center justify-end">
+                      <div className={`w-px rounded-full ${isUp ? 'bg-emerald-400/70' : 'bg-red-400/70'}`} style={{ height: `${wickHeight}px` }} />
+                      <div
+                        className={`w-full rounded-md ${isUp ? 'bg-emerald-400/75' : 'bg-red-400/75'}`}
+                        style={{ height: `${bodyHeight}px`, maxWidth: '10px', marginTop: `${-bodyHeight}px` }}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="flex h-56 items-center justify-center rounded-3xl border border-dashed border-white/10 bg-white/5 text-center text-sm text-slate-400">
+                Backend historical/candle stream is unavailable for this session.
+              </div>
+            )}
             <div className="mt-4 flex items-center justify-between text-xs text-slate-500">
               <span className="inline-flex items-center gap-1"><Clock3 size={12} /> Last update {lastUpdate.toLocaleTimeString()}</span>
               <span>{statusMessage}</span>
@@ -162,6 +171,9 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
           <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.3em] text-orange-300/70">
             <Layers3 size={13} />
             Depth
+          </div>
+          <div className="mt-3 text-xs text-slate-500">
+            {marketDepth.instrumentLabel ?? 'No backend contract selected'}
           </div>
           <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
             <div className="rounded-3xl border border-emerald-500/20 bg-emerald-500/10 p-4">
@@ -176,6 +188,7 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
                     <span className="text-slate-300">{level.quantity.toLocaleString('en-IN')}</span>
                   </div>
                 ))}
+                {!depthReady && <div className="rounded-2xl bg-black/15 px-3 py-6 text-center text-xs text-slate-400">Backend depth unavailable</div>}
               </div>
             </div>
             <div className="rounded-3xl border border-red-500/20 bg-red-500/10 p-4">
@@ -190,6 +203,7 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
                     <span className="text-slate-300">{level.quantity.toLocaleString('en-IN')}</span>
                   </div>
                 ))}
+                {!depthReady && <div className="rounded-2xl bg-black/15 px-3 py-6 text-center text-xs text-slate-400">Connect the backend for native depth</div>}
               </div>
             </div>
           </div>
@@ -205,7 +219,7 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
             </div>
             <div className="rounded-2xl bg-white/5 px-3 py-3">
               <div className="inline-flex items-center gap-1"><Clock3 size={12} /> Freshness</div>
-              <div className="mt-2 text-sm font-semibold text-white">{isLive ? 'Live' : 'Simulated'}</div>
+              <div className="mt-2 text-sm font-semibold text-white">{marketDepth.source === 'backend' || candlesReady ? 'Backend native' : isLive ? 'Live chain only' : 'Simulated'}</div>
             </div>
           </div>
         </section>

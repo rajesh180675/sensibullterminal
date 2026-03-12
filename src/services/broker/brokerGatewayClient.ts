@@ -7,6 +7,7 @@ import {
   fetchFunds,
   fetchExpiryDates,
   fetchHistorical,
+  fetchMarketDepth,
   fetchOptionChain,
   fetchOrderBook,
   fetchPositions,
@@ -148,6 +149,18 @@ export const brokerGatewayClient = {
     }) {
       const cfg = SYMBOL_CONFIG[symbol];
       return fetchHistorical(session.proxyBase, {
+        stockCode: cfg.breezeStockCode,
+        exchangeCode: cfg.breezeExchangeCode,
+        ...params,
+      });
+    },
+    async fetchMarketDepth(symbol: SymbolCode, session: BreezeSession, params: {
+      expiryDate: string;
+      right: 'call' | 'put';
+      strikePrice: string;
+    }) {
+      const cfg = SYMBOL_CONFIG[symbol];
+      return fetchMarketDepth(session.proxyBase, {
         stockCode: cfg.breezeStockCode,
         exchangeCode: cfg.breezeExchangeCode,
         ...params,
