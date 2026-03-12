@@ -257,6 +257,40 @@ export interface BackendExecutionPreview {
   validation?: BackendExecutionValidationSummary;
 }
 
+export interface BackendRepairPreview {
+  incrementalPreview: BackendExecutionPreview;
+  currentMargin: {
+    margin_required: number;
+    available_margin: number;
+    span_margin: number;
+    block_trade_margin: number;
+    order_margin: number;
+    trade_margin: number;
+  };
+  resultingMargin: {
+    margin_required: number;
+    available_margin: number;
+    span_margin: number;
+    block_trade_margin: number;
+    order_margin: number;
+    trade_margin: number;
+  };
+  resultingLegs: Array<Record<string, unknown>>;
+  ranking: {
+    score: number;
+    creditEfficiency: number;
+    marginRelief: number;
+    thesisPreservation: number;
+  };
+  notes: string[];
+  updated_at?: number;
+}
+
+export interface BackendSellerReviewState {
+  entries: Array<Record<string, unknown>>;
+  playbook_reviews?: Array<Record<string, unknown>>;
+}
+
 export interface BackendExecutionValidationLegSummary {
   kind: 'preview' | 'margin';
   captured_at: number;
@@ -761,6 +795,23 @@ export async function fetchMarginPreview(
   }
 }
 
+export async function fetchRepairPreview(
+  backendUrl: string,
+  payload: Record<string, unknown>,
+): Promise<{ ok: boolean; data?: BackendRepairPreview; error?: string }> {
+  const url = apiUrl(backendUrl, '/api/repair-preview');
+  try {
+    const data = await fetchJson<{ success: boolean; data?: BackendRepairPreview; error?: string }>(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return data.success ? { ok: true, data: data.data } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export async function fetchExecutionValidation(
   backendUrl: string,
   limit = 10,
@@ -784,6 +835,35 @@ export async function fetchAutomationRules(
   try {
     const data = await fetchJson<{ success: boolean; rules?: BackendAutomationRule[]; error?: string }>(url);
     return data.success ? { ok: true, rules: data.rules ?? [] } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function fetchSellerReviewState(
+  backendUrl: string,
+): Promise<{ ok: boolean; data?: BackendSellerReviewState; error?: string }> {
+  const url = apiUrl(backendUrl, '/api/reviews/state');
+  try {
+    const data = await fetchJson<{ success: boolean; data?: BackendSellerReviewState; error?: string }>(url);
+    return data.success ? { ok: true, data: data.data } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function saveSellerReviewState(
+  backendUrl: string,
+  payload: Record<string, unknown>,
+): Promise<{ ok: boolean; data?: BackendSellerReviewState; error?: string }> {
+  const url = apiUrl(backendUrl, '/api/reviews/state');
+  try {
+    const data = await fetchJson<{ success: boolean; data?: BackendSellerReviewState; error?: string }>(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return data.success ? { ok: true, data: data.data } : { ok: false, error: data.error };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }

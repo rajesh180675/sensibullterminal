@@ -120,6 +120,10 @@ export interface PositionLeg {
   brokerLegKey?: string;
   orderId?: string;
   tradeId?: string;
+  delta?: number;
+  gamma?: number;
+  theta?: number;
+  vega?: number;
 }
 
 export interface MarketIndex {
@@ -307,6 +311,15 @@ export interface SellerPlaybook {
   noTradeConditions: string[];
 }
 
+export interface SellerPlaybookReview {
+  playbookName: string;
+  entries: number;
+  alignedEntries: number;
+  violations: number;
+  netPnl: number;
+  lastReviewedAt: number;
+}
+
 export interface SellerOpportunityAutomationPreset {
   id: string;
   label: string;
@@ -420,6 +433,15 @@ export interface SellerJournalEntry {
   outcome: 'pending' | 'open' | 'closed_win' | 'closed_loss' | 'flat';
   adjustmentCount: number;
   adjustmentEffectiveness: 'unreviewed' | 'improving' | 'worsening' | 'flat';
+  lifecycleEvents?: Array<{
+    id: string;
+    type: 'captured' | 'executed' | 'linked_position' | 'adjusted' | 'closed';
+    timestamp: number;
+    detail: string;
+    realizedPnl?: number;
+    orderIds?: string[];
+    tradeIds?: string[];
+  }>;
 }
 
 export interface SellerJournalAnalyticsBucket {
@@ -447,6 +469,11 @@ export interface SellerJournalSummary {
   analytics: SellerJournalAnalytics;
 }
 
+export interface SellerReviewState {
+  entries: SellerJournalEntry[];
+  playbookReviews: SellerPlaybookReview[];
+}
+
 export interface AdjustmentSnapshot {
   netCredit: number;
   maxProfit: number;
@@ -470,10 +497,17 @@ export interface AdjustmentPreviewDelta {
   notes: string[];
 }
 
+export interface AdjustmentRanking {
+  score: number;
+  creditEfficiency: number;
+  marginRelief: number;
+  thesisPreservation: number;
+}
+
 export interface AdjustmentSuggestion {
   id: string;
   positionId: string;
-  strategyFamily: 'short_strangle' | 'short_straddle' | 'iron_condor' | 'vertical_spread' | 'single_leg_short' | 'custom';
+  strategyFamily: 'short_strangle' | 'short_straddle' | 'iron_condor' | 'vertical_spread' | 'single_leg_short' | 'calendar' | 'broken_wing' | 'ratio_repair' | 'expiry_day' | 'custom';
   repairType: 'roll_tested_side' | 'roll_spread_wider' | 'add_wings' | 'close_tested_side' | 'flatten_all' | 'recenter_structure' | 'reduce_winning_side';
   title: string;
   rationale: string;
@@ -486,6 +520,7 @@ export interface AdjustmentSuggestion {
   legsAfter: OptionLeg[];
   repairLegs: OptionLeg[];
   previewDelta: AdjustmentPreviewDelta;
+  ranking: AdjustmentRanking;
 }
 
 export interface AutomationRule {

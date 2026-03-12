@@ -177,18 +177,18 @@ export function mapBreezePositions(data: unknown): Position[] {
     const action: 'BUY' | 'SELL' = rawAction.toLowerCase().startsWith('b') ? 'BUY' : 'SELL';
     const type: 'CE' | 'PE' = rawRight.toLowerCase().startsWith('c') ? 'CE' : 'PE';
     const strike = numeric(position.strike_price);
-    const entryPrice = readFirst(position, ['average_price', 'avg_price']);
-    const currentPrice = readFirst(position, ['ltp', 'current_price', 'close_price'], entryPrice);
+    const entryPrice = readFirst(position, ['normalized_average_price', 'average_price', 'avg_price']);
+    const currentPrice = readFirst(position, ['normalized_ltp', 'ltp', 'current_price', 'close_price'], entryPrice);
     const quantity = Math.max(1, Math.abs(Math.round(readFirst(position, ['quantity', 'net_quantity', 'net_qty'], 1))));
     const lotSize = SYMBOL_CONFIG[symbol].lotSize;
     const lots = Math.max(1, Math.round(quantity / lotSize));
-    const realizedPnl = readFirst(position, ['realised_pnl', 'realized_pnl', 'booked_profit_loss', 'realized_mtm']);
+    const realizedPnl = readFirst(position, ['normalized_realized_pnl', 'realised_pnl', 'realized_pnl', 'booked_profit_loss', 'realized_mtm']);
     const unrealizedPnl = readFirst(
       position,
-      ['unrealised_pnl', 'unrealized_pnl', 'open_profit_loss', 'open_mtm'],
+      ['normalized_unrealized_pnl', 'unrealised_pnl', 'unrealized_pnl', 'open_profit_loss', 'open_mtm'],
       (action === 'BUY' ? 1 : -1) * (currentPrice - entryPrice) * quantity,
     );
-    const pnl = readFirst(position, ['pnl', 'mtm', 'total_pnl'], realizedPnl + unrealizedPnl);
+    const pnl = readFirst(position, ['normalized_mtm', 'pnl', 'mtm', 'total_pnl'], realizedPnl + unrealizedPnl);
     const expiry = String(position.expiry_date || '');
     const bucketKey = [
       symbol,
@@ -215,6 +215,10 @@ export function mapBreezePositions(data: unknown): Position[] {
       brokerLegKey: String(position.position_key || position.leg_id || `${bucketKey}-${type}-${strike}-${action}`),
       orderId: brokerOrderId || undefined,
       tradeId: brokerTradeId || undefined,
+      delta: numeric((position.broker_greeks as Record<string, unknown> | undefined)?.delta),
+      gamma: numeric((position.broker_greeks as Record<string, unknown> | undefined)?.gamma),
+      theta: numeric((position.broker_greeks as Record<string, unknown> | undefined)?.theta),
+      vega: numeric((position.broker_greeks as Record<string, unknown> | undefined)?.vega),
     };
 
     if (!existing) {

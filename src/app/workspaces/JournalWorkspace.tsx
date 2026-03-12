@@ -305,6 +305,27 @@ export function JournalWorkspace() {
                 </div>
               </div>
 
+              <div className="rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-300">
+                <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Lifecycle</div>
+                <div className="mt-3 space-y-2">
+                  {(selectedEntry.lifecycleEvents ?? []).slice(0, 6).map((event) => (
+                    <div key={event.id} className="rounded-2xl bg-[#08101d] px-3 py-3 text-xs text-slate-300">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="text-white">{event.type}</div>
+                        <div className="text-slate-500">{new Date(event.timestamp).toLocaleString()}</div>
+                      </div>
+                      <div className="mt-1">{event.detail}</div>
+                      {(event.orderIds?.length || event.tradeIds?.length || event.realizedPnl !== undefined) && (
+                        <div className="mt-1 text-slate-500">
+                          {event.orderIds?.length ? `Orders ${event.orderIds.length}` : 'Orders 0'} · {event.tradeIds?.length ? `Trades ${event.tradeIds.length}` : 'Trades 0'}
+                          {event.realizedPnl !== undefined ? ` · Realized ${fmtPnL(event.realizedPnl)}` : ''}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
               <label className="rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-300">
                 <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Review notes</div>
                 <textarea

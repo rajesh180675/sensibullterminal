@@ -20,6 +20,15 @@ function nextLegId(positionId: string, index: number) {
 }
 
 function approximateGreeks(leg: PositionLeg, spotPrice: number) {
+  if ([leg.delta, leg.theta, leg.gamma, leg.vega].some((value) => value !== undefined && value !== 0)) {
+    return {
+      iv: 14,
+      delta: leg.delta ?? 0,
+      theta: leg.theta ?? -2.2,
+      gamma: leg.gamma ?? 0.0015,
+      vega: leg.vega ?? 0.12,
+    };
+  }
   const distanceRatio = Math.abs(spotPrice - leg.strike) / Math.max(spotPrice, 1);
   const directionalWeight = Math.max(0.12, 0.5 - distanceRatio * 3.5);
   const delta = leg.type === 'CE' ? directionalWeight : -directionalWeight;
@@ -106,7 +115,47 @@ function previewDeltaFor(currentLegs: OptionLeg[], proposedLegs: OptionLeg[]): A
   };
 }
 
+function rankingForSuggestion(
+  strategyFamily: AdjustmentSuggestion['strategyFamily'],
+  repairType: AdjustmentSuggestion['repairType'],
+  previewDelta: AdjustmentPreviewDelta,
+): AdjustmentSuggestion['ranking'] {
+  const premiumBase = Math.abs(previewDelta.premiumDelta);
+  const feeBase = Math.abs(previewDelta.feeDelta);
+  const marginRelief = Math.max(0, -previewDelta.marginDelta);
+  const creditEfficiency = premiumBase / Math.max(feeBase + Math.abs(previewDelta.resultingMargin) * 0.01, 1);
+  let thesisPreservation = 58;
+  if (repairType === 'roll_tested_side' || repairType === 'roll_spread_wider' || repairType === 'recenter_structure') thesisPreservation = 86;
+  if (repairType === 'add_wings' || repairType === 'reduce_winning_side') thesisPreservation = 74;
+  if (repairType === 'flatten_all') thesisPreservation = 18;
+  if (strategyFamily === 'calendar' || strategyFamily === 'broken_wing' || strategyFamily === 'ratio_repair' || strategyFamily === 'expiry_day') {
+    thesisPreservation += 5;
+  }
+  const score = Math.min(100, creditEfficiency * 18 + (marginRelief / Math.max(Math.abs(previewDelta.resultingMargin), 1)) * 40 + thesisPreservation * 0.45);
+  return {
+    score: Number(score.toFixed(2)),
+    creditEfficiency: Number(creditEfficiency.toFixed(4)),
+    marginRelief: Number(marginRelief.toFixed(2)),
+    thesisPreservation: Number(Math.min(100, thesisPreservation).toFixed(2)),
+  };
+}
+
+function parseExpiryDate(expiry: string) {
+  const parsed = new Date(expiry);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatExpiry(date: Date) {
+  return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+}
+
 function detectStrategyFamily(position: Position): AdjustmentSuggestion['strategyFamily'] {
+  const strategyName = position.strategy.toLowerCase();
+  if (strategyName.includes('calendar') || strategyName.includes('diagonal')) return 'calendar';
+  if (strategyName.includes('broken wing')) return 'broken_wing';
+  if (strategyName.includes('ratio')) return 'ratio_repair';
+  const expiryDate = parseExpiryDate(position.expiry);
+  if (expiryDate && (expiryDate.getTime() - Date.now()) / 86400000 <= 1.1) return 'expiry_day';
   const sellCalls = position.legs.filter((leg) => leg.action === 'SELL' && leg.type === 'CE').length;
   const sellPuts = position.legs.filter((leg) => leg.action === 'SELL' && leg.type === 'PE').length;
   const buyCalls = position.legs.filter((leg) => leg.action === 'BUY' && leg.type === 'CE').length;
@@ -122,11 +171,14 @@ function detectStrategyFamily(position: Position): AdjustmentSuggestion['strateg
   return 'custom';
 }
 
-function createBaseSuggestion(position: Position, partial: Omit<AdjustmentSuggestion, 'strategyFamily' | 'previewDelta'>): AdjustmentSuggestion {
+function createBaseSuggestion(position: Position, partial: Omit<AdjustmentSuggestion, 'strategyFamily' | 'previewDelta' | 'ranking'>): AdjustmentSuggestion {
+  const strategyFamily = detectStrategyFamily(position);
+  const previewDelta = previewDeltaFor(partial.legsBefore, partial.legsAfter);
   return {
     ...partial,
-    strategyFamily: detectStrategyFamily(position),
-    previewDelta: previewDeltaFor(partial.legsBefore, partial.legsAfter),
+    strategyFamily,
+    previewDelta,
+    ranking: rankingForSuggestion(strategyFamily, partial.repairType, previewDelta),
   };
 }
 
@@ -250,6 +302,116 @@ function createSuggestionsForPosition(position: Position, spotPrice: number): Ad
     }));
   }
 
+  if (strategyFamily === 'calendar') {
+    const nextExpiry = (() => {
+      const parsed = parseExpiryDate(position.expiry);
+      if (!parsed) return position.expiry;
+      const next = new Date(parsed.getTime() + 7 * 86400000);
+      return formatExpiry(next);
+    })();
+    const calendarRepairLegs = baseLegs
+      .filter((leg) => leg.action === 'SELL')
+      .map((leg) => asRepairLeg(leg, {
+        action: 'BUY',
+        expiry: leg.expiry,
+      }))
+      .concat(baseLegs
+        .filter((leg) => leg.action === 'SELL')
+        .map((leg) => asRepairLeg(leg, {
+          action: 'SELL',
+          expiry: nextExpiry,
+        })));
+    const proposed = baseLegs.map((leg) => (
+      leg.action === 'SELL' ? { ...leg, expiry: nextExpiry } : leg
+    ));
+    suggestions.push(createBaseSuggestion(position, {
+      id: `${position.id}-calendar-roll`,
+      repairType: 'roll_tested_side',
+      positionId: position.id,
+      title: 'Roll the short calendar leg to the next expiry',
+      rationale: 'Calendar and diagonal structures defend better by rolling the front short leg outward in time instead of only moving strikes.',
+      trigger: 'Front expiry short leg is under stress or theta is exhausted.',
+      repairFlow: 'Close the near-expiry short and reopen the same strike in the next weekly expiry.',
+      severity: 'warning',
+      current,
+      proposed: summarize(position, proposed, stressedLabels),
+      legsBefore: baseLegs,
+      legsAfter: proposed,
+      repairLegs: calendarRepairLegs,
+    }));
+  }
+
+  if (strategyFamily === 'broken_wing') {
+    const wingLeg = baseLegs.find((leg) => leg.action === 'BUY' && leg.type === primaryStress.type);
+    if (wingLeg) {
+      const patchedWing = shiftLeg(wingLeg, primaryStress.type === 'CE' ? step : -step);
+      const proposed = baseLegs.map((leg) => leg.id === wingLeg.id ? patchedWing : leg);
+      suggestions.push(createBaseSuggestion(position, {
+        id: `${position.id}-repair-broken-wing`,
+        repairType: 'add_wings',
+        positionId: position.id,
+        title: 'Rebalance the broken-wing tail',
+        rationale: 'When the broken-wing body drifts too close to spot, nudging the far wing restores asymmetry without fully abandoning the structure.',
+        trigger: `${primaryStress.type} body is pinning too close to spot.`,
+        repairFlow: 'Sell the existing protective wing and buy the wider wing only if the new tail meaningfully lowers max-loss concentration.',
+        severity: 'warning',
+        current,
+        proposed: summarize(position, proposed, stressedLabels),
+        legsBefore: baseLegs,
+        legsAfter: proposed,
+        repairLegs: [asRepairLeg(wingLeg, { action: 'SELL' }), asRepairLeg(patchedWing, { action: 'BUY' })],
+      }));
+    }
+  }
+
+  if (strategyFamily === 'ratio_repair') {
+    const dominantShort = baseLegs.find((leg) => leg.action === 'SELL' && leg.type === primaryStress.type);
+    if (dominantShort) {
+      const tail = asRepairLeg(dominantShort, {
+        action: 'BUY',
+        strike: dominantShort.type === 'CE' ? dominantShort.strike + step * 3 : dominantShort.strike - step * 3,
+        ltp: Math.max(5, dominantShort.ltp * 0.28),
+      });
+      const proposed = [...baseLegs, { ...tail, action: 'BUY' as const }];
+      suggestions.push(createBaseSuggestion(position, {
+        id: `${position.id}-ratio-repair`,
+        repairType: 'add_wings',
+        positionId: position.id,
+        title: 'Convert the ratio into a hedged repair',
+        rationale: 'Adding a farther tail converts the excess short quantity into a controllable broken-wing style payoff.',
+        trigger: 'Ratio side has become the dominant tail risk.',
+        repairFlow: 'Add the repair tail first, then decide whether to roll the short body.',
+        severity: 'critical',
+        current,
+        proposed: summarize(position, proposed, stressedLabels),
+        legsBefore: baseLegs,
+        legsAfter: proposed,
+        repairLegs: [tail],
+      }));
+    }
+  }
+
+  if (strategyFamily === 'expiry_day') {
+    const reduced = baseLegs.filter((leg) => !(leg.action === 'SELL' && leg.type === primaryStress.type));
+    suggestions.push(createBaseSuggestion(position, {
+      id: `${position.id}-expiry-day-degamma`,
+      repairType: 'reduce_winning_side',
+      positionId: position.id,
+      title: 'Expiry-day de-gamma',
+      rationale: 'On expiry, the fastest repair is often to remove the stressed short leg and preserve only the safer carry that remains.',
+      trigger: 'Time-to-expiry is low and gamma is accelerating around the stressed strike.',
+      repairFlow: 'Use this when defending the full structure is slower than simply cutting the stressed short gamma.',
+      severity: 'critical',
+      current,
+      proposed: summarize(position, reduced, stressedLabels),
+      legsBefore: baseLegs,
+      legsAfter: reduced,
+      repairLegs: baseLegs
+        .filter((leg) => leg.action === 'SELL' && leg.type === primaryStress.type)
+        .map((leg) => asRepairLeg(leg, { action: 'BUY' })),
+    }));
+  }
+
   const nakedShorts = baseLegs.filter((leg) => (
     leg.action === 'SELL'
     && !baseLegs.some((candidate) => candidate.action === 'BUY' && candidate.type === leg.type && (
@@ -328,7 +490,9 @@ function createSuggestionsForPosition(position: Position, spotPrice: number): Ad
     repairLegs: baseLegs.map((leg) => asRepairLeg(leg, { action: oppositeAction(leg.action) })),
   }));
 
-  return suggestions.slice(0, 6);
+  return suggestions
+    .sort((left, right) => right.ranking.score - left.ranking.score)
+    .slice(0, 8);
 }
 
 export function AdjustmentProvider({ children }: { children: React.ReactNode }) {
@@ -364,45 +528,49 @@ export function AdjustmentProvider({ children }: { children: React.ReactNode }) 
     const hydrate = async () => {
       const next = await Promise.all(baseSuggestions.map(async (suggestion) => {
         try {
-          const [currentPreview, proposedPreview, currentMargin, proposedMargin] = await Promise.all([
-            brokerGatewayClient.execution.previewStrategy(session, buildBackendLegPayload(suggestion.legsBefore)),
-            suggestion.legsAfter.length > 0
-              ? brokerGatewayClient.execution.previewStrategy(session, buildBackendLegPayload(suggestion.legsAfter))
-              : Promise.resolve({ ok: true, data: buildExecutionPreview([]) }),
-            brokerGatewayClient.execution.fetchMargin(session, suggestion.legsBefore),
-            suggestion.legsAfter.length > 0
-              ? brokerGatewayClient.execution.fetchMargin(session, suggestion.legsAfter)
-              : Promise.resolve({ ok: true, data: buildExecutionPreview([]) }),
-          ]);
+          const repairResult = await brokerGatewayClient.execution.repairPreview(session, {
+            current_legs: buildBackendLegPayload(suggestion.legsBefore),
+            repair_legs: buildBackendLegPayload(suggestion.repairLegs),
+            meta: {
+              repair_type: suggestion.repairType,
+              strategy_family: suggestion.strategyFamily,
+            },
+          });
 
-          if (!currentPreview.ok || !proposedPreview.ok || !currentMargin.ok || !proposedMargin.ok) {
+          if (!repairResult.ok || !repairResult.data) {
             return suggestion;
           }
-
-          const currentMarginRequired = currentMargin.data?.marginRequired ?? currentPreview.data?.marginRequired ?? suggestion.current.maxLoss;
-          const proposedMarginRequired = proposedMargin.data?.marginRequired ?? proposedPreview.data?.marginRequired ?? suggestion.proposed.maxLoss;
+          const resultingMargin = repairResult.data.resultingMargin.margin_required ?? suggestion.proposed.maxLoss;
+          const marginDelta = resultingMargin - (repairResult.data.currentMargin.margin_required ?? suggestion.current.maxLoss);
+          const premiumDelta = repairResult.data.incrementalPreview.estimatedPremium ?? 0;
+          const feeDelta = repairResult.data.incrementalPreview.estimatedFees ?? 0;
+          const previewDelta: AdjustmentPreviewDelta = {
+            status: 'ready',
+            source: 'backend',
+            premiumDelta,
+            feeDelta,
+            marginDelta,
+            resultingMargin,
+            resultingMaxLoss: suggestion.proposed.maxLoss,
+            notes: repairResult.data.notes ?? ['Broker-confirmed repair preview loaded.'],
+          };
           return {
             ...suggestion,
-            previewDelta: {
-              status: 'ready' as const,
-              source: 'backend' as const,
-              premiumDelta: (proposedPreview.data?.estimatedPremium ?? 0) - (currentPreview.data?.estimatedPremium ?? 0),
-              feeDelta: (proposedPreview.data?.estimatedFees ?? 0) - (currentPreview.data?.estimatedFees ?? 0),
-              marginDelta: proposedMarginRequired - currentMarginRequired,
-              resultingMargin: proposedMarginRequired,
-              resultingMaxLoss: suggestion.proposed.maxLoss,
-              notes: [
-                'Broker-confirmed repair preview loaded.',
-                ...(proposedPreview.data?.notes ?? []),
-                ...(proposedMargin.data?.notes ?? []),
-              ],
+            previewDelta,
+            ranking: {
+              score: repairResult.data.ranking.score,
+              creditEfficiency: repairResult.data.ranking.creditEfficiency,
+              marginRelief: repairResult.data.ranking.marginRelief,
+              thesisPreservation: repairResult.data.ranking.thesisPreservation * 100,
             },
           };
         } catch {
           return suggestion;
         }
       }));
-      if (!cancelled) setSuggestions(next);
+      if (!cancelled) {
+        setSuggestions(next.sort((left, right) => right.ranking.score - left.ranking.score));
+      }
     };
 
     void hydrate();

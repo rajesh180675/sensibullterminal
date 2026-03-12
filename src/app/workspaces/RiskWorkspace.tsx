@@ -148,6 +148,9 @@ export function RiskWorkspace() {
                 <div className="mt-1 text-slate-400">
                   Source {suggestion.previewDelta.source === 'backend' ? 'broker preview' : 'local estimate'} · Status {suggestion.previewDelta.status}
                 </div>
+                <div className="mt-1 text-slate-400">
+                  Rank {suggestion.ranking.score} · Credit efficiency {suggestion.ranking.creditEfficiency} · Margin relief {fmtPnL(suggestion.ranking.marginRelief)} · Thesis preservation {Math.round(suggestion.ranking.thesisPreservation)}%
+                </div>
                 {suggestion.previewDelta.notes.length > 0 && (
                   <div className="mt-2 text-slate-400">{suggestion.previewDelta.notes.join(' | ')}</div>
                 )}

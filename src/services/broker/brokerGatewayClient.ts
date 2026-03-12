@@ -18,6 +18,9 @@ import {
   fetchOptionChain,
   fetchOrderBook,
   fetchPositions,
+  fetchRepairPreview,
+  fetchSellerReviewState,
+  saveSellerReviewState,
   fetchSpotPrice,
   fetchTradeBook,
   isKaggleBackend,
@@ -200,6 +203,9 @@ export const brokerGatewayClient = {
     async previewStrategy(session: BreezeSession, legs: Array<Record<string, unknown>>) {
       return fetchExecutionPreview(session.proxyBase, legs);
     },
+    async repairPreview(session: BreezeSession, payload: Record<string, unknown>) {
+      return fetchRepairPreview(session.proxyBase, payload);
+    },
     async fetchMargin(session: BreezeSession, legs: OptionLeg[]) {
       const cfg = SYMBOL_CONFIG[legs[0].symbol];
       return fetchMarginPreview(session.proxyBase, legs.map((leg) => ({
@@ -237,6 +243,14 @@ export const brokerGatewayClient = {
     },
     async fetchCallbacks(session: BreezeSession, limit = 25) {
       return fetchAutomationCallbacks(session.proxyBase, limit);
+    },
+  },
+  reviews: {
+    async fetchState(session: BreezeSession) {
+      return fetchSellerReviewState(session.proxyBase);
+    },
+    async saveState(session: BreezeSession, payload: Record<string, unknown>) {
+      return saveSellerReviewState(session.proxyBase, payload);
     },
   },
 };

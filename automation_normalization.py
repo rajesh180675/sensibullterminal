@@ -135,12 +135,36 @@ def normalize_position_mtm(row: dict, quantity: float) -> float:
 
 def normalize_position_row(row: dict) -> dict:
     quantity = normalize_position_quantity(row)
+    realized = safe_float(first_present(row, [
+        "booked_pnl",
+        "realized_pnl",
+        "realised_pnl",
+        "realized_profit_loss",
+        "realised_profit_loss",
+    ]))
+    unrealized = safe_float(first_present(row, [
+        "unrealized_profit_loss",
+        "unrealised_profit_loss",
+        "unrealized_pnl",
+        "unrealised_pnl",
+        "open_profit_loss",
+        "open_mtm",
+    ]))
+    broker_greeks = {
+        "delta": safe_float(first_present(row, ["delta", "option_delta", "greek_delta"])),
+        "gamma": safe_float(first_present(row, ["gamma", "option_gamma", "greek_gamma"])),
+        "theta": safe_float(first_present(row, ["theta", "option_theta", "greek_theta"])),
+        "vega": safe_float(first_present(row, ["vega", "option_vega", "greek_vega"])),
+    }
     return {
         "symbol": row_symbol(row),
         "quantity": quantity,
         "mtm": normalize_position_mtm(row, quantity),
         "averagePrice": safe_float(first_present(row, ["average_price", "avg_price", "averagePrice", "cost_price"])),
         "ltp": safe_float(first_present(row, ["ltp", "last_traded_price", "last_price", "market_price"])),
+        "realizedPnl": realized,
+        "unrealizedPnl": unrealized,
+        "brokerGreeks": broker_greeks,
         "raw": row,
     }
 

@@ -1,9 +1,11 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import type { OrderBookRow, TradeBookRow } from '../../utils/kaggleClient';
-import type { OptionLeg, Position, SellerJournalEntry, SellerJournalSummary, SellerOpportunity } from '../../types/index';
+import type { OptionLeg, Position, SellerJournalEntry, SellerJournalSummary, SellerOpportunity, SellerPlaybookReview, SellerReviewState } from '../../types/index';
 import { useExecutionStore } from '../execution/executionStore';
 import { usePortfolioStore } from '../portfolio/portfolioStore';
 import { useSellerIntelligenceStore } from '../seller/sellerIntelligenceStore';
+import { useSessionStore } from '../session/sessionStore';
 
 const STORAGE_KEY = 'sensibull.sellerJournal.v2';
 
@@ -71,6 +73,12 @@ function buildEntryFromOpportunity(opportunity: SellerOpportunity): SellerJourna
     outcome: 'pending',
     adjustmentCount: 0,
     adjustmentEffectiveness: 'unreviewed',
+    lifecycleEvents: [{
+      id: `event-captured-${now}`,
+      type: 'captured',
+      timestamp: now,
+      detail: 'Seller idea captured into the journal.',
+    }],
   };
 }
 
@@ -101,6 +109,39 @@ function tallyPnlBuckets(entries: SellerJournalEntry[]) {
     .sort((left, right) => Math.abs(right[1]) - Math.abs(left[1]))
     .slice(0, 5)
     .map(([label, value]) => ({ label, value }));
+}
+
+function buildPlaybookReviews(entries: SellerJournalEntry[]): SellerPlaybookReview[] {
+  const reviews = new Map<string, SellerPlaybookReview>();
+  entries.forEach((entry) => {
+    if (!entry.playbookName) return;
+    const current = reviews.get(entry.playbookName) ?? {
+      playbookName: entry.playbookName,
+      entries: 0,
+      alignedEntries: 0,
+      violations: 0,
+      netPnl: 0,
+      lastReviewedAt: entry.updatedAt,
+    };
+    current.entries += 1;
+    current.alignedEntries += entry.playbookCompliance === 'aligned' ? 1 : 0;
+    current.violations += entry.playbookCompliance === 'violates' ? 1 : 0;
+    current.netPnl += entry.netPnl;
+    current.lastReviewedAt = Math.max(current.lastReviewedAt, entry.updatedAt);
+    reviews.set(entry.playbookName, current);
+  });
+  return [...reviews.values()].sort((left, right) => right.lastReviewedAt - left.lastReviewedAt);
+}
+
+function mergeEntries(localEntries: SellerJournalEntry[], remoteEntries: SellerJournalEntry[]) {
+  const byId = new Map<string, SellerJournalEntry>();
+  [...remoteEntries, ...localEntries].forEach((entry) => {
+    const existing = byId.get(entry.id);
+    if (!existing || entry.updatedAt >= existing.updatedAt) {
+      byId.set(entry.id, entry);
+    }
+  });
+  return [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt);
 }
 
 function legMatchesRow(leg: OptionLeg, row: Record<string, unknown>) {
@@ -167,8 +208,11 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
   const { regime } = useSellerIntelligenceStore();
   const { blotter } = useExecutionStore();
   const { livePositions, orders, trades } = usePortfolioStore();
+  const { session } = useSessionStore();
   const [entries, setEntries] = useState<SellerJournalEntry[]>(() => loadEntries());
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
+  const [backendHydrated, setBackendHydrated] = useState(false);
+  const lastSavedState = useRef('');
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -206,6 +250,11 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
       },
     };
   }, [entries]);
+
+  const reviewState = useMemo<SellerReviewState>(() => ({
+    entries,
+    playbookReviews: buildPlaybookReviews(entries),
+  }), [entries]);
 
   const selectedEntry = useMemo(
     () => entries.find((entry) => entry.id === selectedEntryId) ?? entries[0] ?? null,
@@ -256,11 +305,40 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
           outcome: 'pending' as const,
           adjustmentCount: 0,
           adjustmentEffectiveness: 'unreviewed' as const,
+          lifecycleEvents: [{
+            id: `event-executed-${item.id}`,
+            type: 'executed' as const,
+            timestamp: item.submittedAt,
+            detail: 'Execution blotter item captured into the journal.',
+            orderIds: [item.id],
+          }],
         }));
       if (additions.length === 0) return current;
       return [...additions, ...current];
     });
   }, [blotter, regime.label]);
+
+  useEffect(() => {
+    if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) {
+      setBackendHydrated(false);
+      return;
+    }
+    let cancelled = false;
+    void brokerGatewayClient.reviews.fetchState(session).then((result) => {
+      if (cancelled || !result.ok || !result.data) {
+        setBackendHydrated(true);
+        return;
+      }
+      const remoteEntries = Array.isArray(result.data.entries) ? result.data.entries as unknown as SellerJournalEntry[] : [];
+      setEntries((current) => mergeEntries(current, remoteEntries));
+      setBackendHydrated(true);
+    }).catch(() => {
+      if (!cancelled) setBackendHydrated(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [session]);
 
   useEffect(() => {
     if (entries.length === 0) return;
@@ -275,6 +353,25 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
         (matchedOrders.length > 0 || matchedTrades.length > 0) ? 'closed' as const : 'unlinked' as const
       );
       const nextAdjustmentCount = deriveAdjustmentCount(entry, matchedPositions);
+      const lifecycleEvents = [...(entry.lifecycleEvents ?? [])];
+      if (linkedPositionStatus === 'open' && entry.linkedPositionStatus !== 'open') {
+        lifecycleEvents.unshift({
+          id: `event-linked-${entry.id}-${Date.now()}`,
+          type: 'linked_position',
+          timestamp: Date.now(),
+          detail: `Journal entry linked to ${matchedPositions.length} live position(s).`,
+          orderIds: matchedOrders.map((row) => row.order_id),
+          tradeIds: matchedTrades.map((row) => row.order_id),
+        });
+      }
+      if (nextAdjustmentCount > entry.adjustmentCount) {
+        lifecycleEvents.unshift({
+          id: `event-adjusted-${entry.id}-${Date.now()}`,
+          type: 'adjusted',
+          timestamp: Date.now(),
+          detail: `Detected ${nextAdjustmentCount - entry.adjustmentCount} additional repair leg(s) relative to the original structure.`,
+        });
+      }
       const nextEntry: SellerJournalEntry = {
         ...entry,
         linkedPositionIds: matchedPositions.map((position) => position.id),
@@ -295,13 +392,45 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
           : undefined,
         lastSyncedAt: Date.now(),
         adjustmentCount: nextAdjustmentCount,
+        lifecycleEvents,
       };
-      return {
+      const withEffectiveness: SellerJournalEntry = {
         ...nextEntry,
         adjustmentEffectiveness: deriveAdjustmentEffectiveness(nextEntry, entry.netPnl),
       };
+      if (
+        withEffectiveness.linkedPositionStatus === 'closed'
+        && entry.linkedPositionStatus !== 'closed'
+      ) {
+        withEffectiveness.lifecycleEvents = [
+          {
+            id: `event-closed-${entry.id}-${Date.now()}`,
+            type: 'closed',
+            timestamp: withEffectiveness.closedAt ?? Date.now(),
+            detail: 'Position lifecycle closed out and realized attribution captured from linked broker orders/trades.',
+            realizedPnl: withEffectiveness.realizedPnl,
+            orderIds: withEffectiveness.linkedOrderIds,
+            tradeIds: withEffectiveness.linkedTradeIds,
+          },
+          ...(withEffectiveness.lifecycleEvents ?? []),
+        ];
+      }
+      return withEffectiveness;
     }));
   }, [entries.length, livePositions, orders, trades]);
+
+  useEffect(() => {
+    if (!backendHydrated || !session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) return;
+    const serialized = JSON.stringify(reviewState);
+    if (serialized === lastSavedState.current) return;
+    lastSavedState.current = serialized;
+    void brokerGatewayClient.reviews.saveState(session, {
+      entries: reviewState.entries,
+      playbookReviews: reviewState.playbookReviews,
+    }).catch(() => {
+      lastSavedState.current = '';
+    });
+  }, [backendHydrated, reviewState, session]);
 
   const value = useMemo<JournalStoreValue>(() => ({
     entries,

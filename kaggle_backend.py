@@ -847,6 +847,38 @@ class AutomationRuleManager:
         return events
 
 
+class SellerReviewManager:
+    def __init__(self, path: str):
+        self.store = JsonStateStore(path, lambda: {"entries": [], "playbook_reviews": []})
+        self._lock = threading.Lock()
+        self._state = self.store.load()
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return {
+                "entries": list(self._state.get("entries", [])),
+                "playbook_reviews": list(self._state.get("playbook_reviews", [])),
+            }
+
+    def replace_state(self, payload: dict) -> dict:
+        entries = payload.get("entries", []) if isinstance(payload, dict) else []
+        playbook_reviews = payload.get("playbookReviews", payload.get("playbook_reviews", [])) if isinstance(payload, dict) else []
+        if not isinstance(entries, list):
+            entries = []
+        if not isinstance(playbook_reviews, list):
+            playbook_reviews = []
+        with self._lock:
+            self._state = {
+                "entries": entries,
+                "playbook_reviews": playbook_reviews,
+            }
+            self.store.save(self._state)
+            return {
+                "entries": list(entries),
+                "playbook_reviews": list(playbook_reviews),
+            }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BreezeEngine
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -874,6 +906,12 @@ class BreezeEngine:
             os.environ.get(
                 "BREEZE_AUTOMATION_RULE_FILE",
                 os.path.join(os.getcwd(), "logs", "automation_rules.json"),
+            ),
+        )
+        self.seller_reviews = SellerReviewManager(
+            os.environ.get(
+                "BREEZE_SELLER_REVIEW_FILE",
+                os.path.join(os.getcwd(), "logs", "seller_reviews.json"),
             ),
         )
         self._ws_thread   = None
@@ -1168,9 +1206,32 @@ class BreezeEngine:
             raise RuntimeError("Not connected")
         pos = self.rate_limiter.enqueue(self.breeze.get_portfolio_positions)
         hld = self.rate_limiter.enqueue(self.breeze.get_portfolio_holdings)
+        rows = pos.get("Success", []) if isinstance(pos, dict) else []
         return {
-            "positions": pos.get("Success", []) if isinstance(pos, dict) else [],
+            "positions": rows,
+            "normalized_positions": [self._normalise_position_snapshot(row) for row in rows if isinstance(row, dict)],
             "holdings":  hld.get("Success", []) if isinstance(hld, dict) else [],
+        }
+
+    def _normalise_position_snapshot(self, row: dict) -> dict:
+        normalized = self._normalise_position_row(row)
+        average_price = _safe_float(normalized.get("averagePrice"))
+        ltp = _safe_float(normalized.get("ltp"))
+        quantity = _safe_float(normalized.get("quantity"))
+        realized = _safe_float(normalized.get("realizedPnl"))
+        unrealized = _safe_float(normalized.get("unrealizedPnl"))
+        if unrealized == 0 and quantity and (average_price or ltp):
+            unrealized = (ltp - average_price) * quantity
+        return {
+            **row,
+            "normalized_symbol": normalized.get("symbol"),
+            "normalized_quantity": quantity,
+            "normalized_mtm": _safe_float(normalized.get("mtm")),
+            "normalized_average_price": average_price,
+            "normalized_ltp": ltp,
+            "normalized_realized_pnl": realized,
+            "normalized_unrealized_pnl": unrealized,
+            "broker_greeks": normalized.get("brokerGreeks", {}),
         }
 
     def get_funds(self) -> dict:
@@ -1519,6 +1580,99 @@ class BreezeEngine:
                 "previewLegs": validation_rows,
                 "margin": margin.get("validation", {}),
             },
+        }
+
+    @staticmethod
+    def _inventory_key(leg: dict) -> tuple:
+        right = "call" if str(leg.get("right") or "").lower().startswith("c") else "put"
+        return (
+            str(leg.get("stock_code", "")),
+            str(leg.get("exchange_code", "NFO")),
+            str(leg.get("expiry_date", "")),
+            right,
+            str(leg.get("strike_price", "")),
+        )
+
+    def _apply_repair_legs(self, current_legs: List[dict], repair_legs: List[dict]) -> List[dict]:
+        buckets: Dict[tuple, dict] = {}
+        for source in current_legs:
+            leg = self._normalise_execution_leg(source)
+            key = self._inventory_key(leg)
+            quantity = _safe_float(leg.get("quantity"))
+            signed = quantity if leg.get("action") == "buy" else -quantity
+            if key not in buckets:
+                buckets[key] = dict(leg)
+                buckets[key]["_net_quantity"] = signed
+            else:
+                buckets[key]["_net_quantity"] += signed
+
+        for source in repair_legs:
+            leg = self._normalise_execution_leg(source)
+            key = self._inventory_key(leg)
+            quantity = _safe_float(leg.get("quantity"))
+            signed = quantity if leg.get("action") == "buy" else -quantity
+            if key not in buckets:
+                buckets[key] = dict(leg)
+                buckets[key]["_net_quantity"] = signed
+            else:
+                buckets[key]["_net_quantity"] += signed
+
+        result: List[dict] = []
+        for leg in buckets.values():
+            net_quantity = _safe_float(leg.pop("_net_quantity", 0))
+            if abs(net_quantity) < 0.5:
+                continue
+            rebuilt = dict(leg)
+            rebuilt["action"] = "buy" if net_quantity > 0 else "sell"
+            rebuilt["quantity"] = str(int(abs(net_quantity)))
+            result.append(rebuilt)
+        return result
+
+    def repair_preview(self, current_legs: List[dict], repair_legs: List[dict], meta: Optional[dict] = None) -> dict:
+        if not self.connected:
+            raise RuntimeError("Not connected")
+        current_normalized = [self._normalise_execution_leg(leg) for leg in current_legs]
+        repair_normalized = [self._normalise_execution_leg(leg) for leg in repair_legs]
+        resulting_legs = self._apply_repair_legs(current_normalized, repair_normalized)
+        incremental = self.preview_strategy(repair_normalized) if repair_normalized else self.preview_strategy([])
+        current_margin = self.calculate_margin(current_normalized) if current_normalized else self.calculate_margin([])
+        resulting_margin = self.calculate_margin(resulting_legs) if resulting_legs else self.calculate_margin([])
+        repair_type = str((meta or {}).get("repair_type") or "repair")
+        strategy_family = str((meta or {}).get("strategy_family") or "custom")
+        thesis_preservation = 0.56
+        if repair_type in {"roll_tested_side", "roll_spread_wider", "recenter_structure"}:
+            thesis_preservation = 0.86
+        elif repair_type in {"add_wings", "reduce_winning_side"}:
+            thesis_preservation = 0.72
+        elif repair_type in {"close_tested_side"}:
+            thesis_preservation = 0.58
+        elif repair_type == "flatten_all":
+            thesis_preservation = 0.2
+        if strategy_family in {"calendar", "broken_wing", "ratio_repair", "expiry_day"}:
+            thesis_preservation = min(0.95, thesis_preservation + 0.05)
+
+        margin_relief = max(0.0, current_margin["margin_required"] - resulting_margin["margin_required"])
+        denominator = max(abs(incremental.get("estimatedFees", 0.0)) + abs(incremental.get("marginRequired", 0.0)) * 0.01, 1.0)
+        credit_efficiency = abs(incremental.get("estimatedPremium", 0.0)) / denominator
+        ranking = {
+            "creditEfficiency": round(credit_efficiency, 4),
+            "marginRelief": round(margin_relief, 2),
+            "thesisPreservation": round(thesis_preservation, 4),
+            "score": round(
+                min(100.0, credit_efficiency * 18.0 + (margin_relief / max(current_margin["margin_required"], 1.0)) * 40.0 + thesis_preservation * 35.0),
+                2,
+            ),
+        }
+        notes = list(incremental.get("notes", []))
+        notes.append("Repair preview is incremental: premium and fees reflect repair legs, margin delta compares live book before and after the repair.")
+        return {
+            "incrementalPreview": incremental,
+            "currentMargin": current_margin,
+            "resultingMargin": resulting_margin,
+            "resultingLegs": resulting_legs,
+            "ranking": ranking,
+            "notes": notes,
+            "updated_at": time.time(),
         }
 
     # ── REST: Historical OHLCV ────────────────────────────────────────────────
@@ -2242,6 +2396,25 @@ async def api_margin(request: Request):
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
+@app.post("/api/repair-preview")
+async def api_repair_preview(request: Request):
+    if not engine.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+
+    current_legs = body.get("current_legs", [])
+    repair_legs = body.get("repair_legs", [])
+    meta = body.get("meta", {})
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, engine.repair_preview, current_legs, repair_legs, meta)
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
 @app.get("/api/diagnostics/execution-validation")
 async def api_execution_validation(limit: int = Query(10)):
     return {
@@ -2359,6 +2532,24 @@ async def api_automation_evaluate():
 @app.get("/api/automation/callbacks")
 async def api_automation_callbacks(limit: int = Query(25)):
     return {"success": True, "events": engine.automation_rules.list_callbacks(limit=limit)}
+
+
+@app.get("/api/reviews/state")
+async def api_review_state():
+    return {"success": True, "data": engine.seller_reviews.get_state()}
+
+
+@app.put("/api/reviews/state")
+async def api_review_state_replace(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, engine.seller_reviews.replace_state, body)
+        return {"success": True, "data": data}
+    except Exception as exc:
+        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
 
 @app.post("/api/automation/callbacks")
