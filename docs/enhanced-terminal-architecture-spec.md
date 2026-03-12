@@ -15,6 +15,7 @@ Goals:
 Companion implementation plan:
 
 - `docs/enhanced-terminal-implementation-plan.md`
+- `docs/options-seller-terminal-spec.md` for the seller-first product PRD layered on this architecture
 
 Primary external sources used for endpoint inventory and transport assumptions:
 

@@ -9,3 +9,9 @@ To avoid browser CORS failures on Vercel, use the built-in serverless proxy rout
 - Optional server env var: `KAGGLE_TERMINAL_AUTH=<shared-secret>`
 
 This route forwards requests from Vercel to your Kaggle backend so the browser stays same-origin.
+
+## Product Docs
+
+- `docs/enhanced-terminal-architecture-spec.md`
+- `docs/enhanced-terminal-implementation-plan.md`
+- `docs/options-seller-terminal-spec.md`
