@@ -245,6 +245,27 @@ export interface BackendExecutionPreview {
   chargesBreakdown?: Record<string, number>;
   notes?: string[];
   updated_at?: number;
+  validation?: BackendExecutionValidationSummary;
+}
+
+export interface BackendExecutionValidationLegSummary {
+  kind: 'preview' | 'margin';
+  captured_at: number;
+  leg_count: number;
+  rawTopLevelFields: string[];
+  successFields: string[];
+  captureFile?: string;
+}
+
+export interface BackendExecutionValidationSummary {
+  kind: 'preview' | 'margin';
+  captured_at: number;
+  leg_count: number;
+  captureFile?: string;
+  rawTopLevelFields?: string[];
+  successFields?: string[];
+  previewLegs?: BackendExecutionValidationLegSummary[];
+  margin?: BackendExecutionValidationLegSummary;
 }
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -671,6 +692,22 @@ export async function fetchMarginPreview(
       body: JSON.stringify({ legs }),
     });
     return data.success ? { ok: true, data: data.data } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function fetchExecutionValidation(
+  backendUrl: string,
+  limit = 10,
+): Promise<{ ok: boolean; records?: Array<Record<string, unknown>>; captureFile?: string; error?: string }> {
+  const qs = new URLSearchParams({ limit: String(limit) });
+  const url = apiUrl(backendUrl, `/api/diagnostics/execution-validation?${qs}`);
+  try {
+    const data = await fetchJson<{ success: boolean; records?: Array<Record<string, unknown>>; capture_file?: string; error?: string }>(url);
+    return data.success
+      ? { ok: true, records: data.records ?? [], captureFile: data.capture_file }
+      : { ok: false, error: data.error ?? 'Unknown error' };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }

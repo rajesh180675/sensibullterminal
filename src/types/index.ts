@@ -174,6 +174,27 @@ export interface ExecutionPreview {
   chargesBreakdown?: Record<string, number>;
   updatedAt?: number;
   notes?: string[];
+  validation?: ExecutionValidationSummary;
+}
+
+export interface ExecutionValidationLegSummary {
+  kind: 'preview' | 'margin';
+  captured_at: number;
+  leg_count: number;
+  rawTopLevelFields: string[];
+  successFields: string[];
+  captureFile?: string;
+}
+
+export interface ExecutionValidationSummary {
+  kind: 'preview' | 'margin';
+  captured_at: number;
+  leg_count: number;
+  captureFile?: string;
+  rawTopLevelFields?: string[];
+  successFields?: string[];
+  previewLegs?: ExecutionValidationLegSummary[];
+  margin?: ExecutionValidationLegSummary;
 }
 
 export interface ExecutionBlotterItem {

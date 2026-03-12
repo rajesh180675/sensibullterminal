@@ -225,6 +225,25 @@ def _bucket_epoch(ts: float, interval: str) -> int:
     return int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
+class ValidationCaptureStore:
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._recent = deque(maxlen=25)
+
+    def append(self, record: dict) -> None:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        line = json.dumps(record, default=str)
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+            self._recent.appendleft(record)
+
+    def recent(self, limit: int = 10) -> List[dict]:
+        with self._lock:
+            return list(self._recent)[: max(1, min(limit, len(self._recent) or 1))]
+
+
 class CandleStore:
     INTERVALS = ("1minute", "5minute", "30minute", "1day")
 
@@ -315,6 +334,12 @@ class BreezeEngine:
         self.rate_limiter = RateLimiter()
         self.tick_store   = TickStore()
         self.candle_store = CandleStore()
+        self.validation_capture = ValidationCaptureStore(
+            os.environ.get(
+                "BREEZE_VALIDATION_CAPTURE_FILE",
+                os.path.join(os.getcwd(), "logs", "breeze_execution_validation.jsonl"),
+            )
+        )
         self._ws_thread   = None
         self._ws_lock     = threading.Lock()
         log.info("[BreezeEngine] initialised")
@@ -643,6 +668,38 @@ class BreezeEngine:
             return payload[0] if payload and isinstance(payload[0], dict) else {}
         return payload if isinstance(payload, dict) else {}
 
+    def _collect_field_names(self, payload: Any) -> List[str]:
+        if isinstance(payload, dict):
+            return sorted(str(key) for key in payload.keys())
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return sorted(str(key) for key in payload[0].keys())
+        return []
+
+    def _record_execution_validation(self, kind: str, legs: List[dict], raw_response: Any, payload: Any) -> dict:
+        captured_at = time.time()
+        record = {
+            "kind": kind,
+            "captured_at": captured_at,
+            "leg_count": len(legs),
+            "request_legs": legs,
+            "raw_top_level_fields": self._collect_field_names(raw_response),
+            "success_fields": self._collect_field_names(payload),
+            "raw_response": raw_response,
+            "success_payload": payload,
+        }
+        try:
+            self.validation_capture.append(record)
+        except Exception as exc:
+            log.warning(f"[Engine] validation capture failed: {exc}")
+        return {
+            "kind": kind,
+            "captured_at": captured_at,
+            "leg_count": len(legs),
+            "rawTopLevelFields": record["raw_top_level_fields"],
+            "successFields": record["success_fields"],
+            "captureFile": self.validation_capture.path,
+        }
+
     def _build_margin_position(self, leg: dict) -> dict:
         normalised = self._normalise_execution_leg(leg)
         return {
@@ -701,12 +758,21 @@ class BreezeEngine:
                 "order_margin": 0.0,
                 "trade_margin": 0.0,
                 "raw": {},
+                "validation": {
+                    "kind": "margin",
+                    "captured_at": time.time(),
+                    "leg_count": 0,
+                    "rawTopLevelFields": [],
+                    "successFields": [],
+                    "captureFile": self.validation_capture.path,
+                },
             }
 
         positions = [self._build_margin_position(leg) for leg in legs]
         exchange_code = str(legs[0].get("exchange_code", "NFO"))
         result = self.rate_limiter.enqueue(self.breeze.margin_calculator, positions, exchange_code)
         payload = self._extract_success_payload(result)
+        validation = self._record_execution_validation("margin", legs, result, payload)
         funds = self.get_funds()
 
         order_margin = _safe_float(
@@ -740,6 +806,7 @@ class BreezeEngine:
             "order_margin": order_margin,
             "trade_margin": trade_margin,
             "raw": payload,
+            "validation": validation,
         }
 
     def preview_strategy(self, legs: List[dict]) -> dict:
@@ -761,9 +828,25 @@ class BreezeEngine:
                 "chargesBreakdown": {},
                 "notes": [],
                 "updated_at": time.time(),
+                "validation": {
+                    "kind": "preview",
+                    "captured_at": time.time(),
+                    "leg_count": 0,
+                    "captureFile": self.validation_capture.path,
+                    "previewLegs": [],
+                    "margin": {
+                        "kind": "margin",
+                        "captured_at": time.time(),
+                        "leg_count": 0,
+                        "rawTopLevelFields": [],
+                        "successFields": [],
+                        "captureFile": self.validation_capture.path,
+                    },
+                },
             }
 
         preview_rows = []
+        validation_rows = []
         total_brokerage = 0.0
         total_charges = 0.0
         charges_breakdown: Dict[str, float] = {}
@@ -797,6 +880,7 @@ class BreezeEngine:
                 "N",
             )
             payload = self._extract_success_payload(response)
+            validation_rows.append(self._record_execution_validation("preview", [normalised], response, payload))
             brokerage, total, charges = self._sum_known_charge_fields(payload)
             total_brokerage += brokerage
             total_charges += total
@@ -828,6 +912,14 @@ class BreezeEngine:
             "notes": notes,
             "updated_at": time.time(),
             "legs": preview_rows,
+            "validation": {
+                "kind": "preview",
+                "captured_at": time.time(),
+                "leg_count": len(legs),
+                "captureFile": self.validation_capture.path,
+                "previewLegs": validation_rows,
+                "margin": margin.get("validation", {}),
+            },
         }
 
     # ── REST: Historical OHLCV ────────────────────────────────────────────────
@@ -1525,10 +1617,20 @@ async def api_margin(request: Request):
                 "chargesBreakdown": {},
                 "notes": [],
                 "updated_at": time.time(),
+                "validation": data.get("validation"),
             },
         }
     except Exception as exc:
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
+
+
+@app.get("/api/diagnostics/execution-validation")
+async def api_execution_validation(limit: int = Query(10)):
+    return {
+        "success": True,
+        "capture_file": engine.validation_capture.path,
+        "records": engine.validation_capture.recent(limit),
+    }
 
 @app.post("/api/order")
 async def api_order(request: Request):
@@ -1926,6 +2028,7 @@ def main():
     print("    POST  /api/strategy/execute multi-leg concurrent order")
     print("    POST  /api/preview          broker-native preview aggregation")
     print("    POST  /api/margin           broker-native margin aggregation")
+    print("    GET   /api/diagnostics/execution-validation recent preview/margin captures")
     print("    POST  /api/squareoff        exit / square-off a position")
     print("    POST  /api/order/cancel     cancel pending order")
     print("    PATCH /api/order/modify     modify order price/qty")

@@ -56,6 +56,13 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
           {previewStatus === 'loading' ? ' · refreshing...' : ''}
           {preview.availableMargin !== undefined ? ` · Available margin ${fmtPnL(preview.availableMargin)}` : ''}
         </div>
+        {preview.validation && (
+          <div className="mt-3 rounded-3xl border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-xs text-cyan-100">
+            Preview fields: {preview.validation.previewLegs?.[0]?.successFields.join(', ') || 'not captured yet'}
+            {preview.validation.margin ? ` · Margin fields: ${preview.validation.margin.successFields.join(', ') || 'not captured yet'}` : ''}
+            {preview.validation.captureFile ? ` · Capture file: ${preview.validation.captureFile}` : ''}
+          </div>
+        )}
       </section>
 
       <div className="grid gap-4">

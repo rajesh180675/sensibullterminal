@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { SYMBOL_CONFIG } from '../../config/market';
-import type { ExecutionBlotterItem, ExecutionPreview, OptionLeg, Position } from '../../types/index';
+import type { ExecutionBlotterItem, ExecutionPreview, ExecutionValidationSummary, OptionLeg, Position } from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { buildPayoff, findBreakevens, maxProfitLoss } from '../../utils/math';
@@ -67,6 +67,33 @@ function enrichPreview(base: ExecutionPreview, patch?: Partial<ExecutionPreview>
     maxProfit: patch.maxProfit ?? base.maxProfit,
     maxLoss: patch.maxLoss ?? base.maxLoss,
     breakevens: patch.breakevens ?? base.breakevens,
+  };
+}
+
+function mergeValidation(
+  previewValidation?: ExecutionValidationSummary,
+  marginValidation?: ExecutionValidationSummary,
+): ExecutionValidationSummary | undefined {
+  if (!previewValidation && !marginValidation) return undefined;
+  const marginLegValidation = previewValidation?.margin ?? (
+    marginValidation
+      ? {
+          kind: 'margin',
+          captured_at: marginValidation.captured_at,
+          leg_count: marginValidation.leg_count,
+          rawTopLevelFields: marginValidation.rawTopLevelFields ?? [],
+          successFields: marginValidation.successFields ?? [],
+          captureFile: marginValidation.captureFile,
+        }
+      : undefined
+  );
+  return {
+    kind: 'preview',
+    captured_at: previewValidation?.captured_at ?? marginValidation?.captured_at ?? Date.now(),
+    leg_count: previewValidation?.leg_count ?? marginValidation?.leg_count ?? 0,
+    captureFile: previewValidation?.captureFile ?? marginValidation?.captureFile,
+    previewLegs: previewValidation?.previewLegs ?? [],
+    margin: marginLegValidation,
   };
 }
 
@@ -194,6 +221,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
         ...marginResult.data,
         source: 'backend',
         updatedAt: previewResult.data?.updated_at ?? marginResult.data?.updated_at ?? Date.now(),
+        validation: mergeValidation(previewResult.data?.validation, marginResult.data?.validation),
       });
       setPreview(merged);
       setPreviewStatus('ready');
