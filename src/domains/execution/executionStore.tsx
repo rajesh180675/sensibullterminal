@@ -121,6 +121,7 @@ interface ExecutionStoreValue {
   isExecuting: boolean;
   addLeg: (leg: Omit<OptionLeg, 'id'>) => void;
   appendLegs: (legs: Array<Omit<OptionLeg, 'id'>>) => void;
+  stageStrategy: (legs: Array<Omit<OptionLeg, 'id'>>) => void;
   updateLeg: (id: string, update: Partial<OptionLeg>) => void;
   removeLeg: (id: string) => void;
   clearLegs: () => void;
@@ -150,6 +151,10 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
       ...current,
       ...nextLegs.map((leg) => ({ ...leg, id: nextExecutionLegId() })),
     ]);
+  }, []);
+
+  const stageStrategy = useCallback((nextLegs: Array<Omit<OptionLeg, 'id'>>) => {
+    setLegs(nextLegs.map((leg) => ({ ...leg, id: nextExecutionLegId() })));
   }, []);
 
   const updateLeg = useCallback((id: string, update: Partial<OptionLeg>) => {
@@ -365,13 +370,14 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     isExecuting,
     addLeg,
     appendLegs,
+    stageStrategy,
     updateLeg,
     removeLeg,
     clearLegs,
     loadPosition,
     clearBlotter,
     executeStrategy,
-  }), [legs, preview, previewStatus, blotter, isExecuting, addLeg, appendLegs, updateLeg, removeLeg, clearLegs, loadPosition, clearBlotter, executeStrategy]);
+  }), [legs, preview, previewStatus, blotter, isExecuting, addLeg, appendLegs, stageStrategy, updateLeg, removeLeg, clearLegs, loadPosition, clearBlotter, executeStrategy]);
 
   return <ExecutionStore.Provider value={value}>{children}</ExecutionStore.Provider>;
 }

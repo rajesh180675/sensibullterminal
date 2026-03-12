@@ -4,7 +4,9 @@ import { OptionChain } from '../../components/OptionChain';
 import { ALL_SYMBOLS, SYMBOL_CONFIG } from '../../config/market';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
+import { useSellerIntelligenceStore } from '../../domains/seller/sellerIntelligenceStore';
 import { useSessionStore } from '../../domains/session/sessionStore';
+import { fmtPnL } from '../../utils/math';
 
 export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void }) {
   const {
@@ -27,8 +29,9 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
     setChartInterval,
     isHistoricalLoading,
   } = useMarketStore();
-  const { addLeg, legs } = useExecutionStore();
+  const { addLeg, legs, stageStrategy } = useExecutionStore();
   const { isLive, statusMessage } = useSessionStore();
+  const { regime, opportunities } = useSellerIntelligenceStore();
 
   const nearestStrikeDiff = chain.length > 0
     ? Math.min(...chain.map((row) => Math.abs(row.strike - spotPrice)))
@@ -58,6 +61,29 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
           <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.3em] text-orange-300/70">
             <Star size={13} />
             Watchlists
+          </div>
+          <div className="mt-4 rounded-3xl border border-orange-500/20 bg-orange-500/10 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-[11px] uppercase tracking-[0.2em] text-orange-200/70">Seller Regime</div>
+                <div className="mt-1 text-lg font-semibold text-white">{regime.label}</div>
+              </div>
+              <div className="text-right">
+                <div className="text-xs text-orange-100/80">Suitability {regime.sellerSuitability}/100</div>
+                <div className="text-xs text-slate-300">Confidence {regime.confidence}%</div>
+              </div>
+            </div>
+            <div className="mt-3 text-sm text-slate-200">{regime.summary}</div>
+            <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+              {regime.metrics.map((metric) => (
+                <div key={metric.label} className="rounded-2xl bg-black/15 px-3 py-2 text-slate-300">
+                  <div className="text-slate-500">{metric.label}</div>
+                  <div className={`${metric.tone === 'positive' ? 'text-emerald-300' : metric.tone === 'warning' || metric.tone === 'critical' ? 'text-amber-300' : 'text-white'} mt-1 font-semibold`}>
+                    {metric.value}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
           <div className="mt-4 grid gap-2">
             {ALL_SYMBOLS.map((code) => {
@@ -99,6 +125,32 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
                 </div>
               </div>
             ))}
+          </div>
+
+          <div className="mt-5 rounded-3xl border border-white/8 bg-white/5 p-4">
+            <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Opportunity feed</div>
+            <div className="mt-3 space-y-2">
+              {opportunities.slice(0, 2).map((idea) => (
+                <button
+                  key={idea.id}
+                  onClick={() => {
+                    stageStrategy(idea.legs);
+                    onOpenStrategy();
+                  }}
+                  className="w-full rounded-2xl border border-white/8 bg-[#0f1728] px-3 py-3 text-left transition hover:border-orange-400/30 hover:bg-[#111c30]"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-white">{idea.title}</div>
+                    <div className="text-xs text-orange-200">Score {idea.sellerScore}</div>
+                  </div>
+                  <div className="mt-1 text-xs text-slate-400">{idea.structure} · {idea.playbookMatches[0] ?? 'Direct seller idea'}</div>
+                  <div className="mt-2 flex items-center justify-between text-xs text-slate-300">
+                    <span>Credit {fmtPnL(idea.expectedCredit)}</span>
+                    <span>Risk {fmtPnL(idea.maxLossEstimate)}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
           </div>
         </section>
 

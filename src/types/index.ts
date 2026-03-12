@@ -257,6 +257,83 @@ export interface RiskSnapshot {
   alerts: RiskAlert[];
 }
 
+export interface SellerMetric {
+  label: string;
+  value: string;
+  tone?: 'neutral' | 'positive' | 'warning' | 'critical';
+}
+
+export interface SellerRegime {
+  id:
+    | 'range_bound'
+    | 'trend_up'
+    | 'trend_down'
+    | 'volatile_expansion'
+    | 'post_event_vol_crush'
+    | 'pre_event_uncertainty'
+    | 'expiry_pinning';
+  label: string;
+  summary: string;
+  sellerSuitability: number;
+  confidence: number;
+  metrics: SellerMetric[];
+  preferredStructures: string[];
+  restrictedStructures: string[];
+  warnings: string[];
+}
+
+export interface SellerPlaybook {
+  id: string;
+  name: string;
+  description: string;
+  targetRegimes: SellerRegime['id'][];
+  allowedStructures: string[];
+  riskBudgetPct: number;
+  style: 'neutral_income' | 'directional_credit' | 'expiry_decay';
+  noTradeConditions: string[];
+}
+
+export interface SellerOpportunityLeg {
+  symbol: SymbolCode;
+  type: 'CE' | 'PE';
+  strike: number;
+  action: 'BUY' | 'SELL';
+  lots: number;
+  ltp: number;
+  iv: number;
+  delta: number;
+  theta: number;
+  gamma: number;
+  vega: number;
+  expiry: string;
+  orderType?: 'market' | 'limit';
+  limitPrice?: number;
+}
+
+export interface SellerOpportunity {
+  id: string;
+  title: string;
+  structure: string;
+  mode: 'conservative_income' | 'aggressive_theta' | 'hedged_only' | 'defined_risk_only' | 'expiry_day';
+  regimeFit: number;
+  sellerScore: number;
+  thesis: string;
+  whyNow: string;
+  expectedCredit: number;
+  marginEstimate: number;
+  maxLossEstimate: number;
+  thetaPerMargin: number;
+  liquidityScore: number;
+  tailRiskScore: number;
+  breakevens: number[];
+  invalidation: string;
+  adjustmentPlan: string;
+  warnings: string[];
+  tags: string[];
+  playbookMatches: string[];
+  legs: SellerOpportunityLeg[];
+}
+
 export interface AutomationRule {
   id: string;
   name: string;

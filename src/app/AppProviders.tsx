@@ -5,6 +5,7 @@ import { MarketProvider } from '../domains/market/marketStore';
 import { PortfolioProvider } from '../domains/portfolio/portfolioStore';
 import { ExecutionProvider } from '../domains/execution/executionStore';
 import { RiskProvider } from '../domains/risk/riskStore';
+import { SellerIntelligenceProvider } from '../domains/seller/sellerIntelligenceStore';
 import { NotificationProvider } from '../stores/notificationStore';
 
 export function AppProviders({ children }: { children: React.ReactNode }) {
@@ -15,9 +16,11 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
           <PortfolioProvider>
             <ExecutionProvider>
               <RiskProvider>
-                <AutomationProvider>
-                  {children}
-                </AutomationProvider>
+                <SellerIntelligenceProvider>
+                  <AutomationProvider>
+                    {children}
+                  </AutomationProvider>
+                </SellerIntelligenceProvider>
               </RiskProvider>
             </ExecutionProvider>
           </PortfolioProvider>
