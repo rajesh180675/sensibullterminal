@@ -862,6 +862,7 @@ class BreezeEngine:
             normalised = self._normalise_execution_leg(leg)
             price = _safe_float(normalised["price"])
             quantity = _safe_float(normalised["quantity"])
+            preview_price = "0" if normalised["order_type"] == "market" else normalised["price"]
             estimated_premium += price * quantity * (1 if normalised["action"] == "sell" else -1)
             capital_at_risk += abs(price * quantity)
             slippage += abs(price * quantity) * 0.0006
@@ -872,7 +873,7 @@ class BreezeEngine:
                 exchange_code=normalised["exchange_code"],
                 product=normalised["product"],
                 order_type=normalised["order_type"],
-                price=normalised["price"],
+                price=preview_price,
                 action=normalised["action"],
                 quantity=normalised["quantity"],
                 expiry_date=normalised["expiry_date"],
