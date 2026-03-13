@@ -3,11 +3,10 @@ import { ConnectBrokerModal } from '../../components/ConnectBrokerModal';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
 import { useSessionStore } from '../../domains/session/sessionStore';
-import { BottomDock } from './BottomDock';
 import { CommandPalette } from './CommandPalette';
-import { RightDrawer } from './RightDrawer';
 import { WorkspaceHeader } from './WorkspaceHeader';
 import { WorkspaceNav } from './WorkspaceNav';
+import { WorkspaceSubnav } from './WorkspaceSubnav';
 import { type WorkspacePath } from '../router';
 import { MarketWorkspace } from '../workspaces/MarketWorkspace';
 import { StrategyWorkspace } from '../workspaces/StrategyWorkspace';
@@ -86,31 +85,42 @@ export function AppShell({
   }
 
   return (
-    <div className="flex h-screen bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.08),transparent_28%),radial-gradient(circle_at_bottom_right,rgba(56,189,248,0.08),transparent_24%),#050a12] text-white">
-      <WorkspaceNav currentPath={currentPath} onNavigate={onNavigate} strategyLegCount={legs.length} />
-
-      <div className="flex min-w-0 flex-1 flex-col">
-        <WorkspaceHeader
+    <div className="h-screen overflow-hidden bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.12),transparent_24%),radial-gradient(circle_at_bottom_right,rgba(34,197,94,0.08),transparent_20%),linear-gradient(180deg,#04090f,#07111b_34%,#06111a)] p-3 text-white">
+      <div className="flex h-full gap-3">
+        <WorkspaceNav
           currentPath={currentPath}
-          symbol={symbol}
-          onSymbolChange={setSymbol}
+          onNavigate={onNavigate}
+          strategyLegCount={legs.length}
+          isLive={isLive}
+          statusMessage={statusMessage}
           onOpenConnections={() => {
             onNavigate('/settings/connections');
             openConnectionCenter();
           }}
-          onRefresh={() => void refreshMarket()}
-          statusMessage={statusMessage}
-          isLive={isLive}
-          lastUpdate={lastUpdate}
-          liveIndices={liveIndices}
         />
 
-        <div className="flex min-h-0 flex-1">
-          <main className="min-w-0 flex-1 overflow-hidden">{content}</main>
-          <RightDrawer />
+        <div className="flex min-w-0 flex-1 overflow-hidden rounded-[30px] border border-white/8 bg-[linear-gradient(180deg,rgba(10,20,34,0.95),rgba(6,12,20,0.92))] shadow-[0_24px_80px_rgba(0,0,0,0.42)]">
+          <div className="flex min-w-0 flex-1 flex-col">
+            <WorkspaceHeader
+              currentPath={currentPath}
+              symbol={symbol}
+              onSymbolChange={setSymbol}
+              onOpenConnections={() => {
+                onNavigate('/settings/connections');
+                openConnectionCenter();
+              }}
+              onRefresh={() => void refreshMarket()}
+              statusMessage={statusMessage}
+              isLive={isLive}
+              lastUpdate={lastUpdate}
+              liveIndices={liveIndices}
+            />
+            <WorkspaceSubnav currentPath={currentPath} />
+            <main className="min-h-0 min-w-0 flex-1 overflow-auto bg-[linear-gradient(180deg,rgba(7,14,23,0.2),rgba(7,14,23,0.68))]">
+              {content}
+            </main>
+          </div>
         </div>
-
-        <BottomDock />
       </div>
 
       <CommandPalette

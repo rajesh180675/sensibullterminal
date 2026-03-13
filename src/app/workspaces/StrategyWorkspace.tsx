@@ -19,7 +19,7 @@ export function StrategyWorkspace() {
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[0.95fr,1.45fr]">
       <div className="grid min-h-0 gap-4">
-        <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
+        <section id="strategy-regime" className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
           <div className="flex items-start justify-between gap-3">
             <div>
               <div className="text-[11px] uppercase tracking-[0.3em] text-orange-300/70">Seller Regime</div>
@@ -50,7 +50,7 @@ export function StrategyWorkspace() {
           )}
         </section>
 
-        <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
+        <section id="strategy-ideas" className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
           <div className="text-[11px] uppercase tracking-[0.3em] text-orange-300/70">Portfolio Overlay</div>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             <div className="rounded-3xl bg-white/5 px-4 py-4">
@@ -70,7 +70,7 @@ export function StrategyWorkspace() {
           </div>
         </section>
 
-        <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
+        <section id="strategy-playbooks" className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
           <div className="text-[11px] uppercase tracking-[0.3em] text-orange-300/70">Opportunity Feed</div>
           <div className="mt-4 space-y-3">
             {opportunities.map((idea) => (
@@ -202,7 +202,7 @@ export function StrategyWorkspace() {
         </section>
       </div>
 
-      <div className="min-h-0 overflow-hidden rounded-[28px] border border-white/8 bg-[#09111f]">
+      <div id="strategy-builder" className="min-h-0 overflow-hidden rounded-[28px] border border-white/8 bg-[#09111f]">
         <div className="h-[calc(100%-86px)] overflow-hidden">
           <StrategyBuilder
             legs={legs}
