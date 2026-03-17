@@ -12,7 +12,8 @@ import {
   TrendingUp, TrendingDown, Activity, Wifi, WifiOff,
   ChevronDown, Bell, Settings, Zap,
 } from 'lucide-react';
-import { SYMBOL_CONFIG, ALL_SYMBOLS, SPOT_PRICES } from '../config/market';
+import { SYMBOL_CONFIG, ALL_SYMBOLS, DEFAULT_SPOT_PRICES } from '../config/market';
+import { useSpotPriceStore } from '../state/market/spotPriceStore';
 import { BreezeSession, SymbolCode, MarketIndex } from '../types/index';
 
 interface Props {
@@ -45,9 +46,9 @@ export const TopBar: React.FC<Props> = ({
   const [showDD, setShowDD] = useState(false);
   const hideDropdownTimeoutRef = useRef<number | null>(null);
   const cfg         = SYMBOL_CONFIG[selectedSymbol];
+  const prices      = useSpotPriceStore((state) => state.prices);
 
-  // BUG 7 FIX: prefer prop over stale module-level constant
-  const spot        = spotPrice ?? SPOT_PRICES[selectedSymbol];
+  const spot        = prices[selectedSymbol] ?? spotPrice ?? DEFAULT_SPOT_PRICES[selectedSymbol];
   const isConnected = session?.isConnected ?? false;
 
   // BUG 7 FIX: use liveIndices prop (React state) not MARKET_INDICES constant
@@ -133,8 +134,7 @@ export const TopBar: React.FC<Props> = ({
             <div className="absolute top-full left-0 mt-1.5 bg-[#1a1d2e] border border-gray-700/40 rounded-2xl shadow-2xl shadow-black/60 z-50 py-1.5 min-w-[320px]">
               {ALL_SYMBOLS.map(sym => {
                 const c   = SYMBOL_CONFIG[sym];
-                // BUG 7 FIX: show live spot for selected symbol, cached for others
-                const s   = sym === selectedSymbol ? spot : SPOT_PRICES[sym];
+                const s   = prices[sym] ?? DEFAULT_SPOT_PRICES[sym];
                 const sel = sym === selectedSymbol;
                 return (
                   <button key={sym} onMouseDown={() => { onSymbolChange(sym); setShowDD(false); }}

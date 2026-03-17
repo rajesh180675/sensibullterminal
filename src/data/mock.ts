@@ -5,11 +5,16 @@
 // ================================================================
 
 import { OptionRow, Position, SymbolCode } from '../types/index';
-import { SYMBOL_CONFIG, SPOT_PRICES, getExpiries } from '../config/market';
+import { SYMBOL_CONFIG, getExpiries } from '../config/market';
+import { useSpotPriceStore } from '../state/market/spotPriceStore';
+
+function currentSpot(symbol: SymbolCode): number {
+  return useSpotPriceStore.getState().getSpot(symbol);
+}
 
 export function generateChain(symbol: SymbolCode, spotOverride?: number): OptionRow[] {
   const cfg   = SYMBOL_CONFIG[symbol];
-  const spot  = spotOverride ?? SPOT_PRICES[symbol];
+  const spot  = spotOverride ?? currentSpot(symbol);
   const step  = cfg.strikeStep;
   const ATM   = Math.round(spot / step) * step;
   const N     = 15;
@@ -47,6 +52,7 @@ export function generateChain(symbol: SymbolCode, spotOverride?: number): Option
 
     return {
       strike, isATM,
+      greekSource: 'approximate',
       ce_ltp:    ceLTP,
       ce_oi:     ceOI,
       ce_oiChg:  Math.round((Math.random()-0.42)*ceOI*0.05),
@@ -105,34 +111,39 @@ function getDynamicExpiry(symbol: SymbolCode, offsetWeeks = 0): string {
   return expiries[idx]?.breezeValue ?? expiries[0]?.breezeValue ?? '';
 }
 
-export const MOCK_POSITIONS: Position[] = [
-  {
-    id:'p1', symbol:'NIFTY', expiry: getDynamicExpiry('NIFTY', 0),
-    strategy:'Bull Call Spread', entryDate: new Date(Date.now() - 3*86400000).toISOString().slice(0,10),
-    status:'ACTIVE', mtmPnl:3250, realizedPnl: 400, unrealizedPnl: 2850, maxProfit:8750, maxLoss:-3750,
-    legs:[
-      { id:'p1-leg1', type:'CE', strike:SPOT_PRICES.NIFTY - 100, action:'BUY',  lots:1, quantity: 75, entryPrice:185.00, currentPrice:210.50, pnl: 3250, realizedPnl: 0, unrealizedPnl: 3250 },
-      { id:'p1-leg2', type:'CE', strike:SPOT_PRICES.NIFTY + 100, action:'SELL', lots:1, quantity: 75, entryPrice: 98.00, currentPrice: 95.25, pnl:  179, realizedPnl: 400, unrealizedPnl: -221 },
-    ],
-  },
-  {
-    id:'p2', symbol:'NIFTY', expiry: getDynamicExpiry('NIFTY', 0),
-    strategy:'Short Strangle', entryDate: new Date(Date.now() - 5*86400000).toISOString().slice(0,10),
-    status:'ACTIVE', mtmPnl:-1450, realizedPnl: 600, unrealizedPnl: -2050, maxProfit:12600, maxLoss:-Infinity,
-    legs:[
-      { id:'p2-leg1', type:'CE', strike:SPOT_PRICES.NIFTY + 500, action:'SELL', lots:2, quantity: 150, entryPrice:125.00, currentPrice:142.50, pnl:-2275, realizedPnl: 0, unrealizedPnl: -2275 },
-      { id:'p2-leg2', type:'PE', strike:SPOT_PRICES.NIFTY - 500, action:'SELL', lots:2, quantity: 150, entryPrice:110.00, currentPrice:101.25, pnl: 1138, realizedPnl: 600, unrealizedPnl: 538 },
-    ],
-  },
-  {
-    id:'p3', symbol:'BSESEN', expiry: getDynamicExpiry('BSESEN', 0),
-    strategy:'Iron Condor', entryDate: new Date(Date.now() - 1*86400000).toISOString().slice(0,10),
-    status:'DRAFT', mtmPnl:0, realizedPnl: 0, unrealizedPnl: 0, maxProfit:5400, maxLoss:-2100,
-    legs:[
-      { id:'p3-leg1', type:'CE', strike:SPOT_PRICES.BSESEN + 500,  action:'SELL', lots:1, quantity: 20, entryPrice:280, currentPrice:275, pnl: 100, realizedPnl: 0, unrealizedPnl: 100 },
-      { id:'p3-leg2', type:'CE', strike:SPOT_PRICES.BSESEN + 1000, action:'BUY',  lots:1, quantity: 20, entryPrice:155, currentPrice:148, pnl:-140, realizedPnl: 0, unrealizedPnl: -140 },
-      { id:'p3-leg3', type:'PE', strike:SPOT_PRICES.BSESEN - 500,  action:'SELL', lots:1, quantity: 20, entryPrice:260, currentPrice:252, pnl: 160, realizedPnl: 0, unrealizedPnl: 160 },
-      { id:'p3-leg4', type:'PE', strike:SPOT_PRICES.BSESEN - 1000, action:'BUY',  lots:1, quantity: 20, entryPrice:148, currentPrice:143, pnl:-100, realizedPnl: 0, unrealizedPnl: -100 },
-    ],
-  },
-];
+export function getMockPositions(): Position[] {
+  const niftySpot = currentSpot('NIFTY');
+  const sensexSpot = currentSpot('BSESEN');
+
+  return [
+    {
+      id:'p1', symbol:'NIFTY', expiry: getDynamicExpiry('NIFTY', 0),
+      strategy:'Bull Call Spread', entryDate: new Date(Date.now() - 3*86400000).toISOString().slice(0,10),
+      status:'ACTIVE', mtmPnl:3250, realizedPnl: 400, unrealizedPnl: 2850, maxProfit:8750, maxLoss:-3750,
+      legs:[
+        { id:'p1-leg1', type:'CE', strike:niftySpot - 100, action:'BUY',  lots:1, quantity: 75, entryPrice:185.00, currentPrice:210.50, pnl: 3250, realizedPnl: 0, unrealizedPnl: 3250 },
+        { id:'p1-leg2', type:'CE', strike:niftySpot + 100, action:'SELL', lots:1, quantity: 75, entryPrice: 98.00, currentPrice: 95.25, pnl:  179, realizedPnl: 400, unrealizedPnl: -221 },
+      ],
+    },
+    {
+      id:'p2', symbol:'NIFTY', expiry: getDynamicExpiry('NIFTY', 0),
+      strategy:'Short Strangle', entryDate: new Date(Date.now() - 5*86400000).toISOString().slice(0,10),
+      status:'ACTIVE', mtmPnl:-1450, realizedPnl: 600, unrealizedPnl: -2050, maxProfit:12600, maxLoss:-Infinity,
+      legs:[
+        { id:'p2-leg1', type:'CE', strike:niftySpot + 500, action:'SELL', lots:2, quantity: 150, entryPrice:125.00, currentPrice:142.50, pnl:-2275, realizedPnl: 0, unrealizedPnl: -2275 },
+        { id:'p2-leg2', type:'PE', strike:niftySpot - 500, action:'SELL', lots:2, quantity: 150, entryPrice:110.00, currentPrice:101.25, pnl: 1138, realizedPnl: 600, unrealizedPnl: 538 },
+      ],
+    },
+    {
+      id:'p3', symbol:'BSESEN', expiry: getDynamicExpiry('BSESEN', 0),
+      strategy:'Iron Condor', entryDate: new Date(Date.now() - 1*86400000).toISOString().slice(0,10),
+      status:'DRAFT', mtmPnl:0, realizedPnl: 0, unrealizedPnl: 0, maxProfit:5400, maxLoss:-2100,
+      legs:[
+        { id:'p3-leg1', type:'CE', strike:sensexSpot + 500,  action:'SELL', lots:1, quantity: 20, entryPrice:280, currentPrice:275, pnl: 100, realizedPnl: 0, unrealizedPnl: 100 },
+        { id:'p3-leg2', type:'CE', strike:sensexSpot + 1000, action:'BUY',  lots:1, quantity: 20, entryPrice:155, currentPrice:148, pnl:-140, realizedPnl: 0, unrealizedPnl: -140 },
+        { id:'p3-leg3', type:'PE', strike:sensexSpot - 500,  action:'SELL', lots:1, quantity: 20, entryPrice:260, currentPrice:252, pnl: 160, realizedPnl: 0, unrealizedPnl: 160 },
+        { id:'p3-leg4', type:'PE', strike:sensexSpot - 1000, action:'BUY',  lots:1, quantity: 20, entryPrice:148, currentPrice:143, pnl:-100, realizedPnl: 0, unrealizedPnl: -100 },
+      ],
+    },
+  ];
+}

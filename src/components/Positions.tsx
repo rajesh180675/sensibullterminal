@@ -43,7 +43,7 @@ import {
   ArrowDownAZ, Ban, Download, Percent,
 } from 'lucide-react';
 import { Position, SymbolCode, BreezeSession } from '../types/index';
-import { MOCK_POSITIONS } from '../data/mock';
+import { getMockPositions } from '../data/mock';
 import { SYMBOL_CONFIG, ALL_SYMBOLS, getExpiries } from '../config/market';
 import { fmtPnL } from '../utils/math';
 import {
@@ -158,7 +158,7 @@ const parseTimestamp = (ts: string): number => {
 const resolvePositions = (
   live: boolean,
   data: Position[] | null | undefined,
-): Position[] => (live && Array.isArray(data) ? data : MOCK_POSITIONS);
+): Position[] => (live && Array.isArray(data) ? data : getMockPositions());
 
 const validateStrike = (value: string, step: number): string | null => {
   const n = Number(value);

@@ -102,6 +102,9 @@ export class BreezeWsClient {
   private maxDelay       = 30_000;   // ms
   private stopped        = false;
   private lastVersion    = -1;
+  private isConnecting   = false;
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly heartbeatTimeoutMs = 45_000;
 
   status: WsStatus = 'disconnected';
 
@@ -118,10 +121,12 @@ export class BreezeWsClient {
   disconnect(): void {
     this.stopped = true;
     this._clearReconnect();
+    this._clearHeartbeat();
     if (this.ws) {
       try { this.ws.close(); } catch { /* ignore */ }
       this.ws = null;
     }
+    this.isConnecting = false;
     this._setStatus('disconnected');
   }
 
@@ -147,6 +152,8 @@ export class BreezeWsClient {
 
   private _connect(): void {
     if (this.stopped) return;
+    if (this.isConnecting) return;
+    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return;
 
     // FIX (Bug #4): If WS is not possible, signal error immediately
     // so the caller falls back to REST polling.
@@ -160,6 +167,7 @@ export class BreezeWsClient {
       return;
     }
 
+    this.isConnecting = true;
     this._setStatus('connecting');
 
     // Build an absolute URL first so relative backends (e.g. /api/kaggle)
@@ -180,14 +188,17 @@ export class BreezeWsClient {
 
       this.ws.onopen = () => {
         console.log('[BreezeWs] ✓ Connected');
+        this.isConnecting = false;
         this._setStatus('connected');
         this.reconnectDelay = 3000;   // reset backoff
         this.lastVersion = -1;
+        this._resetHeartbeat();
       };
 
       this.ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data as string) as TickUpdate;
+          this._resetHeartbeat();
           if (msg.type === 'heartbeat') return;
           if (msg.version <= this.lastVersion) return;   // no-op if stale
           this.lastVersion = msg.version;
@@ -199,11 +210,14 @@ export class BreezeWsClient {
 
       this.ws.onerror = (err) => {
         console.error('[BreezeWs] Error:', err);
+        this.isConnecting = false;
         this._setStatus('error');
       };
 
       this.ws.onclose = (ev) => {
         console.warn(`[BreezeWs] Closed — code=${ev.code} reason=${ev.reason}`);
+        this.isConnecting = false;
+        this._clearHeartbeat();
         this.ws = null;
         if (!this.stopped) {
           this._setStatus('reconnecting');
@@ -215,6 +229,7 @@ export class BreezeWsClient {
 
     } catch (err) {
       console.error('[BreezeWs] Failed to create WebSocket:', err);
+      this.isConnecting = false;
       this._setStatus('error');
       if (!this.stopped) this._scheduleReconnect();
     }
@@ -233,6 +248,21 @@ export class BreezeWsClient {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+  }
+
+  private _resetHeartbeat(): void {
+    this._clearHeartbeat();
+    this.heartbeatTimer = setTimeout(() => {
+      console.warn('[BreezeWs] Heartbeat timeout. Reconnecting stream.');
+      try { this.ws?.close(); } catch { /* ignore */ }
+    }, this.heartbeatTimeoutMs);
+  }
+
+  private _clearHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
   }
 
