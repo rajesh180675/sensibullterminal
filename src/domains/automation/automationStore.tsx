@@ -1,33 +1,19 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import type { AutomationCallbackEvent, AutomationRule, SellerOpportunity, SymbolCode } from '../../types/index';
+import React, { createContext, useCallback, useContext, useEffect, useMemo } from 'react';
+import type { AutomationCallbackEvent, AutomationRule, SellerOpportunity } from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
+import {
+  useAutomationCallbacksQuery,
+  useAutomationRulesQuery,
+  useCreateAutomationRuleMutation,
+  useDeleteAutomationRuleMutation,
+  useEvaluateAutomationRulesMutation,
+  useSaveAutomationRuleMutation,
+  useToggleAutomationRuleStatusMutation,
+} from '../../services/api/terminalQueryHooks';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { useExecutionStore } from '../execution/executionStore';
 import { useMarketStore } from '../market/marketStore';
 import { useSessionStore } from '../session/sessionStore';
-
-function seedRules(symbol: SymbolCode): AutomationRule[] {
-  const today = new Date();
-  return [
-    {
-      id: 'rule-gtt-condor',
-      name: 'Condor stop cluster',
-      kind: 'gtt',
-      status: 'active',
-      scope: `${symbol} weekly spreads`,
-      trigger: 'Net loss breaches staged spot guardrail',
-      action: 'Place hedge buyback for staged legs',
-      lastRun: 'Never',
-      nextRun: 'Live',
-      notes: 'Frontend fallback seed rule. Connect a backend session for persistence.',
-      symbol,
-      triggerConfig: { type: 'manual' },
-      actionConfig: { type: 'notify', message: 'Manual review required.' },
-      runCount: 0,
-      updatedAt: today.getTime(),
-    },
-  ];
-}
 
 interface AutomationStoreValue {
   rules: AutomationRule[];
@@ -48,48 +34,36 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
   const { symbol, spotPrice } = useMarketStore();
   const { legs } = useExecutionStore();
   const { session } = useSessionStore();
-  const [rules, setRules] = useState<AutomationRule[]>(() => seedRules(symbol));
-  const [callbacks, setCallbacks] = useState<AutomationCallbackEvent[]>([]);
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'loading' | 'ready' | 'fallback'>('idle');
-
   const backendReady = Boolean(session?.isConnected && session.proxyBase && brokerGatewayClient.session.isBackend(session.proxyBase));
-
-  const loadBackendState = useCallback(async () => {
-    if (!session || !backendReady) {
-      setRules(seedRules(symbol));
-      setCallbacks([]);
-      setSyncStatus('fallback');
-      return;
-    }
-    setSyncStatus('loading');
-    const [rulesResult, callbacksResult] = await Promise.all([
-      brokerGatewayClient.automation.fetchRules(session),
-      brokerGatewayClient.automation.fetchCallbacks(session, 25),
-    ]);
-    if (!rulesResult.ok) {
-      setRules(seedRules(symbol));
-      setCallbacks([]);
-      setSyncStatus('fallback');
-      notify({
-        title: 'Automation backend unavailable',
-        message: rulesResult.error || 'Falling back to local automation drafts.',
-        tone: 'warning',
-      });
-      return;
-    }
-    setRules(rulesResult.rules as AutomationRule[] ?? []);
-    setCallbacks(callbacksResult.events as AutomationCallbackEvent[] ?? []);
-    setSyncStatus('ready');
-  }, [backendReady, notify, session, symbol]);
+  const rulesQuery = useAutomationRulesQuery({ session, symbol });
+  const callbacksQuery = useAutomationCallbacksQuery({ session });
+  const createRuleMutation = useCreateAutomationRuleMutation({ session, symbol });
+  const saveRuleMutation = useSaveAutomationRuleMutation({ session, symbol });
+  const deleteRuleMutation = useDeleteAutomationRuleMutation({ session, symbol });
+  const toggleRuleMutation = useToggleAutomationRuleStatusMutation({ session, symbol });
+  const evaluateMutation = useEvaluateAutomationRulesMutation({ session, symbol });
+  const rules = rulesQuery.data ?? [];
+  const callbacks = callbacksQuery.data ?? [];
+  const syncStatus: AutomationStoreValue['syncStatus'] = !backendReady
+    ? 'fallback'
+    : rulesQuery.isFetching || callbacksQuery.isFetching || evaluateMutation.isPending
+      ? 'loading'
+      : rulesQuery.isError
+        ? 'fallback'
+        : 'ready';
 
   useEffect(() => {
-    void loadBackendState();
-  }, [loadBackendState]);
+    if (!backendReady || !rulesQuery.error) return;
+    notify({
+      title: 'Automation backend unavailable',
+      message: rulesQuery.error.message || 'Falling back to local automation drafts.',
+      tone: 'warning',
+    });
+  }, [backendReady, notify, rulesQuery.error]);
 
   const persistRule = useCallback(async (draftRule: AutomationRule) => {
-    if (!session || !backendReady) {
-      setRules((current) => [draftRule, ...current]);
-      setSyncStatus('fallback');
+    if (!backendReady) {
+      await createRuleMutation.mutateAsync(draftRule);
       notify({
         title: 'Automation draft created',
         message: draftRule.name,
@@ -98,28 +72,23 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
       return draftRule;
     }
 
-    const result = await brokerGatewayClient.automation.createRule(session, draftRule as unknown as Record<string, unknown>);
-    if (!result.ok || !result.rule) {
+    try {
+      const rule = await createRuleMutation.mutateAsync(draftRule);
+      notify({
+        title: 'Automation rule created',
+        message: rule.name,
+        tone: 'success',
+      });
+      return rule;
+    } catch (error) {
       notify({
         title: 'Automation rule failed',
-        message: result.error || 'Could not persist automation rule to backend.',
+        message: error instanceof Error ? error.message : String(error),
         tone: 'error',
       });
       return null;
     }
-
-    setRules((current) => [result.rule as AutomationRule, ...current.filter((rule) => rule.id !== result.rule?.id)]);
-    notify({
-      title: 'Automation rule created',
-      message: result.rule.name,
-      tone: 'success',
-    });
-    const callbackResult = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
-    if (callbackResult.ok) {
-      setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
-    }
-    return result.rule as AutomationRule;
-  }, [backendReady, notify, session]);
+  }, [backendReady, createRuleMutation, notify]);
 
   const createRuleFromStrategy = useCallback(async () => {
     if (legs.length === 0) {
@@ -217,100 +186,62 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
       return;
     }
 
-    if (!session || !backendReady) {
-      setRules((existing) => {
-        const found = existing.some((item) => item.id === rule.id);
-        return found ? existing.map((item) => (item.id === rule.id ? rule : item)) : [rule, ...existing];
-      });
-      setSyncStatus('fallback');
-      return;
-    }
-
-    const result = await brokerGatewayClient.automation.updateRule(session, rule.id, rule as unknown as Record<string, unknown>);
-    if (!result.ok || !result.rule) {
+    try {
+      await saveRuleMutation.mutateAsync(rule);
+      if (backendReady) {
+        notify({
+          title: 'Automation rule saved',
+          message: rule.name,
+          tone: 'success',
+        });
+      }
+    } catch (error) {
       notify({
         title: 'Automation save failed',
-        message: result.error || 'Could not save automation rule.',
+        message: error instanceof Error ? error.message : String(error),
         tone: 'error',
       });
-      return;
     }
-
-    setRules((existing) => existing.map((item) => (item.id === rule.id ? result.rule as AutomationRule : item)));
-    const callbackResult = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
-    if (callbackResult.ok) {
-      setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
-    }
-    notify({
-      title: 'Automation rule saved',
-      message: result.rule.name,
-      tone: 'success',
-    });
-  }, [backendReady, notify, session]);
+  }, [backendReady, notify, saveRuleMutation]);
 
   const deleteRule = useCallback(async (id: string) => {
     const current = rules.find((rule) => rule.id === id);
     if (!current) return;
 
-    if (!session || !backendReady) {
-      setRules((existing) => existing.filter((rule) => rule.id !== id));
-      setSyncStatus('fallback');
-      return;
-    }
-
-    const result = await brokerGatewayClient.automation.deleteRule(session, id);
-    if (!result.ok) {
+    try {
+      await deleteRuleMutation.mutateAsync({ id });
+      if (backendReady) {
+        notify({
+          title: 'Automation rule deleted',
+          message: current.name,
+          tone: 'success',
+        });
+      }
+    } catch (error) {
       notify({
         title: 'Automation delete failed',
-        message: result.error || 'Could not delete automation rule.',
+        message: error instanceof Error ? error.message : String(error),
         tone: 'error',
       });
-      return;
     }
-
-    setRules((existing) => existing.filter((rule) => rule.id !== id));
-    const callbackResult = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
-    if (callbackResult.ok) {
-      setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
-    }
-    notify({
-      title: 'Automation rule deleted',
-      message: current.name,
-      tone: 'success',
-    });
-  }, [backendReady, notify, rules, session]);
+  }, [backendReady, deleteRuleMutation, notify, rules]);
 
   const toggleRuleStatus = useCallback(async (id: string) => {
     const current = rules.find((rule) => rule.id === id);
     if (!current) return;
-    const nextStatus = current.status === 'active' ? 'paused' : 'active';
-
-    if (!session || !backendReady) {
-      setRules((existing) => existing.map((rule) => (
-        rule.id === id ? { ...rule, status: nextStatus, nextRun: nextStatus === 'active' ? 'Live' : 'Paused' } : rule
-      )));
-      return;
-    }
-
-    const result = await brokerGatewayClient.automation.updateRuleStatus(session, id, nextStatus);
-    if (!result.ok || !result.rule) {
+    try {
+      await toggleRuleMutation.mutateAsync({ rule: current });
+    } catch (error) {
       notify({
         title: 'Automation update failed',
-        message: result.error || 'Could not update automation rule status.',
+        message: error instanceof Error ? error.message : String(error),
         tone: 'error',
       });
-      return;
     }
-
-    setRules((existing) => existing.map((rule) => rule.id === id ? result.rule as AutomationRule : rule));
-    const callbackResult = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
-    if (callbackResult.ok) {
-      setCallbacks(callbackResult.events as AutomationCallbackEvent[] ?? []);
-    }
-  }, [backendReady, notify, rules, session]);
+  }, [notify, rules, toggleRuleMutation]);
 
   const evaluateRules = useCallback(async () => {
-    if (!session || !backendReady) {
+    if (!backendReady) {
       notify({
         title: 'Backend required',
         message: 'Connect a backend session to evaluate automation rules.',
@@ -318,22 +249,21 @@ export function AutomationProvider({ children }: { children: React.ReactNode }) 
       });
       return;
     }
-    const result = await brokerGatewayClient.automation.evaluate(session);
-    if (!result.ok) {
+    try {
+      const result = await evaluateMutation.mutateAsync();
+      notify({
+        title: 'Automation evaluated',
+        message: `${result.count ?? 0} automation event(s) recorded.`,
+        tone: 'success',
+      });
+    } catch (error) {
       notify({
         title: 'Automation evaluation failed',
-        message: result.error || 'Could not evaluate backend automation rules.',
+        message: error instanceof Error ? error.message : String(error),
         tone: 'error',
       });
-      return;
     }
-    await loadBackendState();
-    notify({
-      title: 'Automation evaluated',
-      message: `${result.count ?? 0} automation event(s) recorded.`,
-      tone: 'success',
-    });
-  }, [backendReady, loadBackendState, notify, session]);
+  }, [backendReady, evaluateMutation, notify]);
 
   const value = useMemo(() => ({
     rules,

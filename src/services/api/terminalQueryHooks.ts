@@ -1,9 +1,19 @@
-import { useMutation, useQuery, useQueryClient, type UseMutationResult, type UseQueryResult } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient, type QueryClient, type UseMutationResult, type UseQueryResult } from '@tanstack/react-query';
 import { generateChain, getMockPositions } from '../../data/mock';
 import { mapBreezePositions, mergeQuotesToChain } from '../../domains/market/marketTransforms';
 import { brokerGatewayClient } from '../broker/brokerGatewayClient';
 import { SYMBOL_CONFIG } from '../../config/market';
-import type { ExpiryDate, BreezeSession, ExecutionPreview, OptionLeg, OptionRow, SymbolCode, Position } from '../../types/index';
+import type {
+  AutomationCallbackEvent,
+  AutomationRule,
+  ExpiryDate,
+  BreezeSession,
+  ExecutionPreview,
+  OptionLeg,
+  OptionRow,
+  SymbolCode,
+  Position,
+} from '../../types/index';
 import type {
   BackendExecutionValidationSummary,
   FundsData,
@@ -82,7 +92,44 @@ export const terminalQueryKeys = {
   orders: (session: BreezeSession | null) => ['portfolio', 'orders', backendSessionKey(session)] as const,
   trades: (session: BreezeSession | null) => ['portfolio', 'trades', backendSessionKey(session)] as const,
   funds: (session: BreezeSession | null) => ['portfolio', 'funds', backendSessionKey(session)] as const,
+  automationRules: (session: BreezeSession | null, symbol: SymbolCode) => ['automation', 'rules', backendSessionKey(session), symbol] as const,
+  automationCallbacks: (session: BreezeSession | null) => ['automation', 'callbacks', backendSessionKey(session)] as const,
 };
+
+function seedAutomationRules(symbol: SymbolCode): AutomationRule[] {
+  const today = new Date();
+  return [
+    {
+      id: 'rule-gtt-condor',
+      name: 'Condor stop cluster',
+      kind: 'gtt',
+      status: 'active',
+      scope: `${symbol} weekly spreads`,
+      trigger: 'Net loss breaches staged spot guardrail',
+      action: 'Place hedge buyback for staged legs',
+      lastRun: 'Never',
+      nextRun: 'Live',
+      notes: 'Frontend fallback seed rule. Connect a backend session for persistence.',
+      symbol,
+      triggerConfig: { type: 'manual' },
+      actionConfig: { type: 'notify', message: 'Manual review required.' },
+      runCount: 0,
+      updatedAt: today.getTime(),
+    },
+  ];
+}
+
+function setAutomationFallbackRuleCache(
+  queryClient: QueryClient,
+  session: BreezeSession | null,
+  symbol: SymbolCode,
+  updater: (current: AutomationRule[]) => AutomationRule[],
+) {
+  queryClient.setQueryData<AutomationRule[]>(
+    terminalQueryKeys.automationRules(session, symbol),
+    updater(queryClient.getQueryData<AutomationRule[]>(terminalQueryKeys.automationRules(session, symbol)) ?? seedAutomationRules(symbol)),
+  );
+}
 
 export function useChainQuery(params: {
   session: BreezeSession | null;
@@ -218,6 +265,47 @@ export function useFundsQuery(params: {
   });
 }
 
+export function useAutomationRulesQuery(params: {
+  session: BreezeSession | null;
+  symbol: SymbolCode;
+}): UseQueryResult<AutomationRule[], Error> {
+  const { session, symbol } = params;
+  return useQuery<AutomationRule[], Error>({
+    queryKey: terminalQueryKeys.automationRules(session, symbol),
+    staleTime: STALE_THRESHOLDS.position,
+    queryFn: async () => {
+      if (!isBackendSession(session)) {
+        return seedAutomationRules(symbol);
+      }
+      const result = await brokerGatewayClient.automation.fetchRules(session);
+      if (!result.ok) {
+        throw new Error(result.error || 'Failed to load automation rules.');
+      }
+      return (result.rules as AutomationRule[] | undefined) ?? [];
+    },
+  });
+}
+
+export function useAutomationCallbacksQuery(params: {
+  session: BreezeSession | null;
+}): UseQueryResult<AutomationCallbackEvent[], Error> {
+  const { session } = params;
+  return useQuery<AutomationCallbackEvent[], Error>({
+    queryKey: terminalQueryKeys.automationCallbacks(session),
+    staleTime: STALE_THRESHOLDS.position,
+    queryFn: async () => {
+      if (!isBackendSession(session)) {
+        return [];
+      }
+      const result = await brokerGatewayClient.automation.fetchCallbacks(session, 25);
+      if (!result.ok) {
+        throw new Error(result.error || 'Failed to load automation callbacks.');
+      }
+      return (result.events as AutomationCallbackEvent[] | undefined) ?? [];
+    },
+  });
+}
+
 export function usePreviewMutation(
   session: BreezeSession | null,
 ): UseMutationResult<Partial<ExecutionPreview>, Error, OptionLeg[]> {
@@ -333,6 +421,148 @@ export function useCancelOrderMutation(
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: terminalQueryKeys.orders(session) }),
         queryClient.invalidateQueries({ queryKey: terminalQueryKeys.positions(session) }),
+      ]);
+    },
+  });
+}
+
+export function useSaveAutomationRuleMutation(params: {
+  session: BreezeSession | null;
+  symbol: SymbolCode;
+}): UseMutationResult<AutomationRule, Error, AutomationRule> {
+  const { session, symbol } = params;
+  const queryClient = useQueryClient();
+  return useMutation<AutomationRule, Error, AutomationRule>({
+    mutationFn: async (rule) => {
+      if (!isBackendSession(session)) {
+        setAutomationFallbackRuleCache(queryClient, session, symbol, (current) => {
+          const found = current.some((item) => item.id === rule.id);
+          return found ? current.map((item) => (item.id === rule.id ? rule : item)) : [rule, ...current];
+        });
+        return rule;
+      }
+      const result = await brokerGatewayClient.automation.updateRule(session, rule.id, rule as unknown as Record<string, unknown>);
+      if (!result.ok || !result.rule) {
+        throw new Error(result.error || 'Could not save automation rule.');
+      }
+      return result.rule as AutomationRule;
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationRules(session, symbol) }),
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationCallbacks(session) }),
+      ]);
+    },
+  });
+}
+
+export function useCreateAutomationRuleMutation(params: {
+  session: BreezeSession | null;
+  symbol: SymbolCode;
+}): UseMutationResult<AutomationRule, Error, AutomationRule> {
+  const { session, symbol } = params;
+  const queryClient = useQueryClient();
+  return useMutation<AutomationRule, Error, AutomationRule>({
+    mutationFn: async (rule) => {
+      if (!isBackendSession(session)) {
+        setAutomationFallbackRuleCache(queryClient, session, symbol, (current) => [rule, ...current]);
+        return rule;
+      }
+      const result = await brokerGatewayClient.automation.createRule(session, rule as unknown as Record<string, unknown>);
+      if (!result.ok || !result.rule) {
+        throw new Error(result.error || 'Could not persist automation rule.');
+      }
+      return result.rule as AutomationRule;
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationRules(session, symbol) }),
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationCallbacks(session) }),
+      ]);
+    },
+  });
+}
+
+export function useDeleteAutomationRuleMutation(params: {
+  session: BreezeSession | null;
+  symbol: SymbolCode;
+}): UseMutationResult<void, Error, { id: string }> {
+  const { session, symbol } = params;
+  const queryClient = useQueryClient();
+  return useMutation<void, Error, { id: string }>({
+    mutationFn: async ({ id }) => {
+      if (!isBackendSession(session)) {
+        setAutomationFallbackRuleCache(queryClient, session, symbol, (current) => current.filter((rule) => rule.id !== id));
+        return;
+      }
+      const result = await brokerGatewayClient.automation.deleteRule(session, id);
+      if (!result.ok) {
+        throw new Error(result.error || 'Could not delete automation rule.');
+      }
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationRules(session, symbol) }),
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationCallbacks(session) }),
+      ]);
+    },
+  });
+}
+
+export function useToggleAutomationRuleStatusMutation(params: {
+  session: BreezeSession | null;
+  symbol: SymbolCode;
+}): UseMutationResult<AutomationRule, Error, { rule: AutomationRule }> {
+  const { session, symbol } = params;
+  const queryClient = useQueryClient();
+  return useMutation<AutomationRule, Error, { rule: AutomationRule }>({
+    mutationFn: async ({ rule }) => {
+      const nextStatus: AutomationRule['status'] = rule.status === 'active' ? 'paused' : 'active';
+      if (!isBackendSession(session)) {
+        const nextRule: AutomationRule = {
+          ...rule,
+          status: nextStatus,
+          nextRun: nextStatus === 'active' ? 'Live' : 'Paused',
+        };
+        setAutomationFallbackRuleCache(queryClient, session, symbol, (current) => current.map((item) => item.id === rule.id ? nextRule : item));
+        return nextRule;
+      }
+      const result = await brokerGatewayClient.automation.updateRuleStatus(session, rule.id, nextStatus);
+      if (!result.ok || !result.rule) {
+        throw new Error(result.error || 'Could not update automation rule status.');
+      }
+      return result.rule as AutomationRule;
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationRules(session, symbol) }),
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationCallbacks(session) }),
+      ]);
+    },
+  });
+}
+
+export function useEvaluateAutomationRulesMutation(params: {
+  session: BreezeSession | null;
+  symbol: SymbolCode;
+}): UseMutationResult<{ count: number }, Error, void> {
+  const { session, symbol } = params;
+  const queryClient = useQueryClient();
+  return useMutation<{ count: number }, Error, void>({
+    mutationFn: async () => {
+      if (!isBackendSession(session)) {
+        throw new Error('Connect a backend session to evaluate automation rules.');
+      }
+      const result = await brokerGatewayClient.automation.evaluate(session);
+      if (!result.ok) {
+        throw new Error(result.error || 'Could not evaluate backend automation rules.');
+      }
+      return { count: result.count ?? 0 };
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationRules(session, symbol) }),
+        queryClient.invalidateQueries({ queryKey: terminalQueryKeys.automationCallbacks(session) }),
       ]);
     },
   });

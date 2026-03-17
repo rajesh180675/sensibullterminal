@@ -31,6 +31,9 @@ export function AppShell({
   const { legs } = useExecutionStore();
   const { symbol, setSymbol, refreshMarket, lastUpdate, liveIndices, spotTruth, chainTruth, stream } = useMarketStore();
   const setLinkedSymbol = useTerminalStore((state) => state.setLinkedSymbol);
+  const commandPaletteOpen = useTerminalStore((state) => state.commandPaletteOpen);
+  const setCommandPaletteOpen = useTerminalStore((state) => state.setCommandPaletteOpen);
+  const setKeyboardMode = useTerminalStore((state) => state.setKeyboardMode);
   const toggleCommandPalette = useTerminalStore((state) => state.toggleCommandPalette);
   const bottomDockOpen = useLayoutStore((state) => state.bottomDockOpen);
   const setBottomDockOpen = useLayoutStore((state) => state.setBottomDockOpen);
@@ -47,10 +50,27 @@ export function AppShell({
   }, [setLinkedSymbol, symbol]);
 
   useEffect(() => {
+    if (commandPaletteOpen) return;
+    if (currentPath === '/market') {
+      setKeyboardMode('chain');
+      return;
+    }
+    if (currentPath === '/strategy' || currentPath === '/execution') {
+      setKeyboardMode('ticket');
+      return;
+    }
+    setKeyboardMode('normal');
+  }, [commandPaletteOpen, currentPath, setKeyboardMode]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
         toggleCommandPalette();
+      }
+      if (event.key === 'Escape' && commandPaletteOpen) {
+        event.preventDefault();
+        setCommandPaletteOpen(false);
       }
       if (event.shiftKey && event.key.toLowerCase() === 'c') {
         event.preventDefault();
@@ -61,7 +81,7 @@ export function AppShell({
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onNavigate, openConnectionCenter, toggleCommandPalette]);
+  }, [commandPaletteOpen, onNavigate, openConnectionCenter, setCommandPaletteOpen, toggleCommandPalette]);
 
   let content: React.ReactNode;
   switch (currentPath) {
