@@ -41,6 +41,8 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Callable
 from collections import deque
 import logging
+from backend.app.create_app import create_app
+from backend.app.core.state import BackendState
 try:
     from automation_normalization import (
         extract_rule_id_hint,
@@ -2228,82 +2230,16 @@ AUTOMATION_WEBHOOK_SECRET = os.environ.get("BREEZE_AUTOMATION_WEBHOOK_SECRET", "
 # FastAPI Application
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="ICICI Breeze Backend v7", version="7.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=86400,
+app = create_app(
+    BackendState(
+        engine=engine,
+        auth_enabled=AUTH_ENABLED,
+        backend_auth_token=BACKEND_AUTH_TOKEN,
+        automation_webhook_secret=AUTOMATION_WEBHOOK_SECRET,
+        version="7.0",
+    ),
+    include_routers=False,
 )
-
-
-def _is_authed(request: Request) -> bool:
-    if not AUTH_ENABLED:
-        return True
-    token = (
-        request.headers.get("x-terminal-auth") or
-        request.headers.get("X-Terminal-Auth") or ""
-    )
-    return token == BACKEND_AUTH_TOKEN
-
-
-def _is_webhook_authed(request: Request) -> bool:
-    if not AUTOMATION_WEBHOOK_SECRET:
-        return False
-    token = (
-        request.headers.get("x-automation-webhook-secret") or
-        request.headers.get("X-Automation-Webhook-Secret") or
-        request.query_params.get("secret") or
-        ""
-    )
-    return token == AUTOMATION_WEBHOOK_SECRET
-
-
-@app.middleware("http")
-async def cors_everywhere(request: Request, call_next):
-    if request.method == "OPTIONS":
-        return Response(
-            status_code=200,
-            headers={
-                "Access-Control-Allow-Origin":  "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Max-Age":       "86400",
-            },
-        )
-
-    if request.url.path.startswith("/api/automation/callbacks/webhook"):
-        if not (_is_authed(request) or _is_webhook_authed(request)):
-            return JSONResponse(
-                status_code=401,
-                content={"success": False, "error": "Unauthorized — missing automation webhook secret"},
-            )
-    elif request.url.path.startswith("/api/") and not _is_authed(request):
-        return JSONResponse(
-            status_code=401,
-            content={"success": False, "error": "Unauthorized — missing/invalid X-Terminal-Auth"},
-        )
-
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
-
-
-@app.options("/{path:path}")
-async def options_handler(path: str):
-    return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin":  "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-        },
-    )
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

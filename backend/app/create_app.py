@@ -36,7 +36,11 @@ def _is_webhook_authed(request: Request, backend_state: BackendState) -> bool:
     return token == backend_state.automation_webhook_secret
 
 
-def create_app(backend_state: BackendState | None = None) -> FastAPI:
+def create_app(
+    backend_state: BackendState | None = None,
+    *,
+    include_routers: bool = True,
+) -> FastAPI:
     state = backend_state or BackendState(engine=None, version="app")
     app = FastAPI(title=settings.app_name)
     app.state.backend_state = state
@@ -94,18 +98,19 @@ def create_app(backend_state: BackendState | None = None) -> FastAPI:
             },
         )
 
-    for router in (
-        session_router,
-        market_router,
-        stream_router,
-        orders_router,
-        portfolio_router,
-        automation_router,
-        reviews_router,
-        diagnostics_router,
-        compat_router,
-    ):
-        app.include_router(router)
+    if include_routers:
+        for router in (
+            session_router,
+            market_router,
+            stream_router,
+            orders_router,
+            portfolio_router,
+            automation_router,
+            reviews_router,
+            diagnostics_router,
+            compat_router,
+        ):
+            app.include_router(router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
