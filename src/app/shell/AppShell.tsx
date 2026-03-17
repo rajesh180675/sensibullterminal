@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { Suspense, lazy, useEffect } from 'react';
 import { ChevronUp } from 'lucide-react';
 import { ConnectBrokerModal } from '../../components/ConnectBrokerModal';
 import { useExecutionStore } from '../../domains/execution/executionStore';
@@ -12,14 +12,15 @@ import { WorkspaceHeader } from './WorkspaceHeader';
 import { WorkspaceNav } from './WorkspaceNav';
 import { WorkspaceSubnav } from './WorkspaceSubnav';
 import { type WorkspacePath } from '../router';
-import { MarketWorkspace } from '../workspaces/MarketWorkspace';
-import { StrategyWorkspace } from '../workspaces/StrategyWorkspace';
-import { JournalWorkspace } from '../workspaces/JournalWorkspace';
-import { ExecutionWorkspace } from '../workspaces/ExecutionWorkspace';
-import { PortfolioWorkspace } from '../workspaces/PortfolioWorkspace';
-import { RiskWorkspace } from '../workspaces/RiskWorkspace';
-import { AutomationWorkspace } from '../workspaces/AutomationWorkspace';
-import { ConnectionsWorkspace } from '../workspaces/ConnectionsWorkspace';
+
+const MarketWorkspace = lazy(() => import('../workspaces/MarketWorkspace').then((module) => ({ default: module.MarketWorkspace })));
+const StrategyWorkspace = lazy(() => import('../workspaces/StrategyWorkspace').then((module) => ({ default: module.StrategyWorkspace })));
+const JournalWorkspace = lazy(() => import('../workspaces/JournalWorkspace').then((module) => ({ default: module.JournalWorkspace })));
+const ExecutionWorkspace = lazy(() => import('../workspaces/ExecutionWorkspace').then((module) => ({ default: module.ExecutionWorkspace })));
+const PortfolioWorkspace = lazy(() => import('../workspaces/PortfolioWorkspace').then((module) => ({ default: module.PortfolioWorkspace })));
+const RiskWorkspace = lazy(() => import('../workspaces/RiskWorkspace').then((module) => ({ default: module.RiskWorkspace })));
+const AutomationWorkspace = lazy(() => import('../workspaces/AutomationWorkspace').then((module) => ({ default: module.AutomationWorkspace })));
+const ConnectionsWorkspace = lazy(() => import('../workspaces/ConnectionsWorkspace').then((module) => ({ default: module.ConnectionsWorkspace })));
 
 export function AppShell({
   currentPath,
@@ -113,6 +114,18 @@ export function AppShell({
       content = <MarketWorkspace onOpenStrategy={() => onNavigate('/strategy')} />;
   }
 
+  const workspaceContent = (
+    <Suspense
+      fallback={(
+        <div className="flex h-full items-center justify-center px-6 text-sm text-slate-400">
+          Loading workspace...
+        </div>
+      )}
+    >
+      {content}
+    </Suspense>
+  );
+
   return (
     <div className="relative h-screen overflow-hidden bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.12),transparent_24%),radial-gradient(circle_at_bottom_right,rgba(34,197,94,0.08),transparent_20%),linear-gradient(180deg,#04090f,#07111b_34%,#06111a)] p-3 text-white">
       <div className="flex h-full gap-3">
@@ -153,7 +166,7 @@ export function AppShell({
             />
             <WorkspaceSubnav currentPath={currentPath} />
             <main className="min-h-0 min-w-0 flex-1 overflow-auto bg-[linear-gradient(180deg,rgba(7,14,23,0.2),rgba(7,14,23,0.68))]">
-              {content}
+              {workspaceContent}
             </main>
           </div>
           {bottomDockOpen && <BottomDock />}
