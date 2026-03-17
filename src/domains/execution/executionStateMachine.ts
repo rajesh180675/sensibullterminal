@@ -7,6 +7,7 @@ import type {
   OptionLeg,
   SymbolCode,
 } from '../../types/index';
+import type { OrderBookRow } from '../../utils/kaggleClient';
 
 export type ExecutionPreviewPhase = 'idle' | 'loading' | 'ready' | 'fallback';
 
@@ -130,4 +131,32 @@ export function finalizeBasket(item: ExecutionBlotterItem, response: string, com
     completedAt,
     recoveryAction,
   };
+}
+
+export function normalizeBrokerOrderStatus(status: string | undefined): 'filled' | 'pending' | 'rejected' | 'cancelled' | 'unknown' {
+  const value = String(status || '').toLowerCase();
+  if (value.includes('complete') || value.includes('filled') || value.includes('traded') || value.includes('executed')) {
+    return 'filled';
+  }
+  if (value.includes('cancel')) return 'cancelled';
+  if (value.includes('reject')) return 'rejected';
+  if (value.includes('open') || value.includes('pending') || value.includes('trigger') || value.includes('placed')) {
+    return 'pending';
+  }
+  return 'unknown';
+}
+
+export function findMatchingOrderRow(leg: OptionLeg, stockCode: string, quantity: string, rows: OrderBookRow[]): OrderBookRow | null {
+  const desiredAction = leg.action.toLowerCase();
+  const desiredRight = leg.type === 'CE' ? 'call' : 'put';
+  const exact = rows.find((row) => {
+    const right = String(row.right || '').toLowerCase();
+    return row.stock_code === stockCode &&
+      String(row.action || '').toLowerCase() === desiredAction &&
+      String(row.strike_price || '') === String(leg.strike) &&
+      String(row.expiry_date || '') === String(leg.expiry) &&
+      (right === desiredRight || right === leg.type.toLowerCase()) &&
+      String(row.quantity || '') === quantity;
+  });
+  return exact ?? null;
 }

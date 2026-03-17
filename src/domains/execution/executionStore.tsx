@@ -9,7 +9,9 @@ import { useSessionStore } from '../session/sessionStore';
 import {
   createDraftBasket,
   finalizeBasket,
+  findMatchingOrderRow,
   nextDraftBasketId,
+  normalizeBrokerOrderStatus,
   updateBasketState,
   updateLegState,
 } from './executionStateMachine';
@@ -140,6 +142,7 @@ interface ExecutionStoreValue {
   retryFailedBasket: (basketId: string) => Promise<void>;
   cancelRemainingBasket: (basketId: string) => Promise<void>;
   squareOffFilledBasket: (basketId: string) => Promise<void>;
+  reconcileInterruptedBasket: (basketId: string) => Promise<void>;
 }
 
 const ExecutionStore = createContext<ExecutionStoreValue | null>(null);
@@ -634,6 +637,107 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     }
   }, [blotter, legSnapshotMap, patchBlotterItem, session]);
 
+  const reconcileInterruptedBasket = useCallback(async (basketId: string) => {
+    if (!session?.isConnected) return;
+    const basket = blotter.find((item) => item.id === basketId);
+    if (!basket) return;
+
+    const ambiguousLegs = (basket.legStates ?? []).filter((leg) => leg.status === 'failed' || leg.status === 'sending');
+    if (ambiguousLegs.length === 0) return;
+
+    setRecoveringBasketId(basketId);
+    try {
+      patchBlotterItem(basketId, (item) => updateBasketState(item, {
+        response: 'Reconciling basket against broker order book...',
+        recoveryAction: item.recoveryAction === 'none' ? 'manual_intervention' : item.recoveryAction,
+      }));
+
+      const ordersResult = await brokerGatewayClient.portfolio.fetchOrders(session);
+      if (!ordersResult.ok) {
+        patchBlotterItem(basketId, (item) => updateBasketState(item, {
+          response: `Order-book reconciliation failed: ${ordersResult.error || 'Unknown error'}`,
+        }));
+        return;
+      }
+
+      const snapshotById = legSnapshotMap(basket);
+      const messages: string[] = [];
+
+      for (const legState of ambiguousLegs) {
+        const leg = snapshotById.get(legState.legId);
+        if (!leg) continue;
+        const cfg = SYMBOL_CONFIG[leg.symbol];
+        const quantity = String(leg.lots * cfg.lotSize);
+        const row = findMatchingOrderRow(leg, cfg.breezeStockCode, quantity, ordersResult.data);
+
+        if (!row) {
+          messages.push(`${legState.summary} not found in order book`);
+          patchBlotterItem(basketId, (item) => updateLegState(item, leg.id, {
+            error: 'Not found during reconciliation.',
+            brokerStatus: 'not_found',
+            reconciledAt: Date.now(),
+            updatedAt: Date.now(),
+          }));
+          continue;
+        }
+
+        const brokerState = normalizeBrokerOrderStatus(row.status);
+        if (brokerState === 'filled') {
+          messages.push(`${legState.summary} reconciled as filled`);
+          patchBlotterItem(basketId, (item) => updateLegState(item, leg.id, {
+            status: 'filled',
+            orderId: row.order_id,
+            brokerStatus: row.status,
+            error: undefined,
+            reconciledAt: Date.now(),
+            updatedAt: Date.now(),
+          }));
+        } else if (brokerState === 'pending') {
+          messages.push(`${legState.summary} reconciled as pending`);
+          patchBlotterItem(basketId, (item) => updateLegState(item, leg.id, {
+            status: 'pending',
+            orderId: row.order_id,
+            brokerStatus: row.status,
+            error: undefined,
+            reconciledAt: Date.now(),
+            updatedAt: Date.now(),
+          }));
+        } else if (brokerState === 'cancelled') {
+          messages.push(`${legState.summary} reconciled as cancelled`);
+          patchBlotterItem(basketId, (item) => updateLegState(item, leg.id, {
+            status: 'cancelled',
+            orderId: row.order_id,
+            brokerStatus: row.status,
+            reconciledAt: Date.now(),
+            updatedAt: Date.now(),
+          }));
+        } else if (brokerState === 'rejected') {
+          messages.push(`${legState.summary} reconciled as rejected`);
+          patchBlotterItem(basketId, (item) => updateLegState(item, leg.id, {
+            status: 'rejected',
+            orderId: row.order_id,
+            brokerStatus: row.status,
+            error: 'Broker rejected the order.',
+            reconciledAt: Date.now(),
+            updatedAt: Date.now(),
+          }));
+        } else {
+          messages.push(`${legState.summary} found with unknown broker status ${row.status}`);
+          patchBlotterItem(basketId, (item) => updateLegState(item, leg.id, {
+            orderId: row.order_id,
+            brokerStatus: row.status,
+            reconciledAt: Date.now(),
+            updatedAt: Date.now(),
+          }));
+        }
+      }
+
+      patchBlotterItem(basketId, (item) => finalizeBasket(item, messages.join(' | ') || 'Reconciliation complete.'));
+    } finally {
+      setRecoveringBasketId(null);
+    }
+  }, [blotter, legSnapshotMap, patchBlotterItem, session]);
+
   const value = useMemo(() => ({
     legs,
     activeBasket,
@@ -654,7 +758,8 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     retryFailedBasket,
     cancelRemainingBasket,
     squareOffFilledBasket,
-  }), [legs, activeBasket, preview, previewStatus, blotter, isExecuting, recoveringBasketId, addLeg, appendLegs, stageStrategy, updateLeg, removeLeg, clearLegs, loadPosition, clearBlotter, executeStrategy, retryFailedBasket, cancelRemainingBasket, squareOffFilledBasket]);
+    reconcileInterruptedBasket,
+  }), [legs, activeBasket, preview, previewStatus, blotter, isExecuting, recoveringBasketId, addLeg, appendLegs, stageStrategy, updateLeg, removeLeg, clearLegs, loadPosition, clearBlotter, executeStrategy, retryFailedBasket, cancelRemainingBasket, squareOffFilledBasket, reconcileInterruptedBasket]);
 
   return <ExecutionStore.Provider value={value}>{children}</ExecutionStore.Provider>;
 }

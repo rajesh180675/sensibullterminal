@@ -46,6 +46,7 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
     retryFailedBasket,
     cancelRemainingBasket,
     squareOffFilledBasket,
+    reconcileInterruptedBasket,
   } = useExecutionStore();
   const { symbol, spotPrice, stream } = useMarketStore();
   const componentEntries = Object.entries(preview.chargeSummary?.componentCharges ?? {}).filter(([, value]) => value > 0);
@@ -212,11 +213,18 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
                 )}
                 {item.legStates && item.legStates.length > 0 && (
                   <div className="mt-2 text-[11px] text-slate-400">
-                    {item.legStates.map((leg) => `${leg.summary} ${leg.status}${leg.orderId ? ` (${leg.orderId})` : ''}`).join(' | ')}
+                    {item.legStates.map((leg) => `${leg.summary} ${leg.status}${leg.orderId ? ` (${leg.orderId})` : ''}${leg.brokerStatus ? ` [${leg.brokerStatus}]` : ''}`).join(' | ')}
                   </div>
                 )}
                 {(item.status === 'partial_failure' || item.status === 'partial_fill') && (
                   <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => void reconcileInterruptedBasket(item.id)}
+                      disabled={recoveringBasketId === item.id}
+                      className="rounded-xl border border-white/15 px-3 py-1.5 text-[11px] text-white transition hover:bg-white/10 disabled:opacity-40"
+                    >
+                      Reconcile order book
+                    </button>
                     <button
                       onClick={() => void retryFailedBasket(item.id)}
                       disabled={recoveringBasketId === item.id}

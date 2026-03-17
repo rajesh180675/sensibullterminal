@@ -262,6 +262,8 @@ export interface ExecutionBasketLeg {
   sentAt?: number;
   updatedAt: number;
   error?: string;
+  brokerStatus?: string;
+  reconciledAt?: number;
 }
 
 export interface ExecutionBlotterItem {
