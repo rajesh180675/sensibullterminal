@@ -1,8 +1,9 @@
-import { Activity, ArrowRight, ShieldAlert, TimerReset, Wallet } from 'lucide-react';
+import { useMemo } from 'react';
+import { Activity, AlertTriangle, ArrowRight, ShieldAlert, TimerReset, Wallet } from 'lucide-react';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
-import type { ExecutionBlotterItem } from '../../types/index';
-import { fmtPnL } from '../../utils/math';
+import type { ExecutionBlotterItem, OptionLeg } from '../../types/index';
+import { buildPayoff, combinedGreeks, findBreakevens, fmtPnL, fmtNum, maxProfitLoss } from '../../utils/math';
 
 const CHARGE_LABELS: Record<string, string> = {
   exchangeTurnoverCharges: 'Exchange turnover',
@@ -32,6 +33,31 @@ function blotterTone(status: ExecutionBlotterItem['status']) {
   return 'bg-slate-500/15 text-slate-300';
 }
 
+function resolveLiveLegs(item: ExecutionBlotterItem, chain: ReturnType<typeof useMarketStore>['chain']): OptionLeg[] {
+  const chainByStrike = new Map(chain.map((row) => [row.strike, row]));
+  const snapshotById = new Map((item.legsSnapshot ?? []).map((leg) => [leg.id, leg] as const));
+
+  return (item.legStates ?? [])
+    .filter((leg) => leg.status === 'filled' || leg.status === 'pending')
+    .map((legState) => {
+      const snapshot = snapshotById.get(legState.legId);
+      if (!snapshot) return null;
+      const row = chainByStrike.get(snapshot.strike);
+      if (!row) return snapshot;
+      const isCall = snapshot.type === 'CE';
+      return {
+        ...snapshot,
+        ltp: isCall ? row.ce_ltp : row.pe_ltp,
+        delta: isCall ? row.ce_delta : row.pe_delta,
+        theta: isCall ? row.ce_theta : row.pe_theta,
+        gamma: isCall ? row.ce_gamma : row.pe_gamma,
+        vega: isCall ? row.ce_vega : row.pe_vega,
+        iv: isCall ? row.ce_iv : row.pe_iv,
+      };
+    })
+    .filter((leg): leg is OptionLeg => Boolean(leg));
+}
+
 export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void }) {
   const {
     legs,
@@ -48,10 +74,30 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
     squareOffFilledBasket,
     reconcileInterruptedBasket,
   } = useExecutionStore();
-  const { symbol, spotPrice, stream } = useMarketStore();
+  const { symbol, spotPrice, stream, chain } = useMarketStore();
   const componentEntries = Object.entries(preview.chargeSummary?.componentCharges ?? {}).filter(([, value]) => value > 0);
   const executeDisabled = legs.length === 0 || isExecuting || !stream.canTrade;
   const executeLabel = isExecuting ? 'Executing...' : !stream.canTrade ? `Blocked · ${stream.label}` : 'Execute';
+  const orphanPanels = useMemo(() => blotter
+    .map((item) => {
+      if (item.status !== 'partial_failure') return null;
+      const liveLegs = resolveLiveLegs(item, chain);
+      if (liveLegs.length === 0) return null;
+      const failedLegs = (item.legStates ?? []).filter((leg) => leg.status === 'failed' || leg.status === 'rejected' || leg.status === 'cancelled');
+      const payoff = buildPayoff(liveLegs, spotPrice);
+      const greeks = combinedGreeks(liveLegs);
+      const { maxLoss } = maxProfitLoss(payoff);
+      return {
+        item,
+        liveLegs,
+        failedLegs,
+        greeks,
+        breakevens: findBreakevens(payoff),
+        maxLoss,
+        exposurePremium: liveLegs.reduce((sum, leg) => sum + leg.ltp * leg.lots * (leg.action === 'SELL' ? 1 : -1), 0),
+      };
+    })
+    .filter((panel): panel is NonNullable<typeof panel> => Boolean(panel)), [blotter, chain, spotPrice]);
 
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[1.1fr,0.9fr]">
@@ -124,6 +170,77 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
       </section>
 
       <div className="grid gap-4">
+        {orphanPanels.length > 0 && (
+          <section className="rounded-[28px] border border-red-500/20 bg-[linear-gradient(180deg,rgba(58,14,14,0.92),rgba(22,10,14,0.95))] p-5">
+            <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.3em] text-red-200/80">
+              <AlertTriangle size={13} />
+              Partial Execution Resolution
+            </div>
+            <div className="mt-4 space-y-4">
+              {orphanPanels.map(({ item, liveLegs, failedLegs, greeks, breakevens, maxLoss, exposurePremium }) => (
+                <div key={item.id} className="rounded-3xl border border-red-500/20 bg-black/20 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-base font-semibold text-white">{item.summary}</div>
+                      <div className="mt-1 text-sm text-red-100">
+                        {liveLegs.length} live leg{liveLegs.length !== 1 ? 's' : ''} remain after partial execution.
+                      </div>
+                    </div>
+                    <span className="rounded-full bg-red-500/15 px-3 py-1 text-xs text-red-100">{item.status}</span>
+                  </div>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4 text-xs">
+                    <div className="rounded-2xl bg-white/5 px-3 py-3 text-slate-200">Net delta {fmtNum(greeks.delta, 2)}</div>
+                    <div className="rounded-2xl bg-white/5 px-3 py-3 text-slate-200">Net theta {fmtNum(greeks.theta, 2)}</div>
+                    <div className="rounded-2xl bg-white/5 px-3 py-3 text-slate-200">Exposure premium {fmtPnL(exposurePremium)}</div>
+                    <div className="rounded-2xl bg-white/5 px-3 py-3 text-slate-200">Max loss {fmtPnL(maxLoss)}</div>
+                  </div>
+                  <div className="mt-3 text-xs text-slate-300">
+                    Breakevens: {breakevens.length > 0 ? breakevens.join(', ') : 'None'} · Spot {spotPrice.toFixed(2)}
+                  </div>
+                  <div className="mt-3 text-xs text-red-50">
+                    Live legs: {liveLegs.map((leg) => `${leg.action} ${leg.type} ${leg.strike} @ ${leg.ltp.toFixed(2)}`).join(' | ')}
+                  </div>
+                  {failedLegs.length > 0 && (
+                    <div className="mt-2 text-xs text-amber-100">
+                      Failed legs: {failedLegs.map((leg) => `${leg.summary}${leg.error ? ` (${leg.error})` : ''}`).join(' | ')}
+                    </div>
+                  )}
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => void reconcileInterruptedBasket(item.id)}
+                      disabled={recoveringBasketId === item.id}
+                      className="rounded-xl border border-white/15 px-3 py-1.5 text-[11px] text-white transition hover:bg-white/10 disabled:opacity-40"
+                    >
+                      Reconcile order book
+                    </button>
+                    <button
+                      onClick={() => void retryFailedBasket(item.id)}
+                      disabled={recoveringBasketId === item.id}
+                      className="rounded-xl border border-cyan-400/20 px-3 py-1.5 text-[11px] text-cyan-100 transition hover:bg-cyan-400/10 disabled:opacity-40"
+                    >
+                      Retry failed
+                    </button>
+                    <button
+                      onClick={() => void cancelRemainingBasket(item.id)}
+                      disabled={recoveringBasketId === item.id}
+                      className="rounded-xl border border-amber-400/20 px-3 py-1.5 text-[11px] text-amber-100 transition hover:bg-amber-400/10 disabled:opacity-40"
+                    >
+                      Cancel remaining
+                    </button>
+                    <button
+                      onClick={() => void squareOffFilledBasket(item.id)}
+                      disabled={recoveringBasketId === item.id}
+                      className="rounded-xl border border-red-400/20 px-3 py-1.5 text-[11px] text-red-100 transition hover:bg-red-400/10 disabled:opacity-40"
+                    >
+                      Square off filled
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
         <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">
           <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.3em] text-orange-300/70">
             <ShieldAlert size={13} />
