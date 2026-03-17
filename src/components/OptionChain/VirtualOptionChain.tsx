@@ -55,6 +55,7 @@ const VirtualOptionChainInner: React.FC<OptionChainProps> = ({
   onRefresh,
   isLive,
   loadingMsg,
+  isStale: isStaleOverride,
   error,
   availableExpiries: _availableExpiries,  // FIX-5 accepted but unused in virtual renderer
 }) => {
@@ -73,7 +74,7 @@ const VirtualOptionChainInner: React.FC<OptionChainProps> = ({
   const [canRefresh, startCooldown] = useRefreshThrottle(isLoading);
   const baseScrollToATM = useScrollToATM(symbol, filteredData.length, tableContainerRef);
   const staleSec = useStalenessTimer(lastUpdate);
-  const isStale = staleSec > STALE_THRESHOLD_SEC;
+  const isStale = isStaleOverride ?? (staleSec > STALE_THRESHOLD_SEC);
 
   const { sortedData, sortState, toggleSort } = useColumnSort(
     filteredData,

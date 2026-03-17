@@ -17,8 +17,10 @@ const CHARGE_LABELS: Record<string, string> = {
 
 export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void }) {
   const { legs, preview, previewStatus, blotter, clearBlotter, executeStrategy, isExecuting } = useExecutionStore();
-  const { symbol, spotPrice } = useMarketStore();
+  const { symbol, spotPrice, stream } = useMarketStore();
   const componentEntries = Object.entries(preview.chargeSummary?.componentCharges ?? {}).filter(([, value]) => value > 0);
+  const executeDisabled = legs.length === 0 || isExecuting || !stream.canTrade;
+  const executeLabel = isExecuting ? 'Executing...' : !stream.canTrade ? `Blocked · ${stream.label}` : 'Execute';
 
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[1.1fr,0.9fr]">
@@ -69,6 +71,11 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
           {previewStatus === 'loading' ? ' · refreshing...' : ''}
           {preview.availableMargin !== undefined ? ` · Available margin ${fmtPnL(preview.availableMargin)}` : ''}
         </div>
+        {!stream.canTrade && (
+          <div className="mt-3 rounded-3xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
+            Execution gated by market stream authority: {stream.detail}
+          </div>
+        )}
         {preview.validation && (
           <div className="mt-3 rounded-3xl border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-xs text-cyan-100">
             Preview fields: {preview.validation.previewLegs?.[0]?.successFields.join(', ') || 'not captured yet'}
@@ -87,6 +94,7 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
           <div className="mt-4 space-y-3 text-sm text-slate-300">
             <div className="rounded-3xl bg-white/5 px-4 py-3">Underlying: {symbol}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">Spot: {spotPrice.toFixed(2)}</div>
+            <div className="rounded-3xl bg-white/5 px-4 py-3">Stream: {stream.label} via {stream.transport}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">Margin required: {fmtPnL(-preview.marginRequired)}</div>
             <div className="rounded-3xl bg-white/5 px-4 py-3">SPAN / Block / Order: {fmtPnL(-(preview.spanMargin ?? 0))} / {fmtPnL(-(preview.blockTradeMargin ?? 0))} / {fmtPnL(-(preview.orderMargin ?? 0))}</div>
             {preview.chargeSummary && (
@@ -121,10 +129,10 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
             </button>
             <button
               onClick={() => void executeStrategy(legs)}
-              disabled={legs.length === 0 || isExecuting}
+              disabled={executeDisabled}
               className="flex flex-1 items-center justify-center rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition enabled:hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {isExecuting ? 'Executing...' : 'Execute'}
+              {executeLabel}
             </button>
           </div>
         </section>

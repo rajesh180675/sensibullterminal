@@ -20,14 +20,14 @@ export function PortfolioWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
     isRefreshing,
   } = usePortfolioStore();
   const { loadPosition } = useExecutionStore();
-  const { setSymbol } = useMarketStore();
-  const { session, isLive } = useSessionStore();
+  const { setSymbol, stream } = useMarketStore();
+  const { session } = useSessionStore();
 
   useEffect(() => {
-    if (session?.isConnected) {
+    if (stream.canRefreshBrokerData) {
       void refreshPositions();
     }
-  }, [session, refreshPositions]);
+  }, [stream.canRefreshBrokerData, refreshPositions]);
 
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[1.25fr,0.75fr]">
@@ -40,7 +40,7 @@ export function PortfolioWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
             onOpenStrategy();
           }}
           livePositions={livePositions}
-          isLive={isLive}
+          isLive={stream.mode !== 'simulated'}
           session={session}
           onRefreshPositions={() => void refreshPositions()}
         />
@@ -55,11 +55,11 @@ export function PortfolioWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
             </div>
             <button
               onClick={() => void refreshPositions()}
-              disabled={isRefreshing}
+              disabled={isRefreshing || !stream.canRefreshBrokerData}
               className="inline-flex items-center gap-2 rounded-2xl border border-white/10 px-3 py-2 text-xs text-slate-300 transition hover:bg-white/10 disabled:opacity-50"
             >
               <RefreshCw size={12} />
-              Refresh
+              {stream.canRefreshBrokerData ? 'Refresh' : `Blocked · ${stream.label}`}
             </button>
           </div>
           <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
@@ -83,6 +83,11 @@ export function PortfolioWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
           <div className="mt-4 rounded-3xl bg-white/5 px-4 py-4 text-sm text-slate-300">
             Funds: {fmtPnL(funds?.available_margin ?? funds?.cash_balance ?? 0)} available · {Math.round(summary.marginUtilization * 100)}% utilized
           </div>
+          {!stream.canRefreshBrokerData && (
+            <div className="mt-3 rounded-3xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
+              Portfolio refresh is gated by market stream authority: {stream.detail}
+            </div>
+          )}
         </section>
 
         <section className="rounded-[28px] border border-white/8 bg-[#0b1321] p-5">

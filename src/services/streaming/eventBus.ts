@@ -1,10 +1,15 @@
 import type { TickUpdate, WsStatus } from '../../utils/breezeWs';
+import type { StreamTransport } from './streamAuthority';
 
 interface TerminalEventMap {
-  'stream:tick': TickUpdate;
+  'stream:tick': {
+    update: TickUpdate;
+    transport: StreamTransport;
+    receivedAt: number;
+  };
   'stream:status': {
     status: WsStatus;
-    transport: 'websocket' | 'polling' | 'system';
+    transport: StreamTransport;
     at: number;
   };
 }

@@ -1,10 +1,11 @@
 import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
-import { MOCK_POSITIONS } from '../../data/mock';
+import { getMockPositions } from '../../data/mock';
 import type { PortfolioSummary, Position } from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { useNotificationStore } from '../../stores/notificationStore';
 import type { FundsData, OrderBookRow, TradeBookRow } from '../../utils/kaggleClient';
 import { mapBreezePositions } from '../market/marketTransforms';
+import { useMarketStore } from '../market/marketStore';
 import { useSessionStore } from '../session/sessionStore';
 
 function derivePortfolioSummary(positions: Position[], funds: FundsData | null): PortfolioSummary {
@@ -57,17 +58,33 @@ const PortfolioStore = createContext<PortfolioStoreValue | null>(null);
 export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const { notify } = useNotificationStore();
   const { session } = useSessionStore();
-  const [livePositions, setLivePositions] = useState<Position[]>(MOCK_POSITIONS);
-  const [selectedPosition, setSelectedPosition] = useState<Position | null>(MOCK_POSITIONS[0] ?? null);
+  const { stream } = useMarketStore();
+  const [livePositions, setLivePositions] = useState<Position[]>(() => getMockPositions());
+  const [selectedPosition, setSelectedPosition] = useState<Position | null>(() => getMockPositions()[0] ?? null);
   const [funds, setFunds] = useState<FundsData | null>(null);
   const [orders, setOrders] = useState<OrderBookRow[]>([]);
   const [trades, setTrades] = useState<TradeBookRow[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   const refreshPortfolioSurface = useCallback(async () => {
+    if (!stream.canRefreshBrokerData) {
+      const mockPositions = getMockPositions();
+      setLivePositions(mockPositions);
+      setSelectedPosition((current) => current ?? mockPositions[0] ?? null);
+      setFunds({
+        cash_balance: 325000,
+        utilized_margin: 84500,
+        available_margin: 240500,
+      });
+      setOrders([]);
+      setTrades([]);
+      return;
+    }
+
     if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) {
-      setLivePositions(MOCK_POSITIONS);
-      setSelectedPosition((current) => current ?? MOCK_POSITIONS[0] ?? null);
+      const mockPositions = getMockPositions();
+      setLivePositions(mockPositions);
+      setSelectedPosition((current) => current ?? mockPositions[0] ?? null);
       setFunds({
         cash_balance: 325000,
         utilized_margin: 84500,
@@ -104,7 +121,7 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setIsRefreshing(false);
     }
-  }, [notify, session]);
+  }, [notify, session, stream.canRefreshBrokerData]);
 
   const refreshPositions = useCallback(async () => {
     await refreshPortfolioSurface();

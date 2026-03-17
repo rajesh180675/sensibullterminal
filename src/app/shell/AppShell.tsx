@@ -30,7 +30,7 @@ export function AppShell({
   onNavigate: (path: WorkspacePath) => void;
 }) {
   const { legs } = useExecutionStore();
-  const { symbol, setSymbol, refreshMarket, lastUpdate, liveIndices, spotTruth, chainTruth } = useMarketStore();
+  const { symbol, setSymbol, refreshMarket, lastUpdate, liveIndices, spotTruth, chainTruth, stream } = useMarketStore();
   const setLinkedSymbol = useSelectionStore((state) => state.setLinkedSymbol);
   const toggleCommandPalette = useTerminalUiStore((state) => state.toggleCommandPalette);
   const bottomDockOpen = useLayoutStore((state) => state.bottomDockOpen);
@@ -38,9 +38,6 @@ export function AppShell({
   const {
     session,
     showConnectionCenter,
-    statusMessage,
-    statusTruth,
-    isLive,
     openConnectionCenter,
     closeConnectionCenter,
     connectSession,
@@ -104,8 +101,8 @@ export function AppShell({
           currentPath={currentPath}
           onNavigate={onNavigate}
           strategyLegCount={legs.length}
-          isLive={isLive}
-          statusMessage={statusMessage}
+          isLive={stream.mode !== 'simulated'}
+          statusMessage={stream.detail}
           onOpenConnections={() => {
             onNavigate('/settings/connections');
             openConnectionCenter();
@@ -126,9 +123,10 @@ export function AppShell({
                 openConnectionCenter();
               }}
               onRefresh={() => void refreshMarket()}
-              statusMessage={statusMessage}
-              statusTruth={statusTruth}
-              isLive={isLive}
+              statusMessage={stream.detail}
+              statusTruth={stream.truth}
+              isLive={stream.mode === 'live'}
+              streamLabel={stream.label}
               lastUpdate={lastUpdate}
               liveIndices={liveIndices}
               spotTruth={spotTruth}

@@ -39,7 +39,7 @@ import { OptionChainErrorBoundary } from './OptionChainErrorBoundary';
 const OptionChainInner: React.FC<OptionChainProps> = ({
   symbol, data, spotPrice, selectedExpiry, onExpiryChange,
   onAddLeg, highlightedStrikes, lastUpdate, isLoading, onRefresh,
-  isLive, loadingMsg, error,
+  isLive, loadingMsg, isStale: isStaleOverride, error,
   availableExpiries,  // FIX-5
 }) => {
   // ── Preferences (SPEC-F4) ───────────────────────────────
@@ -63,7 +63,7 @@ const OptionChainInner: React.FC<OptionChainProps> = ({
   const [canRefresh, startCooldown] = useRefreshThrottle(isLoading);
   const scrollToATM = useScrollToATM(symbol, filteredData.length, tableContainerRef);
   const staleSec = useStalenessTimer(lastUpdate);
-  const isStale = staleSec > STALE_THRESHOLD_SEC;
+  const isStale = isStaleOverride ?? (staleSec > STALE_THRESHOLD_SEC);
 
   // ── Sorting (SPEC-F1) ───────────────────────────────────
   const { sortedData, sortState, toggleSort } = useColumnSort(

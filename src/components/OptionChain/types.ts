@@ -19,6 +19,7 @@ export interface OptionChainProps {
   onRefresh: () => void;
   isLive?: boolean;
   loadingMsg?: string;
+  isStale?: boolean;
   error?: string | null;
   strikeRange?: number;
   // FIX-5: live expiries from backend so Toolbar shows correct options

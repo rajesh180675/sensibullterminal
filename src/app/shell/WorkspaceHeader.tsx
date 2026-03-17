@@ -14,6 +14,7 @@ export function WorkspaceHeader({
   statusMessage,
   statusTruth,
   isLive,
+  streamLabel,
   lastUpdate,
   liveIndices,
   spotTruth,
@@ -27,6 +28,7 @@ export function WorkspaceHeader({
   statusMessage: string;
   statusTruth: TruthDescriptor;
   isLive: boolean;
+  streamLabel: string;
   lastUpdate: Date;
   liveIndices: MarketIndex[];
   spotTruth: TruthDescriptor;
@@ -46,7 +48,7 @@ export function WorkspaceHeader({
           <div className="mt-2 flex flex-wrap items-center gap-3">
             <h1 className="text-2xl font-semibold tracking-tight text-white">{route.title}</h1>
             <span className={`rounded-full px-3 py-1 text-xs font-medium ${isLive ? 'bg-emerald-500/12 text-emerald-200' : 'bg-amber-500/12 text-amber-200'}`}>
-              {isLive ? 'Live broker path' : 'Preview mode'}
+              {streamLabel}
             </span>
             <TruthPill descriptor={spotTruth} compact />
             <TruthPill descriptor={chainTruth} compact />
@@ -72,7 +74,7 @@ export function WorkspaceHeader({
             }`}
           >
             {isLive ? <Wifi size={14} /> : <WifiOff size={14} />}
-            {isLive ? 'Session live' : 'Connect broker'}
+            {isLive ? 'Stream live' : 'Review connections'}
           </button>
         </div>
       </div>

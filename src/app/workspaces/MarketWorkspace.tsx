@@ -16,7 +16,6 @@ import { ALL_SYMBOLS, SYMBOL_CONFIG } from '../../config/market';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
 import { useSellerIntelligenceStore } from '../../domains/seller/sellerIntelligenceStore';
-import { useSessionStore } from '../../domains/session/sessionStore';
 import { fmtPnL } from '../../utils/math';
 
 export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void }) {
@@ -41,9 +40,9 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
     chartInterval,
     setChartInterval,
     isHistoricalLoading,
+    stream,
   } = useMarketStore();
   const { addLeg, legs, stageStrategy, preview } = useExecutionStore();
-  const { isLive, statusMessage } = useSessionStore();
   const { regime, opportunities } = useSellerIntelligenceStore();
 
   const nearestStrikeDiff = chain.length > 0
@@ -68,6 +67,8 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
   const candlesReady = historical.length > 0;
   const selectedWatchlist = watchlist.find((entry) => entry.symbol === symbol);
   const topIdeas = opportunities.slice(0, 3);
+  const greekSource = chainWithAtm[0]?.greekSource ?? 'approximate';
+  const greekLabel = greekSource === 'black-scholes' ? 'Greeks: BS' : greekSource === 'broker' ? 'Greeks: broker' : 'Greeks: approx';
 
   return (
     <div className="grid min-h-full gap-4 p-4 2xl:grid-cols-[280px,minmax(0,1fr),340px]">
@@ -84,8 +85,14 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
                 <div className="mt-2 text-2xl font-semibold text-white">{SYMBOL_CONFIG[symbol].displayName}</div>
                 <div className="mt-1 text-sm text-slate-300">{expiry.label}</div>
               </div>
-              <div className={`rounded-full px-3 py-1 text-xs ${isLive ? 'bg-emerald-500/15 text-emerald-200' : 'bg-amber-500/15 text-amber-200'}`}>
-                {isLive ? 'Live' : 'Preview'}
+              <div className={`rounded-full px-3 py-1 text-xs ${
+                stream.mode === 'live'
+                  ? 'bg-emerald-500/15 text-emerald-200'
+                  : stream.mode === 'degraded'
+                    ? 'bg-amber-500/15 text-amber-200'
+                    : 'bg-slate-500/15 text-slate-200'
+              }`}>
+                {stream.label}
               </div>
             </div>
             <div className="mt-4 grid grid-cols-2 gap-2 text-xs">
@@ -100,7 +107,13 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
               <div className="rounded-2xl bg-black/20 px-3 py-3">
                 <div className="text-slate-500">Feed</div>
                 <div className="mt-1 text-sm font-semibold text-white">
-                  {marketDepth.source === 'backend' || candlesReady ? 'Backend native' : isLive ? 'Live chain' : 'Simulated'}
+                  {stream.transport === 'websocket'
+                    ? 'WebSocket normalized'
+                    : stream.transport === 'polling'
+                      ? 'Polling fallback'
+                      : marketDepth.source === 'backend' || candlesReady
+                        ? 'Backend snapshot'
+                        : 'Simulated'}
                 </div>
               </div>
               <div className="rounded-2xl bg-black/20 px-3 py-3">
@@ -196,7 +209,7 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
               </div>
               <h2 className="mt-2 text-2xl font-semibold text-white">{SYMBOL_CONFIG[symbol].displayName}</h2>
               <p className="mt-1 text-sm text-slate-400">
-                Spot {spotPrice.toFixed(2)} · {selectedWatchlist ? `${selectedWatchlist.change >= 0 ? '+' : ''}${selectedWatchlist.change.toFixed(2)} (${selectedWatchlist.pct.toFixed(2)}%)` : 'awaiting watchlist quote'} · {statusMessage}
+                Spot {spotPrice.toFixed(2)} · {selectedWatchlist ? `${selectedWatchlist.change >= 0 ? '+' : ''}${selectedWatchlist.change.toFixed(2)} (${selectedWatchlist.pct.toFixed(2)}%)` : 'awaiting watchlist quote'} · {stream.detail}
               </p>
             </div>
 
@@ -229,11 +242,23 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
               </span>
               <TruthPill descriptor={spotTruth} compact />
               <TruthPill descriptor={chainTruth} compact />
+              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-slate-300">
+                {greekLabel}
+              </span>
               <span className={`rounded-full px-3 py-2 ${depthReady ? 'bg-emerald-500/12 text-emerald-200' : 'bg-amber-500/12 text-amber-200'}`}>
                 {depthReady ? 'Depth linked' : 'Depth awaiting backend'}
               </span>
               <span className={`rounded-full px-3 py-2 ${chainError ? 'bg-red-500/12 text-red-200' : 'bg-cyan-500/12 text-cyan-100'}`}>
                 {chainError || (isLoading ? 'Refreshing chain' : 'Chain ready')}
+              </span>
+              <span className={`rounded-full px-3 py-2 ${
+                stream.mode === 'live'
+                  ? 'bg-emerald-500/12 text-emerald-100'
+                  : stream.mode === 'degraded'
+                    ? 'bg-amber-500/12 text-amber-100'
+                    : 'bg-slate-500/12 text-slate-200'
+              }`}>
+                {stream.label} · {stream.backpressureLevel === 'none' ? 'steady' : stream.backpressureLevel}
               </span>
             </div>
           </div>
@@ -252,8 +277,9 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
               lastUpdate={lastUpdate}
               isLoading={isLoading}
               onRefresh={refreshMarket}
-              isLive={isLive}
-              loadingMsg={statusMessage}
+              isLive={stream.mode === 'live'}
+              loadingMsg={stream.detail}
+              isStale={stream.isStale}
               error={chainError}
               availableExpiries={availableExpiries}
             />

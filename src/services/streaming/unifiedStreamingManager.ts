@@ -1,5 +1,6 @@
 import { breezeWs, startTickPolling, type TickUpdate, type WsStatus } from '../../utils/breezeWs';
 import { terminalEventBus } from './eventBus';
+import type { StreamTransport } from './streamAuthority';
 
 export class UnifiedStreamingManager {
   private stopPolling: (() => void) | null = null;
@@ -10,7 +11,7 @@ export class UnifiedStreamingManager {
     onStatus: (status: WsStatus) => void = () => undefined,
   ): void {
     this.disconnect();
-    const publishStatus = (status: WsStatus, transport: 'websocket' | 'polling' | 'system') => {
+    const publishStatus = (status: WsStatus, transport: StreamTransport) => {
       terminalEventBus.emit('stream:status', {
         status,
         transport,
@@ -18,17 +19,23 @@ export class UnifiedStreamingManager {
       });
       onStatus(status);
     };
-    const publishTick = (update: TickUpdate) => {
-      terminalEventBus.emit('stream:tick', update);
+    const publishTick = (update: TickUpdate, transport: StreamTransport) => {
+      terminalEventBus.emit('stream:tick', {
+        update,
+        transport,
+        receivedAt: Date.now(),
+      });
       onTick(update);
     };
 
-    breezeWs.connect(backendUrl, publishTick, (status) => {
+    breezeWs.connect(backendUrl, (update) => {
+      publishTick(update, 'websocket');
+    }, (status) => {
       publishStatus(status, 'websocket');
       if (status === 'error') {
         this.stopPolling = startTickPolling(backendUrl, (update) => {
           publishStatus('connected', 'polling');
-          publishTick(update);
+          publishTick(update, 'polling');
         });
       }
     });

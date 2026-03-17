@@ -4,6 +4,7 @@ import type { ExecutionBlotterItem, ExecutionPreview, ExecutionValidationSummary
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { buildPayoff, findBreakevens, maxProfitLoss } from '../../utils/math';
+import { useMarketStore } from '../market/marketStore';
 import { useSessionStore } from '../session/sessionStore';
 
 let executionLegId = 0;
@@ -135,6 +136,7 @@ const ExecutionStore = createContext<ExecutionStoreValue | null>(null);
 export function ExecutionProvider({ children }: { children: React.ReactNode }) {
   const { notify } = useNotificationStore();
   const { session } = useSessionStore();
+  const { stream } = useMarketStore();
   const [legs, setLegs] = useState<OptionLeg[]>([]);
   const [blotter, setBlotter] = useState<ExecutionBlotterItem[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
@@ -267,6 +269,20 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
 
     setBlotter((current) => [blotterBase, ...current].slice(0, 20));
 
+    if (!stream.canTrade) {
+      setBlotter((current) => current.map((item) => item.id === blotterId ? {
+        ...item,
+        status: 'failed',
+        response: `Execution blocked. ${stream.detail}`,
+      } : item));
+      notify({
+        title: 'Execution blocked',
+        message: stream.detail,
+        tone: 'warning',
+      });
+      return;
+    }
+
     if (!session?.isConnected) {
       setBlotter((current) => current.map((item) => item.id === blotterId ? {
         ...item,
@@ -362,7 +378,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
       message: results.join(' | ') || 'No orders sent.',
       tone: status === 'failed' ? 'error' : status === 'partial' ? 'warning' : 'success',
     });
-  }, [notify, session]);
+  }, [notify, session, stream]);
 
   const value = useMemo(() => ({
     legs,
