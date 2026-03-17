@@ -22,12 +22,14 @@ import {
   fetchRepairPreview,
   fetchSellerReviewState,
   saveSellerReviewState,
+  squareOffPosition,
   fetchSpotPrice,
   fetchTradeBook,
   isKaggleBackend,
   setTerminalAuthToken,
   updateAutomationRule,
   updateAutomationRuleStatus,
+  cancelOrder,
 } from '../../utils/kaggleClient';
 import { setWsAuthToken, subscribeOptionChain } from '../../utils/breezeWs';
 import type { OptionLeg } from '../../types/index';
@@ -210,6 +212,12 @@ export const brokerGatewayClient = {
   orders: {
     async placeDirectLeg(session: BreezeSession, params: Parameters<typeof placeLegOrder>[1]) {
       return placeLegOrder(session, params);
+    },
+    async cancel(session: BreezeSession, orderId: string, exchangeCode = 'NFO') {
+      return cancelOrder(session.proxyBase, orderId, exchangeCode);
+    },
+    async squareOffLeg(session: BreezeSession, params: Parameters<typeof squareOffPosition>[1]) {
+      return squareOffPosition(session.proxyBase, params);
     },
   },
   execution: {

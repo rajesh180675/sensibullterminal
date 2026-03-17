@@ -33,7 +33,20 @@ function blotterTone(status: ExecutionBlotterItem['status']) {
 }
 
 export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void }) {
-  const { legs, activeBasket, preview, previewStatus, blotter, clearBlotter, executeStrategy, isExecuting } = useExecutionStore();
+  const {
+    legs,
+    activeBasket,
+    preview,
+    previewStatus,
+    blotter,
+    clearBlotter,
+    executeStrategy,
+    isExecuting,
+    recoveringBasketId,
+    retryFailedBasket,
+    cancelRemainingBasket,
+    squareOffFilledBasket,
+  } = useExecutionStore();
   const { symbol, spotPrice, stream } = useMarketStore();
   const componentEntries = Object.entries(preview.chargeSummary?.componentCharges ?? {}).filter(([, value]) => value > 0);
   const executeDisabled = legs.length === 0 || isExecuting || !stream.canTrade;
@@ -200,6 +213,31 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
                 {item.legStates && item.legStates.length > 0 && (
                   <div className="mt-2 text-[11px] text-slate-400">
                     {item.legStates.map((leg) => `${leg.summary} ${leg.status}${leg.orderId ? ` (${leg.orderId})` : ''}`).join(' | ')}
+                  </div>
+                )}
+                {(item.status === 'partial_failure' || item.status === 'partial_fill') && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={() => void retryFailedBasket(item.id)}
+                      disabled={recoveringBasketId === item.id}
+                      className="rounded-xl border border-cyan-400/20 px-3 py-1.5 text-[11px] text-cyan-100 transition hover:bg-cyan-400/10 disabled:opacity-40"
+                    >
+                      Retry failed
+                    </button>
+                    <button
+                      onClick={() => void cancelRemainingBasket(item.id)}
+                      disabled={recoveringBasketId === item.id}
+                      className="rounded-xl border border-amber-400/20 px-3 py-1.5 text-[11px] text-amber-100 transition hover:bg-amber-400/10 disabled:opacity-40"
+                    >
+                      Cancel remaining
+                    </button>
+                    <button
+                      onClick={() => void squareOffFilledBasket(item.id)}
+                      disabled={recoveringBasketId === item.id}
+                      className="rounded-xl border border-red-400/20 px-3 py-1.5 text-[11px] text-red-100 transition hover:bg-red-400/10 disabled:opacity-40"
+                    >
+                      Square off filled
+                    </button>
                   </div>
                 )}
               </div>
