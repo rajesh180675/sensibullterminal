@@ -9,7 +9,7 @@ import { useSellerIntelligenceStore } from '../../domains/seller/sellerIntellige
 import { fmtPnL } from '../../utils/math';
 
 export function StrategyWorkspace() {
-  const { legs, appendLegs, updateLeg, removeLeg, executeStrategy, clearLegs, preview, stageStrategy } = useExecutionStore();
+  const { legs, activeBasket, appendLegs, updateLeg, removeLeg, executeStrategy, clearLegs, preview, stageStrategy } = useExecutionStore();
   const { chain, symbol, spotPrice } = useMarketStore();
   const { snapshot } = useRiskStore();
   const { createRuleFromStrategy, createRuleFromOpportunity } = useAutomationStore();
@@ -219,6 +219,9 @@ export function StrategyWorkspace() {
         {legs.length > 0 && (
           <div className="grid gap-3 border-t border-white/8 bg-[#09111f] px-5 py-3 text-sm xl:grid-cols-[1.2fr,1fr,1fr,auto,auto]">
             <div className="flex items-center text-slate-300">{legs.length} legs staged for execution.</div>
+            <div className="rounded-2xl bg-white/5 px-3 py-2 text-slate-300">
+              <span className="inline-flex items-center gap-2 text-white"><Zap size={14} /> Basket {activeBasket?.status ?? 'staged'}</span>
+            </div>
             <div className="rounded-2xl bg-white/5 px-3 py-2 text-slate-300">
               <span className="inline-flex items-center gap-2 text-white"><Zap size={14} /> Margin {fmtPnL(-preview.marginRequired)}</span>
             </div>

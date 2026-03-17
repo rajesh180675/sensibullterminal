@@ -21,6 +21,7 @@ export interface SymbolConfig {
 export interface OptionRow {
   strike:     number;
   isATM?:     boolean;
+  greekSource?: 'approximate' | 'black-scholes' | 'broker';
   ce_ltp:     number;
   ce_oi:      number;
   ce_oiChg:   number;
@@ -224,6 +225,45 @@ export interface ExecutionValidationSummary {
   margin?: ExecutionValidationLegSummary;
 }
 
+export type ExecutionLegStatus =
+  | 'drafted'
+  | 'staged'
+  | 'previewing'
+  | 'previewed'
+  | 'sending'
+  | 'pending'
+  | 'filled'
+  | 'failed'
+  | 'rejected'
+  | 'cancelled';
+
+export type ExecutionBasketStatus =
+  | 'staged'
+  | 'ready'
+  | 'sending'
+  | 'partial_fill'
+  | 'all_filled'
+  | 'partial_failure'
+  | 'all_failed'
+  | 'cancelled';
+
+export type ExecutionRecoveryAction =
+  | 'none'
+  | 'cancel_remaining'
+  | 'retry_failed'
+  | 'square_off_filled'
+  | 'manual_intervention';
+
+export interface ExecutionBasketLeg {
+  legId: string;
+  summary: string;
+  status: ExecutionLegStatus;
+  orderId?: string;
+  sentAt?: number;
+  updatedAt: number;
+  error?: string;
+}
+
 export interface ExecutionBlotterItem {
   id: string;
   submittedAt: number;
@@ -231,8 +271,11 @@ export interface ExecutionBlotterItem {
   legCount: number;
   summary: string;
   premium: number;
-  status: 'queued' | 'sent' | 'partial' | 'failed';
+  status: ExecutionBasketStatus;
   response: string;
+  completedAt?: number;
+  recoveryAction?: ExecutionRecoveryAction;
+  legStates?: ExecutionBasketLeg[];
   legsSnapshot?: OptionLeg[];
   previewSnapshot?: ExecutionPreview;
 }

@@ -262,7 +262,11 @@ export function JournalProvider({ children }: { children: React.ReactNode }) {
   );
 
   useEffect(() => {
-    const filledItems = blotter.filter((item) => item.status === 'sent' || item.status === 'partial');
+    const filledItems = blotter.filter((item) => (
+      item.status === 'partial_fill' ||
+      item.status === 'all_filled' ||
+      item.status === 'partial_failure'
+    ));
     if (filledItems.length === 0) return;
     setEntries((current) => {
       const seen = new Set(current.map((entry) => entry.sourceBlotterId).filter(Boolean));

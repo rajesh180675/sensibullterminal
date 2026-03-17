@@ -6,10 +6,16 @@ import { useNotificationStore } from '../../stores/notificationStore';
 import { buildPayoff, findBreakevens, maxProfitLoss } from '../../utils/math';
 import { useMarketStore } from '../market/marketStore';
 import { useSessionStore } from '../session/sessionStore';
+import {
+  createDraftBasket,
+  finalizeBasket,
+  nextDraftBasketId,
+  updateBasketState,
+  updateLegState,
+} from './executionStateMachine';
 
 let executionLegId = 0;
 const nextExecutionLegId = () => `leg-${++executionLegId}-${Date.now()}`;
-const nextBlotterId = () => `blotter-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 
 export function buildExecutionPreview(legs: OptionLeg[]): ExecutionPreview {
   if (legs.length === 0) {
@@ -116,6 +122,7 @@ export function buildBackendLegPayload(legs: OptionLeg[]) {
 
 interface ExecutionStoreValue {
   legs: OptionLeg[];
+  activeBasket: ExecutionBlotterItem | null;
   preview: ExecutionPreview;
   previewStatus: 'idle' | 'loading' | 'ready' | 'fallback';
   blotter: ExecutionBlotterItem[];
@@ -137,6 +144,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
   const { notify } = useNotificationStore();
   const { session } = useSessionStore();
   const { stream } = useMarketStore();
+  const [draftMeta, setDraftMeta] = useState<{ id: string; createdAt: number } | null>(null);
   const [legs, setLegs] = useState<OptionLeg[]>([]);
   const [blotter, setBlotter] = useState<ExecutionBlotterItem[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
@@ -145,17 +153,24 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
   const [previewStatus, setPreviewStatus] = useState<'idle' | 'loading' | 'ready' | 'fallback'>('idle');
 
   const addLeg = useCallback((leg: Omit<OptionLeg, 'id'>) => {
-    setLegs((current) => [...current, { ...leg, id: nextExecutionLegId() }]);
+    setLegs((current) => {
+      if (current.length === 0) setDraftMeta({ id: nextDraftBasketId(), createdAt: Date.now() });
+      return [...current, { ...leg, id: nextExecutionLegId() }];
+    });
   }, []);
 
   const appendLegs = useCallback((nextLegs: Array<Omit<OptionLeg, 'id'>>) => {
-    setLegs((current) => [
-      ...current,
-      ...nextLegs.map((leg) => ({ ...leg, id: nextExecutionLegId() })),
-    ]);
+    setLegs((current) => {
+      if (current.length === 0 && nextLegs.length > 0) setDraftMeta({ id: nextDraftBasketId(), createdAt: Date.now() });
+      return [
+        ...current,
+        ...nextLegs.map((leg) => ({ ...leg, id: nextExecutionLegId() })),
+      ];
+    });
   }, []);
 
   const stageStrategy = useCallback((nextLegs: Array<Omit<OptionLeg, 'id'>>) => {
+    setDraftMeta(nextLegs.length > 0 ? { id: nextDraftBasketId(), createdAt: Date.now() } : null);
     setLegs(nextLegs.map((leg) => ({ ...leg, id: nextExecutionLegId() })));
   }, []);
 
@@ -167,10 +182,14 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     setLegs((current) => current.filter((leg) => leg.id !== id));
   }, []);
 
-  const clearLegs = useCallback(() => setLegs([]), []);
+  const clearLegs = useCallback(() => {
+    setDraftMeta(null);
+    setLegs([]);
+  }, []);
   const clearBlotter = useCallback(() => setBlotter([]), []);
 
   const loadPosition = useCallback((position: Position) => {
+    setDraftMeta({ id: nextDraftBasketId(), createdAt: Date.now() });
     setLegs(position.legs.map((leg) => ({
       id: nextExecutionLegId(),
       symbol: position.symbol,
@@ -250,31 +269,55 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     };
   }, [legs, localPreview, notify, session]);
 
+  const activeBasket = useMemo<ExecutionBlotterItem | null>(() => {
+    if (legs.length === 0 || !draftMeta) return null;
+    return createDraftBasket({
+      basketId: draftMeta.id,
+      createdAt: draftMeta.createdAt,
+      symbol: legs[0].symbol,
+      legs,
+      preview,
+      previewStatus,
+    });
+  }, [draftMeta, legs, preview, previewStatus]);
+
   const executeStrategy = useCallback(async (selectedLegs: OptionLeg[]) => {
     if (selectedLegs.length === 0) return;
 
-    const blotterId = nextBlotterId();
+    const usesActiveDraft = !!(activeBasket && activeBasket.legStates?.every((leg) => selectedLegs.some((candidate) => candidate.id === leg.legId)));
+    const submittedAt = Date.now();
+    const blotterId = usesActiveDraft
+      ? activeBasket.id
+      : nextDraftBasketId();
     const blotterBase: ExecutionBlotterItem = {
+      ...(activeBasket ?? createDraftBasket({
+        basketId: blotterId,
+        createdAt: submittedAt,
+        symbol: selectedLegs[0].symbol,
+        legs: selectedLegs,
+        preview,
+        previewStatus,
+      })),
       id: blotterId,
-      submittedAt: Date.now(),
-      symbol: selectedLegs[0].symbol,
-      legCount: selectedLegs.length,
-      summary: selectedLegs.map((leg) => `${leg.action} ${leg.type} ${leg.strike}`).join(' | '),
-      premium: buildExecutionPreview(selectedLegs).estimatedPremium,
-      status: 'queued',
-      response: 'Queued for broker dispatch.',
-      legsSnapshot: selectedLegs.map((leg) => ({ ...leg })),
-      previewSnapshot: buildExecutionPreview(selectedLegs),
+      submittedAt,
+      status: 'sending',
+      response: 'Sending basket sequentially to the broker.',
     };
 
     setBlotter((current) => [blotterBase, ...current].slice(0, 20));
+    if (usesActiveDraft) {
+      setDraftMeta({ id: nextDraftBasketId(), createdAt: Date.now() });
+    }
 
     if (!stream.canTrade) {
-      setBlotter((current) => current.map((item) => item.id === blotterId ? {
-        ...item,
-        status: 'failed',
-        response: `Execution blocked. ${stream.detail}`,
-      } : item));
+      setBlotter((current) => current.map((item) => item.id === blotterId
+        ? updateBasketState(item, {
+            status: 'all_failed',
+            response: `Execution blocked. ${stream.detail}`,
+            completedAt: Date.now(),
+            recoveryAction: 'none',
+          })
+        : item));
       notify({
         title: 'Execution blocked',
         message: stream.detail,
@@ -284,11 +327,14 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (!session?.isConnected) {
-      setBlotter((current) => current.map((item) => item.id === blotterId ? {
-        ...item,
-        status: 'failed',
-        response: 'No broker session connected.',
-      } : item));
+      setBlotter((current) => current.map((item) => item.id === blotterId
+        ? updateBasketState(item, {
+            status: 'all_failed',
+            response: 'No broker session connected.',
+            completedAt: Date.now(),
+            recoveryAction: 'none',
+          })
+        : item));
       notify({
         title: 'Broker not connected',
         message: 'Open Connections and validate a live session before executing orders.',
@@ -300,42 +346,90 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     setIsExecuting(true);
     const cfg = SYMBOL_CONFIG[selectedLegs[0].symbol];
     const results: string[] = [];
-    let successCount = 0;
+    let basketInterrupted = false;
 
     try {
       if (brokerGatewayClient.session.isBackend(session.proxyBase)) {
         const base = session.proxyBase.replace(/\/api\/?$/, '').replace(/\/$/, '');
-        const response = await fetch(`${base}/api/strategy/execute`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            legs: selectedLegs.map((leg) => ({
-              stock_code: cfg.breezeStockCode,
-              exchange_code: cfg.breezeExchangeCode,
-              action: leg.action.toLowerCase(),
-              quantity: String(leg.lots * cfg.lotSize),
-              expiry_date: leg.expiry,
-              right: leg.type === 'CE' ? 'call' : 'put',
-              strike_price: String(leg.strike),
-              order_type: leg.orderType ?? 'market',
-              price: leg.orderType === 'limit' ? String(leg.limitPrice ?? leg.ltp) : '0',
-            })),
-          }),
-        });
-
-        const data = await response.json() as {
-          results?: Array<{ success: boolean; order_id?: string; error?: string }>;
-        };
-
-        data.results?.forEach((result, index) => {
+        for (let index = 0; index < selectedLegs.length; index += 1) {
           const leg = selectedLegs[index];
-          if (result.success) successCount += 1;
-          results.push(result.success
-            ? `${leg.type} ${leg.strike} ${leg.action} -> ${result.order_id}`
-            : `${leg.type} ${leg.strike} failed -> ${result.error}`);
-        });
+          setBlotter((current) => current.map((item) => item.id === blotterId
+            ? updateLegState(item, leg.id, { status: 'sending', sentAt: Date.now(), updatedAt: Date.now() })
+            : item));
+
+          try {
+            const response = await fetch(`${base}/api/strategy/execute`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                legs: [{
+                  stock_code: cfg.breezeStockCode,
+                  exchange_code: cfg.breezeExchangeCode,
+                  action: leg.action.toLowerCase(),
+                  quantity: String(leg.lots * cfg.lotSize),
+                  expiry_date: leg.expiry,
+                  right: leg.type === 'CE' ? 'call' : 'put',
+                  strike_price: String(leg.strike),
+                  order_type: leg.orderType ?? 'market',
+                  price: leg.orderType === 'limit' ? String(leg.limitPrice ?? leg.ltp) : '0',
+                }],
+              }),
+            });
+
+            const data = await response.json() as {
+              results?: Array<{ success: boolean; order_id?: string; error?: string }>;
+            };
+            const result = data.results?.[0];
+
+            if (result?.success) {
+              results.push(`${leg.type} ${leg.strike} ${leg.action} -> ${result.order_id}`);
+              setBlotter((current) => current.map((item) => item.id === blotterId
+                ? updateLegState(item, leg.id, {
+                    status: 'pending',
+                    orderId: result.order_id,
+                    updatedAt: Date.now(),
+                  })
+                : item));
+            } else {
+              const error = result?.error || 'Rejected by broker.';
+              results.push(`${leg.type} ${leg.strike} failed -> ${error}`);
+              setBlotter((current) => current.map((item) => item.id === blotterId ? updateBasketState(
+                updateLegState(item, leg.id, {
+                  status: 'rejected',
+                  error,
+                  updatedAt: Date.now(),
+                }),
+                {
+                  status: index === 0 ? 'all_failed' : 'partial_failure',
+                  recoveryAction: index === 0 ? 'none' : 'manual_intervention',
+                },
+              ) : item));
+              basketInterrupted = true;
+              break;
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            results.push(`${leg.type} ${leg.strike} failed -> ${message}`);
+            setBlotter((current) => current.map((item) => item.id === blotterId ? updateBasketState(
+              updateLegState(item, leg.id, {
+                status: 'failed',
+                error: message,
+                updatedAt: Date.now(),
+              }),
+              {
+                status: index === 0 ? 'all_failed' : 'partial_failure',
+                recoveryAction: index === 0 ? 'none' : 'manual_intervention',
+              },
+            ) : item));
+            basketInterrupted = true;
+            break;
+          }
+        }
       } else {
         for (const leg of selectedLegs) {
+          setBlotter((current) => current.map((item) => item.id === blotterId
+            ? updateLegState(item, leg.id, { status: 'sending', sentAt: Date.now(), updatedAt: Date.now() })
+            : item));
           try {
             const result = await brokerGatewayClient.orders.placeDirectLeg(session, {
               stockCode: cfg.breezeStockCode,
@@ -348,10 +442,30 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
               orderType: (leg.orderType ?? 'market') as 'market' | 'limit',
               price: leg.orderType === 'limit' ? String(leg.limitPrice ?? leg.ltp) : '0',
             });
-            successCount += 1;
             results.push(`${leg.type} ${leg.strike} ${leg.action} -> ${result.order_id}`);
+            setBlotter((current) => current.map((item) => item.id === blotterId
+              ? updateLegState(item, leg.id, {
+                  status: 'pending',
+                  orderId: result.order_id,
+                  updatedAt: Date.now(),
+                })
+              : item));
           } catch (error) {
-            results.push(error instanceof Error ? error.message : String(error));
+            const message = error instanceof Error ? error.message : String(error);
+            results.push(`${leg.type} ${leg.strike} failed -> ${message}`);
+            setBlotter((current) => current.map((item) => item.id === blotterId ? updateBasketState(
+              updateLegState(item, leg.id, {
+                status: 'failed',
+                error: message,
+                updatedAt: Date.now(),
+              }),
+              {
+                status: results.length === 1 ? 'all_failed' : 'partial_failure',
+                recoveryAction: results.length === 1 ? 'none' : 'manual_intervention',
+              },
+            ) : item));
+            basketInterrupted = true;
+            break;
           }
         }
       }
@@ -361,27 +475,25 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
       setIsExecuting(false);
     }
 
-    const status = successCount === 0
-      ? 'failed'
-      : successCount === selectedLegs.length
-        ? 'sent'
-        : 'partial';
-
-    setBlotter((current) => current.map((item) => item.id === blotterId ? {
-      ...item,
-      status,
-      response: results.join(' | ') || 'No orders sent.',
-    } : item));
+    setBlotter((current) => current.map((item) => item.id === blotterId
+      ? finalizeBasket(
+          updateBasketState(item, {
+            status: basketInterrupted ? item.status : 'partial_fill',
+          }),
+          results.join(' | ') || 'No orders sent.',
+        )
+      : item));
 
     notify({
       title: 'Execution result',
       message: results.join(' | ') || 'No orders sent.',
-      tone: status === 'failed' ? 'error' : status === 'partial' ? 'warning' : 'success',
+      tone: basketInterrupted && results.length <= 1 ? 'error' : basketInterrupted ? 'warning' : 'success',
     });
-  }, [notify, session, stream]);
+  }, [activeBasket, notify, preview, previewStatus, session, stream]);
 
   const value = useMemo(() => ({
     legs,
+    activeBasket,
     preview,
     previewStatus,
     blotter,
@@ -395,7 +507,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     loadPosition,
     clearBlotter,
     executeStrategy,
-  }), [legs, preview, previewStatus, blotter, isExecuting, addLeg, appendLegs, stageStrategy, updateLeg, removeLeg, clearLegs, loadPosition, clearBlotter, executeStrategy]);
+  }), [legs, activeBasket, preview, previewStatus, blotter, isExecuting, addLeg, appendLegs, stageStrategy, updateLeg, removeLeg, clearLegs, loadPosition, clearBlotter, executeStrategy]);
 
   return <ExecutionStore.Provider value={value}>{children}</ExecutionStore.Provider>;
 }

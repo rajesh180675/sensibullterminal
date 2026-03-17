@@ -1,6 +1,7 @@
 import { Activity, ArrowRight, ShieldAlert, TimerReset, Wallet } from 'lucide-react';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
+import type { ExecutionBlotterItem } from '../../types/index';
 import { fmtPnL } from '../../utils/math';
 
 const CHARGE_LABELS: Record<string, string> = {
@@ -15,8 +16,24 @@ const CHARGE_LABELS: Record<string, string> = {
   totalTax: 'Total tax',
 };
 
+function blotterTone(status: ExecutionBlotterItem['status']) {
+  if (status === 'all_filled' || status === 'partial_fill' || status === 'ready') {
+    return 'bg-emerald-500/15 text-emerald-300';
+  }
+  if (status === 'partial_failure') {
+    return 'bg-amber-500/15 text-amber-300';
+  }
+  if (status === 'all_failed' || status === 'cancelled') {
+    return 'bg-red-500/15 text-red-300';
+  }
+  if (status === 'sending') {
+    return 'bg-cyan-500/15 text-cyan-200';
+  }
+  return 'bg-slate-500/15 text-slate-300';
+}
+
 export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void }) {
-  const { legs, preview, previewStatus, blotter, clearBlotter, executeStrategy, isExecuting } = useExecutionStore();
+  const { legs, activeBasket, preview, previewStatus, blotter, clearBlotter, executeStrategy, isExecuting } = useExecutionStore();
   const { symbol, spotPrice, stream } = useMarketStore();
   const componentEntries = Object.entries(preview.chargeSummary?.componentCharges ?? {}).filter(([, value]) => value > 0);
   const executeDisabled = legs.length === 0 || isExecuting || !stream.canTrade;
@@ -71,6 +88,13 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
           {previewStatus === 'loading' ? ' · refreshing...' : ''}
           {preview.availableMargin !== undefined ? ` · Available margin ${fmtPnL(preview.availableMargin)}` : ''}
         </div>
+        {activeBasket && (
+          <div className="mt-3 rounded-3xl border border-white/8 bg-white/5 px-4 py-3 text-xs text-slate-300">
+            Basket state: <span className="font-semibold text-white">{activeBasket.status}</span>
+            {' · '}
+            {activeBasket.legStates?.map((leg) => `${leg.summary}: ${leg.status}`).join(' | ') || 'No leg states yet'}
+          </div>
+        )}
         {!stream.canTrade && (
           <div className="mt-3 rounded-3xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
             Execution gated by market stream authority: {stream.detail}
@@ -160,7 +184,7 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
               <div key={item.id} className="rounded-3xl border border-white/8 bg-white/5 px-4 py-3">
                 <div className="flex items-center justify-between gap-3">
                   <div className="text-sm font-semibold text-white">{item.summary}</div>
-                  <span className={`rounded-full px-2 py-1 text-[10px] uppercase tracking-[0.2em] ${item.status === 'sent' ? 'bg-emerald-500/15 text-emerald-300' : item.status === 'partial' ? 'bg-amber-500/15 text-amber-300' : item.status === 'failed' ? 'bg-red-500/15 text-red-300' : 'bg-slate-500/15 text-slate-300'}`}>
+                  <span className={`rounded-full px-2 py-1 text-[10px] uppercase tracking-[0.2em] ${blotterTone(item.status)}`}>
                     {item.status}
                   </span>
                 </div>
@@ -170,6 +194,14 @@ export function ExecutionWorkspace({ onOpenStrategy }: { onOpenStrategy: () => v
                   <span>{fmtPnL(item.premium)}</span>
                 </div>
                 <div className="mt-2 text-xs text-slate-300">{item.response}</div>
+                {item.recoveryAction && item.recoveryAction !== 'none' && (
+                  <div className="mt-2 text-[11px] text-amber-200">Recovery: {item.recoveryAction}</div>
+                )}
+                {item.legStates && item.legStates.length > 0 && (
+                  <div className="mt-2 text-[11px] text-slate-400">
+                    {item.legStates.map((leg) => `${leg.summary} ${leg.status}${leg.orderId ? ` (${leg.orderId})` : ''}`).join(' | ')}
+                  </div>
+                )}
               </div>
             ))}
           </div>
