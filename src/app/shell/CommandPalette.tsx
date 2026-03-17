@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Search } from 'lucide-react';
-import { useTerminalUiStore } from '../../state/terminal/terminalUiStore';
+import { useTerminalStore } from '../../state/terminal/terminalStore';
 import { WORKSPACE_ROUTES, type WorkspacePath } from '../router';
 
 export function CommandPalette({
@@ -12,8 +12,8 @@ export function CommandPalette({
   onNavigate: (path: WorkspacePath) => void;
   onOpenConnections: () => void;
 }) {
-  const open = useTerminalUiStore((state) => state.commandPaletteOpen);
-  const setCommandPaletteOpen = useTerminalUiStore((state) => state.setCommandPaletteOpen);
+  const open = useTerminalStore((state) => state.commandPaletteOpen);
+  const setCommandPaletteOpen = useTerminalStore((state) => state.setCommandPaletteOpen);
   const [query, setQuery] = useState('');
 
   useEffect(() => {

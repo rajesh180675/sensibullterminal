@@ -4,9 +4,8 @@ import { ConnectBrokerModal } from '../../components/ConnectBrokerModal';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
 import { useSessionStore } from '../../domains/session/sessionStore';
-import { useSelectionStore } from '../../state/selections/selectionStore';
 import { useLayoutStore } from '../../state/layout/layoutStore';
-import { useTerminalUiStore } from '../../state/terminal/terminalUiStore';
+import { useTerminalStore } from '../../state/terminal/terminalStore';
 import { CommandPalette } from './CommandPalette';
 import { BottomDock } from './BottomDock';
 import { WorkspaceHeader } from './WorkspaceHeader';
@@ -31,8 +30,8 @@ export function AppShell({
 }) {
   const { legs } = useExecutionStore();
   const { symbol, setSymbol, refreshMarket, lastUpdate, liveIndices, spotTruth, chainTruth, stream } = useMarketStore();
-  const setLinkedSymbol = useSelectionStore((state) => state.setLinkedSymbol);
-  const toggleCommandPalette = useTerminalUiStore((state) => state.toggleCommandPalette);
+  const setLinkedSymbol = useTerminalStore((state) => state.setLinkedSymbol);
+  const toggleCommandPalette = useTerminalStore((state) => state.toggleCommandPalette);
   const bottomDockOpen = useLayoutStore((state) => state.bottomDockOpen);
   const setBottomDockOpen = useLayoutStore((state) => state.setBottomDockOpen);
   const {

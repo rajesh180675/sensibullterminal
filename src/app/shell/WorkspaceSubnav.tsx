@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { PanelsTopLeft } from 'lucide-react';
-import { useWorkspaceStore } from '../../state/workspace/workspaceStore';
+import { useTerminalStore } from '../../state/terminal/terminalStore';
 import { WORKSPACE_ROUTE_BY_PATH, type WorkspacePath } from '../router';
 
 function readHash() {
@@ -10,8 +10,8 @@ function readHash() {
 export function WorkspaceSubnav({ currentPath }: { currentPath: WorkspacePath }) {
   const route = WORKSPACE_ROUTE_BY_PATH[currentPath];
   const sections = route.sections;
-  const activeSection = useWorkspaceStore((state) => state.activeSectionByPath[currentPath] ?? sections[0]?.id ?? '');
-  const setActiveSection = useWorkspaceStore((state) => state.setActiveSection);
+  const activeSection = useTerminalStore((state) => state.activeSectionByPath[currentPath] ?? sections[0]?.id ?? '');
+  const setActiveSection = useTerminalStore((state) => state.setActiveSection);
 
   useEffect(() => {
     const syncFromHash = () => {

@@ -3,13 +3,13 @@ import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom';
 import { AppProviders } from './app/AppProviders';
 import { normalizeWorkspacePath } from './app/router';
 import { AppShell } from './app/shell/AppShell';
-import { useWorkspaceStore } from './state/workspace/workspaceStore';
+import { useTerminalStore } from './state/terminal/terminalStore';
 
 function AppRoot() {
   const location = useLocation();
   const navigate = useNavigate();
   const currentPath = normalizeWorkspacePath(location.pathname);
-  const setActivePath = useWorkspaceStore((state) => state.setActivePath);
+  const setActivePath = useTerminalStore((state) => state.setActivePath);
 
   useEffect(() => {
     setActivePath(currentPath);
