@@ -15,3 +15,5 @@ This route forwards requests from Vercel to your Kaggle backend so the browser s
 - `docs/enhanced-terminal-architecture-spec.md`
 - `docs/enhanced-terminal-implementation-plan.md`
 - `docs/options-seller-terminal-spec.md`
+- `docs/institutional-terminal-master-spec.md`
+- `docs/institutional-terminal-master-plan.md`
