@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
-import { SYMBOL_CONFIG } from '../../config/market';
+import { DEFAULT_RISK_FREE_RATE, SYMBOL_CONFIG } from '../../config/market';
+import { computeGreeks } from '../../lib/math/greeks';
 import type { AdjustmentPreviewDelta, AdjustmentSnapshot, AdjustmentSuggestion, OptionLeg, Position, PositionLeg } from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { buildBackendLegPayload, buildExecutionPreview } from '../execution/executionStore';
@@ -19,7 +20,7 @@ function nextLegId(positionId: string, index: number) {
   return `adj-${positionId}-${index}`;
 }
 
-function approximateGreeks(leg: PositionLeg, spotPrice: number) {
+function approximateGreeks(leg: PositionLeg, spotPrice: number, expiry: string) {
   if ([leg.delta, leg.theta, leg.gamma, leg.vega].some((value) => value !== undefined && value !== 0)) {
     return {
       iv: 14,
@@ -32,8 +33,32 @@ function approximateGreeks(leg: PositionLeg, spotPrice: number) {
   const distanceRatio = Math.abs(spotPrice - leg.strike) / Math.max(spotPrice, 1);
   const directionalWeight = Math.max(0.12, 0.5 - distanceRatio * 3.5);
   const delta = leg.type === 'CE' ? directionalWeight : -directionalWeight;
+  const iv = 14 + Math.max(0, 6 - distanceRatio * 100);
+  const expiryDate = parseExpiryDate(expiry);
+  const daysToExpiry = expiryDate
+    ? Math.max(0, Math.ceil((expiryDate.getTime() - Date.now()) / 86400000))
+    : 0;
+  const computed = computeGreeks({
+    spot: spotPrice,
+    strike: leg.strike,
+    daysToExpiry,
+    iv,
+    right: leg.type,
+    riskFreeRate: DEFAULT_RISK_FREE_RATE,
+  });
+
+  if (computed) {
+    return {
+      iv,
+      delta: computed.delta,
+      theta: computed.theta,
+      gamma: computed.gamma,
+      vega: computed.vega,
+    };
+  }
+
   return {
-    iv: 14 + Math.max(0, 6 - distanceRatio * 100),
+    iv,
     delta,
     theta: -2.2 + distanceRatio * 3,
     gamma: 0.0015 + Math.max(0, 0.005 - distanceRatio * 0.015),
@@ -43,7 +68,7 @@ function approximateGreeks(leg: PositionLeg, spotPrice: number) {
 
 function positionToOptionLegs(position: Position, spotPrice: number): OptionLeg[] {
   return position.legs.map((leg, index) => {
-    const greeks = approximateGreeks(leg, spotPrice);
+    const greeks = approximateGreeks(leg, spotPrice, position.expiry);
     return {
       id: leg.id ?? nextLegId(position.id, index),
       symbol: position.symbol,

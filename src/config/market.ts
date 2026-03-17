@@ -67,10 +67,12 @@ export function getExpiries(sym: SymbolCode): ExpiryDate[] {
   return sym === 'NIFTY' ? NIFTY_EXPIRIES : SENSEX_EXPIRIES;
 }
 
-export const SPOT_PRICES: Record<SymbolCode, number> = {
+export const DEFAULT_SPOT_PRICES: Record<SymbolCode, number> = {
   NIFTY:  24520,
   BSESEN: 80450,
 };
+
+export const DEFAULT_RISK_FREE_RATE = 0.065;
 
 // FIX: Added dayOpen field to each index for accurate daily change calculation
 export const MARKET_INDICES: MarketIndex[] = [

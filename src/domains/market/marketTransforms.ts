@@ -1,7 +1,45 @@
-import { SYMBOL_CONFIG } from '../../config/market';
+import { DEFAULT_RISK_FREE_RATE, SYMBOL_CONFIG } from '../../config/market';
+import { computeGreeks } from '../../lib/math/greeks';
 import type { OptionQuote } from '../../utils/kaggleClient';
 import type { MarketIndex, OptionRow, Position, SymbolCode } from '../../types/index';
 import type { TickData } from '../../utils/breezeWs';
+
+function numeric(value: unknown, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function withComputedGreeks(row: OptionRow, spot: number, daysToExpiry: number): OptionRow {
+  const ceGreeks = computeGreeks({
+    spot,
+    strike: row.strike,
+    daysToExpiry,
+    iv: row.ce_iv,
+    right: 'CE',
+    riskFreeRate: DEFAULT_RISK_FREE_RATE,
+  });
+  const peGreeks = computeGreeks({
+    spot,
+    strike: row.strike,
+    daysToExpiry,
+    iv: row.pe_iv,
+    right: 'PE',
+    riskFreeRate: DEFAULT_RISK_FREE_RATE,
+  });
+
+  return {
+    ...row,
+    greekSource: ceGreeks || peGreeks ? 'black-scholes' : row.greekSource ?? 'approximate',
+    ce_delta: ceGreeks?.delta ?? row.ce_delta,
+    ce_gamma: ceGreeks?.gamma ?? row.ce_gamma,
+    ce_theta: ceGreeks?.theta ?? row.ce_theta,
+    ce_vega: ceGreeks?.vega ?? row.ce_vega,
+    pe_delta: peGreeks?.delta ?? row.pe_delta,
+    pe_gamma: peGreeks?.gamma ?? row.pe_gamma,
+    pe_theta: peGreeks?.theta ?? row.pe_theta,
+    pe_vega: peGreeks?.vega ?? row.pe_vega,
+  };
+}
 
 export function mergeQuotesToChain(
   calls: OptionQuote[],
@@ -30,55 +68,40 @@ export function mergeQuotesToChain(
     Math.abs(strike - spot) < Math.abs(best - spot) ? strike : best
   );
 
-  const dte = Math.max(1, daysToExpiry);
-  const timeToExpiry = dte / 365;
-
   return strikes.map((strike) => {
     const ce = ceMap.get(strike);
     const pe = peMap.get(strike);
-    const value = (input: string | undefined, fallback = 0) => {
-      const parsed = parseFloat(input ?? '');
-      return Number.isNaN(parsed) ? fallback : parsed;
-    };
-
-    const ceLtp = value(ce?.ltp);
-    const peLtp = value(pe?.ltp);
-    const moneyness = (spot - strike) / spot;
-    const ceDelta = Math.max(0.01, Math.min(0.99, 0.5 + moneyness * 2.5));
-    const peDelta = -(1 - ceDelta);
-    const gamma = 0.00028 * Math.exp(-Math.pow(moneyness * 10, 2) / 2);
-    const ceTheta = -((ceLtp || 1) * 0.016 + 1.2);
-    const peTheta = -((peLtp || 1) * 0.016 + 1.2);
-    const vega = 18 * gamma * spot * 0.01 * Math.sqrt(timeToExpiry > 0 ? timeToExpiry : 0.019);
-
-    return {
+    const baseRow: OptionRow = {
       strike,
       isATM: Math.abs(strike - atmStrike) < step / 2,
-      ce_ltp: ceLtp,
-      ce_oi: value(ce?.['open-interest']),
-      ce_oiChg: value(ce?.['oi-change-percentage']),
-      ce_volume: value(ce?.['total-quantity-traded']),
-      ce_iv: value(ce?.['implied-volatility']),
-      ce_delta: ceDelta,
-      ce_theta: ceTheta,
-      ce_gamma: gamma,
-      ce_vega: vega,
-      ce_bid: Math.max(0.05, value(ce?.['best-bid-price'])),
-      ce_ask: value(ce?.['best-offer-price']),
+      greekSource: 'approximate',
+      ce_ltp: numeric(ce?.ltp),
+      ce_oi: numeric(ce?.['open-interest']),
+      ce_oiChg: numeric(ce?.['oi-change-percentage']),
+      ce_volume: numeric(ce?.['total-quantity-traded']),
+      ce_iv: numeric(ce?.['implied-volatility']),
+      ce_delta: 0,
+      ce_theta: 0,
+      ce_gamma: 0,
+      ce_vega: 0,
+      ce_bid: Math.max(0.05, numeric(ce?.['best-bid-price'])),
+      ce_ask: numeric(ce?.['best-offer-price']),
       ce_ltpChg: 0,
-      pe_ltp: peLtp,
-      pe_oi: value(pe?.['open-interest']),
-      pe_oiChg: value(pe?.['oi-change-percentage']),
-      pe_volume: value(pe?.['total-quantity-traded']),
-      pe_iv: value(pe?.['implied-volatility']),
-      pe_delta: peDelta,
-      pe_theta: peTheta,
-      pe_gamma: gamma,
-      pe_vega: vega,
-      pe_bid: Math.max(0.05, value(pe?.['best-bid-price'])),
-      pe_ask: value(pe?.['best-offer-price']),
+      pe_ltp: numeric(pe?.ltp),
+      pe_oi: numeric(pe?.['open-interest']),
+      pe_oiChg: numeric(pe?.['oi-change-percentage']),
+      pe_volume: numeric(pe?.['total-quantity-traded']),
+      pe_iv: numeric(pe?.['implied-volatility']),
+      pe_delta: 0,
+      pe_theta: 0,
+      pe_gamma: 0,
+      pe_vega: 0,
+      pe_bid: Math.max(0.05, numeric(pe?.['best-bid-price'])),
+      pe_ask: numeric(pe?.['best-offer-price']),
       pe_ltpChg: 0,
     };
+
+    return withComputedGreeks(baseRow, spot, daysToExpiry);
   });
 }
 
@@ -100,7 +123,12 @@ export function deriveSpotFromMedian(chain: OptionRow[]): number | null {
   return Math.round(median);
 }
 
-export function applyTicksToChain(chain: OptionRow[], ticks: TickData[]): OptionRow[] {
+export function applyTicksToChain(
+  chain: OptionRow[],
+  ticks: TickData[],
+  spot: number,
+  daysToExpiry: number,
+): OptionRow[] {
   if (ticks.length === 0) return chain;
 
   const ceUpdates = new Map<number, Partial<OptionRow>>();
@@ -136,13 +164,15 @@ export function applyTicksToChain(chain: OptionRow[], ticks: TickData[]): Option
     const peUpdate = peUpdates.get(row.strike);
     if (!ceUpdate && !peUpdate) return row;
     changed = true;
-    return {
+    const updatedRow: OptionRow = {
       ...row,
       ...ceUpdate,
       ...peUpdate,
+      greekSource: row.greekSource ?? 'approximate',
       ce_ltpChg: ceUpdate?.ce_ltp != null ? ceUpdate.ce_ltp - row.ce_ltp : 0,
       pe_ltpChg: peUpdate?.pe_ltp != null ? peUpdate.pe_ltp - row.pe_ltp : 0,
     };
+    return withComputedGreeks(updatedRow, spot, daysToExpiry);
   });
 
   return changed ? next : chain;
@@ -153,10 +183,6 @@ export function mapBreezePositions(data: unknown): Position[] {
   if (!payload?.positions) return [];
 
   const grouped = new Map<string, Position>();
-  const numeric = (value: unknown, fallback = 0) => {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  };
   const readFirst = (row: Record<string, unknown>, keys: string[], fallback = 0) => {
     const match = keys.find((key) => row[key] !== undefined && row[key] !== null && row[key] !== '');
     return numeric(match ? row[match] : undefined, fallback);

@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { MARKET_INDICES, SPOT_PRICES, SYMBOL_CONFIG, getExpiries } from '../../config/market';
+import { DEFAULT_SPOT_PRICES, MARKET_INDICES, SYMBOL_CONFIG, getExpiries } from '../../config/market';
 import { generateChain, simulateTick } from '../../data/mock';
 import { truthDescriptor, type TruthDescriptor } from '../../lib/truth';
 import type {
@@ -14,6 +14,7 @@ import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { terminalEventBus } from '../../services/streaming/eventBus';
 import { UnifiedStreamingManager } from '../../services/streaming/unifiedStreamingManager';
 import { useNotificationStore } from '../../stores/notificationStore';
+import { useSpotPriceStore } from '../../state/market/spotPriceStore';
 import type { BackendMarketDepth, HistoricalCandle } from '../../utils/kaggleClient';
 import type { TickUpdate } from '../../utils/breezeWs';
 import { useSessionStore } from '../session/sessionStore';
@@ -130,7 +131,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
   const [expiry, setExpiryState] = useState<ExpiryDate>(getExpiries(DEFAULT_SYMBOL)[0]);
   const [availableExpiries, setAvailableExpiries] = useState<ExpiryDate[]>(getExpiries(DEFAULT_SYMBOL));
   const [chain, setChain] = useState<OptionRow[]>(() => generateChain(DEFAULT_SYMBOL));
-  const [spotPrice, setSpotPrice] = useState<number>(SPOT_PRICES[DEFAULT_SYMBOL]);
+  const [spotPrice, setSpotPrice] = useState<number>(useSpotPriceStore.getState().getSpot(DEFAULT_SYMBOL));
   const [lastUpdate, setLastUpdate] = useState(new Date());
   const [spotTruth, setSpotTruth] = useState<TruthDescriptor>(() => truthDescriptor('analytical', 'mock_spot_seed'));
   const [chainTruth, setChainTruth] = useState<TruthDescriptor>(() => truthDescriptor('analytical', 'mock_chain_seed'));
@@ -145,26 +146,24 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
 
   const currentChain = useRef<OptionRow[]>(chain);
   const currentSymbol = useRef<SymbolCode>(symbol);
-  const currentSpot = useRef<number>(spotPrice);
   const currentInterval = useRef<string>(chartInterval);
-  const dayOpenBySymbol = useRef<Partial<Record<SymbolCode, number>>>({});
   const demoTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const skipNextExpiryReload = useRef<string | null>(null);
   const lastDepthRefresh = useRef<number>(0);
 
   useEffect(() => { currentChain.current = chain; }, [chain]);
   useEffect(() => { currentSymbol.current = symbol; }, [symbol]);
-  useEffect(() => { currentSpot.current = spotPrice; }, [spotPrice]);
   useEffect(() => { currentInterval.current = chartInterval; }, [chartInterval]);
 
   const updateSpot = useCallback((nextSpot: number, nextSymbol = currentSymbol.current, nextTruth?: TruthDescriptor) => {
-    SPOT_PRICES[nextSymbol] = nextSpot;
-    currentSpot.current = nextSpot;
+    const accepted = useSpotPriceStore.getState().setSpot(nextSymbol, nextSpot);
+    if (!accepted) return;
     setSpotPrice(nextSpot);
     if (nextTruth) {
       setSpotTruth(nextTruth);
     }
-    setLiveIndices((current) => updateIndicesWithSpot(current, nextSymbol, nextSpot, dayOpenBySymbol.current[nextSymbol]));
+    const dayOpen = useSpotPriceStore.getState().dayOpens[nextSymbol];
+    setLiveIndices((current) => updateIndicesWithSpot(current, nextSymbol, nextSpot, dayOpen));
   }, []);
 
   const refreshHistorical = useCallback(async () => {
@@ -213,7 +212,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     const activeSymbol = options?.symbolOverride ?? currentSymbol.current;
     const activeExpiry = options?.expiryOverride ?? expiry;
     const activeChain = options?.chainOverride ?? currentChain.current;
-    const activeSpot = options?.spotOverride ?? currentSpot.current;
+    const activeSpot = options?.spotOverride ?? useSpotPriceStore.getState().getSpot(activeSymbol);
 
     if (!activeSession?.isConnected || !brokerGatewayClient.session.isBackend(activeSession.proxyBase)) {
       setMarketDepth(emptyDepth());
@@ -247,12 +246,13 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
   }, [expiry.breezeValue, expiry.label, session]);
 
   const fetchAndSetSpot = useCallback(async (nextSymbol: SymbolCode, nextSession: NonNullable<typeof session>) => {
-    const fallback = SPOT_PRICES[nextSymbol];
+    const fallback = useSpotPriceStore.getState().getSpot(nextSymbol);
     try {
       const result = await brokerGatewayClient.market.fetchSpot(nextSymbol, nextSession);
       if (result.ok && result.spot && result.spot > 1000) {
-        if (!dayOpenBySymbol.current[nextSymbol]) {
-          dayOpenBySymbol.current[nextSymbol] = result.spot;
+        const spotStore = useSpotPriceStore.getState();
+        if (!spotStore.dayOpens[nextSymbol]) {
+          spotStore.setDayOpen(nextSymbol, result.spot);
         }
         updateSpot(result.spot, nextSymbol, truthDescriptor('broker', 'breeze_rest_spot'));
         return result.spot;
@@ -292,7 +292,13 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const handleTickUpdate = useCallback((update: TickUpdate) => {
-    const updatedChain = applyTicksToChain(currentChain.current, update.ticks);
+    const activeSpot = useSpotPriceStore.getState().getSpot(currentSymbol.current);
+    const updatedChain = applyTicksToChain(
+      currentChain.current,
+      update.ticks,
+      activeSpot,
+      expiry.daysToExpiry,
+    );
     setChain(updatedChain);
     currentChain.current = updatedChain;
     setLastUpdate(new Date());
@@ -301,15 +307,17 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     const nextSymbol = currentSymbol.current;
     const broadcastSpot = update.spot_prices?.[nextSymbol] ?? update.spot_prices?.NIFTY;
     if (broadcastSpot && broadcastSpot > 1000) {
-      const diff = Math.abs(broadcastSpot - currentSpot.current);
-      if (diff < currentSpot.current * 0.15) {
+      const currentSpot = useSpotPriceStore.getState().getSpot(nextSymbol);
+      const diff = Math.abs(broadcastSpot - currentSpot);
+      if (diff < currentSpot * 0.15) {
         if (diff > 0.5) updateSpot(broadcastSpot, nextSymbol, truthDescriptor('broker', 'breeze_ws_spot', update.ts));
       }
     } else {
       const derivedSpot = deriveSpotFromMedian(updatedChain);
       if (derivedSpot && derivedSpot > 1000) {
-        const diff = Math.abs(derivedSpot - currentSpot.current);
-        if (diff > 1 && diff < currentSpot.current * 0.15) {
+        const currentSpot = useSpotPriceStore.getState().getSpot(nextSymbol);
+        const diff = Math.abs(derivedSpot - currentSpot);
+        if (diff > 1 && diff < currentSpot * 0.15) {
           updateSpot(derivedSpot, nextSymbol, truthDescriptor('normalized', 'put_call_parity', update.ts));
         }
       }
@@ -319,7 +327,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     if (streamedCandles && streamedCandles.length > 0) {
       setHistorical((current) => mergeHistorical(current, streamedCandles));
     }
-  }, [updateSpot]);
+  }, [expiry.daysToExpiry, updateSpot]);
 
   const fetchLiveChain = useCallback(async (
     nextSymbol: SymbolCode,
@@ -398,7 +406,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       const staticExpiries = getExpiries(nextSymbol);
       setAvailableExpiries(staticExpiries);
       setExpiryState(staticExpiries[0]);
-      updateSpot(SPOT_PRICES[nextSymbol], nextSymbol, truthDescriptor('analytical', 'static_spot_seed'));
+      updateSpot(DEFAULT_SPOT_PRICES[nextSymbol], nextSymbol, truthDescriptor('analytical', 'static_spot_seed'));
       setChain(generateChain(nextSymbol));
       setChainTruth(truthDescriptor('analytical', 'mock_chain_seed'));
       setHistorical([]);
@@ -447,7 +455,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     const expiries = getExpiries(nextSymbol);
     setAvailableExpiries(expiries);
     setExpiryState(expiries[0]);
-    updateSpot(SPOT_PRICES[nextSymbol], nextSymbol, truthDescriptor('analytical', 'mock_spot_seed'));
+    updateSpot(DEFAULT_SPOT_PRICES[nextSymbol], nextSymbol, truthDescriptor('analytical', 'mock_spot_seed'));
     setChain(generateChain(nextSymbol));
     setChainTruth(truthDescriptor('analytical', 'mock_chain_seed'));
     setHistorical([]);
@@ -535,7 +543,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       skipNextExpiryReload.current = null;
       return;
     }
-    void fetchLiveChain(symbol, expiry, session, currentSpot.current);
+    void fetchLiveChain(symbol, expiry, session, useSpotPriceStore.getState().getSpot(symbol));
   }, [expiry.breezeValue, fetchLiveChain, session, symbol, expiry]);
 
   const value = useMemo(() => ({
