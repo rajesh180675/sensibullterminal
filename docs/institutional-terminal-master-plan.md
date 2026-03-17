@@ -1,601 +1,873 @@
 # Sensibull Terminal: Institutional Master Implementation Plan
 
-## 1. Purpose
+## 1. Plan Status
 
-This plan translates `docs/institutional-terminal-master-spec.md` into an execution roadmap that is realistic for the existing codebase.
+This document is the execution plan for `docs/institutional-terminal-master-spec.md`.
 
-This is not a greenfield roadmap. It assumes the current app, current backend, current seller intelligence, and current Breeze integration remain the starting point.
+It replaces the earlier high-level roadmap and is grounded in the repository state on March 17, 2026.
 
----
+Current baseline confirmed in code:
 
-## 2. Program Goals
+- frontend entrypoint is `src/App.tsx`
+- routing is a custom history hook in `src/app/useWorkspaceRoute.ts`
+- shell composition lives in `src/app/shell/AppShell.tsx`
+- domain orchestration is still the nested provider stack in `src/app/AppProviders.tsx`
+- market, execution, portfolio, risk, automation, journal, and session logic live under `src/domains/*`
+- broker access is funneled through `src/services/broker/brokerGatewayClient.ts`
+- live transport is handled by `src/services/streaming/unifiedStreamingManager.ts`
+- the backend is still primarily the 3308-line `kaggle_backend.py`
 
-The program should deliver:
-
-- a professional seller terminal shell
-- explicit backend-authoritative trading domains
-- a consistent OMS, risk, automation, and review lifecycle
-- Bloomberg-class workspace density and interaction patterns
-- a system that can scale without turning every new feature into another provider coupling layer
-
----
-
-## 3. Guiding Delivery Principles
-
-- Preserve product logic that already works.
-- Replace ambiguity with explicit authority boundaries.
-- Build infrastructure that improves every workspace, not one-off screens.
-- Treat execution safety and operational diagnostics as first-class deliverables.
-- Do not hide fallback behavior. Label it.
-- Prefer module extraction over cosmetic rewrites.
+The goal is not a rewrite for style. The goal is to move this repo from a strong seller-focused prototype into a terminal platform with explicit authority boundaries, reusable workstation infrastructure, and maintainable service modules.
 
 ---
 
-## 4. Current Starting Constraints
+## 2. Implementation Decisions Locked Now
 
-What already exists:
+These decisions should be treated as plan-of-record unless an implementation spike proves a blocker.
 
-- route shell
-- strong `OptionChain`
-- seller intelligence
-- execution preview and margin
-- backend automation and review persistence
-- repair preview endpoint
-- journal linkage
+### 2.1 Client Routing
 
-What constrains the next phase:
+Adopt `react-router-dom` and retire `src/app/useWorkspaceRoute.ts` after migration.
 
-- nested provider graph
-- custom minimal router
-- one large backend file
-- mixed broker truth and analytical inference
-- non-uniform workspace UI patterns
-- legacy artifacts still present
+Reason:
+
+- the current custom router is too limited for deep links, nested workspace state, loaders, and persisted URL state
+- the spec explicitly requires richer route semantics and a true workspace model
+
+### 2.2 Server State and Mutations
+
+Adopt `@tanstack/react-query` for backend reads, writes, invalidation, loading states, and mutation recovery.
+
+Reason:
+
+- current providers mix server state, UI state, and cross-domain derivation
+- the spec requires clear separation between authoritative backend state and terminal-local state
+
+### 2.3 Terminal UI State
+
+Create `src/state/*` stores backed by `zustand` for terminal-local state:
+
+- workspace selection
+- panel visibility
+- symbol linking
+- staged selections
+- layout persistence metadata
+- command palette state
+- per-workspace filters and sort state
+
+Reason:
+
+- this is the cleanest path out of the current provider dependency chain
+- the repo already wants domain intent without React tree orchestration as the primary runtime model
+
+### 2.4 Stream Fan-Out
+
+Introduce a typed event bus in `src/services/streaming/eventBus.ts` and route all live updates through it.
+
+Reason:
+
+- the spec requires stream-driven behavior without broad provider invalidation
+- current `UnifiedStreamingManager` only handles transport fallback, not terminal-wide event distribution
+
+### 2.5 Layout Engine
+
+Adopt a proven docking layout library for the shell rather than building a custom dock manager first.
+
+Plan-of-record choice:
+
+- spike `flexlayout-react` first for dockable panels, tabs, splits, and layout serialization
+- if the spike fails on React 19 or keyboard control requirements within one implementation day, fall back to a thin internal split-pane shell and defer full docking to a later phase
+
+Reason:
+
+- the spec requires dockable panels, saved layouts, split panes, stackable tabs, and bottom dock behavior
+- that is too much infrastructure to reinvent before the product surfaces are upgraded
+
+### 2.6 Backend Packaging
+
+Keep one FastAPI process initially, but split code into a real package under `backend/app/` and reduce `kaggle_backend.py` to a bootstrap entrypoint.
+
+Reason:
+
+- this preserves deployment simplicity
+- it resolves the current maintainability problem without forcing premature service decomposition
+
+### 2.7 Truth Model
+
+Every live surface and every API response must explicitly identify:
+
+- `authority`: `broker` | `normalized` | `analytical`
+- `source`: transport or computation origin
+- `as_of`: freshness timestamp
+
+Reason:
+
+- the spec makes this a core invariant
+- the current code mixes broker-confirmed and inferred data too freely
+
+### 2.8 Persistence
+
+Introduce a storage layer now and move automation, review, playbook, and layout persistence behind repository interfaces.
+
+Initial backing store:
+
+- SQLite via the Python standard library `sqlite3`
+
+Reason:
+
+- the repo already persists automation and review state
+- file-backed state is no longer enough for auditability, layout persistence, and multi-session continuity
+- `sqlite3` keeps the migration realistic without adding unnecessary backend complexity in the first pass
+
+### 2.9 Grouped Strategy Identity
+
+Promote grouped strategy identity to a backend-owned model.
+
+Canonical entity:
+
+- `GroupedPosition`
+
+Reason:
+
+- portfolio, risk, adjustment, review, and attribution all depend on coherent strategy grouping
+- the spec explicitly calls out frontend grouping heuristics as insufficient for the next stage
 
 ---
 
-## 5. Delivery Workstreams
+## 3. Current Repo Starting Point
 
-### Workstream A: Terminal Shell and Layout System
+### 3.1 Frontend
+
+The current app already proves several important assets:
+
+- `src/app/shell/AppShell.tsx` gives a real route shell instead of a giant `App.tsx`
+- `src/app/router.ts` already contains workspace metadata
+- `src/components/OptionChain/*` is the strongest production-grade component family in the repo
+- `src/domains/execution/executionStore.tsx` already merges local preview with backend preview and margin
+- `src/domains/market/marketStore.tsx` already combines chain, depth, historical data, watchlists, and streaming
+- `src/services/broker/brokerGatewayClient.ts` already centralizes most backend and broker access
+
+The main constraints are equally clear:
+
+- `src/app/AppProviders.tsx` is still the orchestration spine
+- `src/app/useWorkspaceRoute.ts` is too thin for terminal-grade routing
+- workspaces are still page-like compositions, not a docked workstation
+- non-chain surfaces are less systematized than the option chain
+- live state is still coupled to React context boundaries
+
+### 3.2 Backend
+
+`kaggle_backend.py` already proves the product has real operating depth:
+
+- connection lifecycle
+- option chain snapshot
+- spot quotes
+- historical candles
+- market depth
+- websocket tick transport
+- preview, margin, and repair preview
+- order placement, cancel, modify, and basket execution
+- positions, funds, orders, and trades
+- automation rules, callbacks, and evaluation
+- review state persistence
+
+The backend constraint is code shape, not feature absence:
+
+- one file owns session, market, OMS, automation, review, transport, auth, and diagnostics
+- route families reflect implementation convenience rather than business domains
+- storage is not yet formalized
+
+### 3.3 Legacy and Transitional Artifacts
+
+These files should be explicitly classified during Phase 0:
+
+- `src/components/OptionChain.old`
+- `src/app/shell/BottomDock.tsx`
+- `src/app/shell/RightDrawer.tsx`
+- `src/components/TopBar.tsx`
+- `src/components/Positions.tsx`
+- browser-direct broker paths in `src/utils/breezeClient.ts`
+
+The plan is not to delete everything immediately. The plan is to declare what remains strategic, what becomes compatibility-only, and what is retired.
+
+---
+
+## 4. Target Code Map
+
+### 4.1 Frontend Target Shape
+
+```text
+src/
+  app/
+    router/
+    shell/
+    layouts/
+    command/
+  ui/
+    panels/
+    grids/
+    ribbons/
+    inspectors/
+    docks/
+    forms/
+  domains/
+    session/
+    market/
+    strategy/
+    execution/
+    portfolio/
+    risk/
+    seller/
+    automation/
+    review/
+  services/
+    api/
+    broker/
+    streaming/
+    analytics/
+    persistence/
+  state/
+    terminal/
+    layout/
+    selections/
+    preferences/
+    workspace/
+  lib/
+    formatting/
+    math/
+    time/
+    ids/
+```
+
+### 4.2 Backend Target Shape
+
+```text
+backend/
+  app/
+    api/
+      routes/
+        session.py
+        market.py
+        stream.py
+        execution.py
+        orders.py
+        portfolio.py
+        risk.py
+        automation.py
+        reviews.py
+        diagnostics.py
+    core/
+      settings.py
+      auth.py
+      logging.py
+      rate_limit.py
+    clients/
+      breeze/
+        session.py
+        market.py
+        execution.py
+        portfolio.py
+        streaming.py
+    services/
+      market/
+      execution/
+      portfolio/
+      risk/
+      automation/
+      reviews/
+      diagnostics/
+      streaming/
+    models/
+    storage/
+```
+
+`kaggle_backend.py` should remain as the externally invoked entrypoint until the deployment scripts are updated, but its job should become:
+
+- load settings
+- create the FastAPI app
+- start the server
+
+---
+
+## 5. Migration Rules
+
+These rules govern implementation across all phases.
+
+1. No big-bang rewrite.
+2. Old routes stay alive behind compatibility adapters until frontend consumers are migrated.
+3. New data models must carry authority and freshness metadata from day one.
+4. All broker mutations must emit audit events.
+5. Layout work must improve at least two workspaces before being considered stable.
+6. Browser-direct mode remains supported only as an explicit diagnostic mode, never as the hidden primary architecture.
+7. Large surface migrations should land as vertical slices, not half-finished skeleton screens.
+
+---
+
+## 6. Delivery Workstreams
+
+### Workstream A: Platform Spine
 
 Owns:
 
-- routing upgrade
-- saved layouts
-- docking/window model
-- submenu and command model
-- reusable workstation components
+- routing
+- query and mutation infrastructure
+- terminal state
+- stream event bus
+- authority metadata
 
-### Workstream B: Data and State Spine
-
-Owns:
-
-- query/mutation architecture
-- event bus
-- stream normalization
-- source/freshness metadata
-- UI state segregation
-
-### Workstream C: Backend Refactor and Contracts
+### Workstream B: Shell and Layout
 
 Owns:
 
-- `kaggle_backend.py` modularization
-- route contract cleanup
-- broker client packaging
-- diagnostics and observability
+- top ribbon
+- left launcher
+- workspace header and submenu
+- docked main grid
+- bottom blotter dock
+- keyboard model
 
-### Workstream D: Market and Chain Desk
-
-Owns:
-
-- market workspace
-- dedicated chain workspace
-- watchlists
-- breadth
-- strike intelligence
-
-### Workstream E: Strategy and Seller Intelligence
+### Workstream C: Market and Strategy Desks
 
 Owns:
 
-- opportunity feed evolution
-- playbooks
-- scenario lab
-- comparison tools
+- launchpad
+- market desk
+- chain desk
+- strategy lab
+- seller intelligence presentation
 
-### Workstream F: Execution and OMS
-
-Owns:
-
-- ticket model
-- broker preview surfaces
-- blotter
-- order lifecycle controls
-- repair staging
-
-### Workstream G: Portfolio and Risk
+### Workstream D: OMS, Portfolio, and Risk
 
 Owns:
 
+- execution desk
 - grouped positions
-- position lifecycle
 - risk cockpit
-- scenario engine
 - adjustment desk
+- scenario surfaces
 
-### Workstream H: Automation and Review
+### Workstream E: Automation, Review, and Ops
 
 Owns:
 
 - automation center
 - callback audit
-- journal lifecycle
-- review analytics
-- playbook review
+- journal and review
+- operations workspace
+- health and diagnostics surfaces
+
+### Workstream F: Backend Modularization
+
+Owns:
+
+- route family cleanup
+- Breeze client extraction
+- persistence layer
+- diagnostics and audit plumbing
 
 ---
 
-## 6. Phase Plan
+## 7. Phase Plan
 
-## Phase 0: Architecture Freeze and Cleanup
+### Phase 0: Freeze the Architecture and Prepare the Repo
 
 ### Objective
 
-Stabilize the architectural baseline before deeper UI and service changes.
+Turn the spec into an implementation baseline and remove ambiguity before feature migration starts.
 
-### Deliverables
+### Concrete Tasks
 
-- adopt the master spec and plan as the repo source of truth
-- classify canonical vs legacy files
-- define target module map
+- adopt this plan as the canonical implementation roadmap
+- add the missing client dependencies:
+  - `react-router-dom`
+  - `@tanstack/react-query`
+  - `zustand`
+  - chosen docking library after the one-day spike
+- create empty scaffolding for:
+  - `src/state/*`
+  - `src/services/api/*`
+  - `backend/app/*`
+- classify files as:
+  - canonical
+  - compatibility
+  - retirement candidate
+- define shared frontend and backend metadata for:
+  - authority
+  - source
+  - freshness
+  - audit event
+- document the exact legacy retirement sequence
 
-### Tasks
+### Repo Areas Touched
 
-- mark canonical frontend paths:
-  - `src/app/*`
-  - `src/domains/*`
-  - `src/services/*`
-  - `src/components/OptionChain/*`
-- mark retirement candidates:
-  - `src/components/OptionChain.old`
-  - unused shell artifacts if superseded
-  - any remaining browser-direct-only pathways not meant for production
-- write ADRs for:
-  - state architecture
-  - routing approach
-  - layout engine approach
-  - backend modularization approach
+- `package.json`
+- `src/app/*`
+- `src/state/*`
+- `src/services/api/*`
+- `backend/app/*`
+- `kaggle_backend.py`
 
 ### Exit Criteria
 
-- clear canonical architecture map
-- no ambiguity about which code paths are strategic
+- dependency direction is agreed
+- directory skeleton exists
+- no ambiguity remains about strategic versus legacy paths
 
 ---
 
-## Phase 1: State Spine Refactor
+### Phase 1: Build the Client Platform Spine
 
 ### Objective
 
-Separate server state, stream state, and UI state.
+Separate server state, terminal state, and live event propagation.
 
-### Deliverables
+### Concrete Tasks
 
-- dedicated terminal state layer
-- query/mutation contract layer
-- event bus for live updates
+- introduce a shared API client layer in `src/services/api/`
+- move backend reads and writes out of provider internals and into query/mutation hooks
+- create terminal-local stores for:
+  - active workspace
+  - symbol links
+  - panel state
+  - staged selections
+  - command palette state
+  - layout metadata
+- create a typed event bus and route tick, order, callback, and notification events through it
+- refactor `src/services/streaming/unifiedStreamingManager.ts` so transport is distinct from event distribution
+- standardize data wrappers so market, execution, portfolio, risk, automation, and review can all display freshness and authority
 
-### Tasks
+### Initial Migrations
 
-- introduce a `state/` layer for:
-  - layout state
-  - selections
-  - panel visibility
-  - workspace preferences
-- move backend fetch/mutation responsibility behind a formal API service layer
-- create stream fan-out service so live ticks are not coupled to provider rerender shape
-- label all domain data with:
-  - source
-  - freshness timestamp
-  - authority tier
-
-### Current File Impacts
-
-- `src/app/AppProviders.tsx`
-- `src/domains/*`
+- `src/domains/session/sessionStore.tsx`
+- `src/domains/market/marketStore.tsx`
+- `src/domains/execution/executionStore.tsx`
 - `src/services/broker/brokerGatewayClient.ts`
 - `src/services/streaming/unifiedStreamingManager.ts`
 
 ### Exit Criteria
 
-- provider graph no longer acts as the primary orchestration engine
-- stream updates do not require broad provider invalidation
+- providers no longer serve as the primary orchestration mechanism
+- live updates do not require broad React context invalidation
+- new code can consume query data and terminal-local state independently
 
 ---
 
-## Phase 2: Router and Layout Engine
+### Phase 2: Replace Page Shell with Terminal Shell
 
 ### Objective
 
-Replace the static page shell with a terminal-grade layout system.
+Move from route-switched pages to a real workstation shell.
 
-### Deliverables
+### Concrete Tasks
 
-- richer routing
-- saved layouts
-- dockable/resizable window model
-- persistent bottom dock
-
-### Tasks
-
-- upgrade routing model to support:
-  - nested workspace routes
-  - URL-persisted state
-  - deep links to symbols, strategies, positions, and rules
-- implement layout engine with:
-  - split panes
-  - tabbed panel stacks
-  - saved workspace layouts
-  - per-layout symbol links
-- formalize the shell:
-  - top ribbon
+- replace `src/app/useWorkspaceRoute.ts` with React Router
+- expand route families to include:
+  - Launchpad
+  - Market
+  - Chain
+  - Strategy
+  - Execution
+  - Portfolio
+  - Risk
+  - Automation
+  - Review
+  - Ops
+- evolve `src/app/router.ts` into a real router module with nested sections and deep-linkable state
+- rebuild `src/app/shell/AppShell.tsx` around:
+  - global top ribbon
   - left launcher
   - workspace header
-  - bottom blotter dock
-  - right inspector rail where appropriate
+  - dockable main grid
+  - persistent bottom dock
+- restore `BottomDock` as a formalized blotter, alerts, callbacks, diagnostics, and notes dock
+- wire keyboard commands for:
+  - command palette
+  - workspace navigation
+  - symbol search
+  - staged execution
+  - inspector toggles
 
-### Current File Impacts
+### Repo Areas Touched
 
+- `src/App.tsx`
 - `src/app/router.ts`
-- `src/app/useWorkspaceRoute.ts`
 - `src/app/shell/*`
+- `src/app/workspaces/*`
+- new `src/app/layouts/*`
+- new `src/state/layout/*`
 
 ### Exit Criteria
 
-- users can save and restore workspace layouts
-- the app feels like a terminal shell, not a page switcher
+- layouts are saved and restorable
+- routing supports deep links into symbols and desks
+- the shell feels like one terminal, not a set of separate pages
 
 ---
 
-## Phase 3: Workstation Design System
+### Phase 3: Modularize the Backend Without Breaking Behavior
 
 ### Objective
 
-Create reusable terminal-grade UI primitives.
+Restructure the backend into domain modules while preserving existing capability.
 
-### Deliverables
+### Concrete Tasks
 
-- panel system
-- dense table/grid system
-- inspector system
-- metric strip system
-- terminal action bars
+- create `backend/app/create_app.py` and move app construction there
+- extract route modules by business domain
+- extract Breeze access into `backend/app/clients/breeze/*`
+- move rate limiter, auth checks, logging, tick store, candle store, automation manager, and review manager into `backend/app/core` and `backend/app/services`
+- create repository interfaces for:
+  - automation rules
+  - automation events
+  - review state
+  - playbooks
+  - workspace layouts
+- keep old endpoints operational through thin adapters while new route families are introduced
 
-### Tasks
+### Initial Route Families
 
-- define reusable components for:
-  - terminal panel
-  - section header
-  - metric ribbon
-  - data ladder
-  - blotter grid
-  - drilldown inspector
-  - dock tabs
-- convert existing workspace bespoke blocks into reusable patterns
+- `/api/session/*`
+- `/api/market/*`
+- `/api/stream/*`
+- `/api/execution/*`
+- `/api/orders/*`
+- `/api/portfolio/*`
+- `/api/risk/*`
+- `/api/automation/*`
+- `/api/reviews/*`
+- `/api/diagnostics/*`
 
 ### Exit Criteria
 
-- workspaces no longer need large custom JSX blocks for every surface
-- visual density and interaction patterns become consistent
+- `kaggle_backend.py` is no longer the place where product logic lives
+- service boundaries exist even though deployment is still single-process
+- old routes still work during migration
 
 ---
 
-## Phase 4: Market and Chain Desk Rebuild
+### Phase 4: Market, Chain, and Launchpad Desks
 
 ### Objective
 
-Promote market and chain into dedicated professional desks.
+Turn the current market workspace into a family of real desks instead of one dense page.
 
-### Deliverables
+### Concrete Tasks
 
-- Market workspace v2
-- new Chain workspace
-- watchlist groups
-- breadth and strike intelligence surfaces
+- split current `MarketWorkspace` into:
+  - Launchpad workspace
+  - Market workspace
+  - Chain workspace
+- preserve and elevate `src/components/OptionChain/*` as the center of the Chain desk
+- add linked symbols, watchlist groups, breadth strip, strike intelligence, skew panels, and event markers on candles
+- move market-derived calculations that need authority or replay into backend services where appropriate
+- create reusable workstation primitives for:
+  - panel shells
+  - metric ribbons
+  - data strips
+  - inspectors
+  - dense grids
 
-### Tasks
-
-- split market awareness from pure chain analysis
-- reuse and extend `OptionChain`
-- add:
-  - linked watchlists
-  - breadth strip
-  - skew strip
-  - OI wall inspector
-  - strike intelligence panel
-  - dedicated quote/depth/candle synchronization
-
-### Current File Impacts
+### Repo Areas Touched
 
 - `src/app/workspaces/MarketWorkspace.tsx`
+- new `src/app/workspaces/LaunchpadWorkspace.tsx`
 - new `src/app/workspaces/ChainWorkspace.tsx`
 - `src/components/OptionChain/*`
 - `src/domains/market/*`
+- `backend/app/services/market/*`
 
 ### Exit Criteria
 
-- option chain, depth, and strike intelligence operate as a dedicated desk
-- Market and Chain have distinct, coherent roles
+- Launchpad answers the morning trader workflow
+- Market handles live situational awareness
+- Chain is a dedicated chain intelligence desk
 
 ---
 
-## Phase 5: Strategy Lab and Seller Intelligence V2
+### Phase 5: Strategy Lab and Execution Desk
 
 ### Objective
 
-Turn seller intelligence into a true decision engine.
+Make the seller idea lifecycle explicit from detection through sending.
 
-### Deliverables
+### Concrete Tasks
 
-- compare mode
-- opportunity ranking modes
-- playbook-aware scenario lab
-- structured idea lifecycle
+- rebuild Strategy into a compare-and-stage lab with:
+  - opportunity leaderboard
+  - compare basket
+  - scenario view
+  - playbook linkage
+  - strategy explanation block
+- refactor execution state from implicit UI behavior into an explicit state machine:
+  - staged
+  - previewing
+  - ready
+  - sending
+  - partial
+  - sent
+  - failed
+- move preview, margin, repair preview, and basket routing behind explicit execution services
+- add rejection drilldown, cancel/replace behavior, slippage guardrails, and leg-level status
+- make all execution surfaces declare whether a metric is broker-confirmed or analytical
 
-### Tasks
+### Repo Areas Touched
 
-- expand opportunity families
-- add compare basket
-- add scenario simulation
-- enrich scoring with:
-  - premium richness
-  - expected move
-  - liquidity
-  - skew
-  - event-aware penalties
-- move parts of seller analytics to backend where appropriate
-
-### Current File Impacts
-
-- `src/domains/seller/sellerIntelligenceStore.tsx`
 - `src/app/workspaces/StrategyWorkspace.tsx`
 - `src/components/StrategyBuilder.tsx`
-
-### Exit Criteria
-
-- seller idea generation feels ranked, explainable, and desk-grade
-
----
-
-## Phase 6: Execution Desk and OMS Upgrade
-
-### Objective
-
-Make execution a real operating desk.
-
-### Deliverables
-
-- staged ticket state machine
-- order basket controls
-- live blotter dock
-- recovery and rejection workflows
-
-### Tasks
-
-- formalize execution state transitions
-- standardize preview and repair preview presentation
-- add:
-  - order policy controls
-  - slippage guardrails
-  - basket send options
-  - partial-fill handling
-  - cancel/replace workflows
-- move direct fetches to formal execution API service layer
-
-### Current File Impacts
-
-- `src/domains/execution/executionStore.tsx`
 - `src/app/workspaces/ExecutionWorkspace.tsx`
-- `kaggle_backend.py` or backend execution service modules
+- `src/domains/seller/sellerIntelligenceStore.tsx`
+- `src/domains/execution/executionStore.tsx`
+- `backend/app/services/execution/*`
+- `backend/app/api/routes/execution.py`
+- `backend/app/api/routes/orders.py`
 
 ### Exit Criteria
 
-- execution desk can be used as a primary OMS surface
+- strategy comparison is explainable and portfolio-aware
+- execution can operate as a true OMS desk rather than a preview form
 
 ---
 
-## Phase 7: Portfolio, Risk, and Adjustment Desk
+### Phase 6: Portfolio, Risk, and Adjustment Authority
 
 ### Objective
 
-Make grouped positions, risk, and repair logic authoritative and inspectable.
+Make grouped book state and repair logic authoritative, inspectable, and consistent across desks.
 
-### Deliverables
+### Concrete Tasks
 
-- grouped strategy model
-- risk cockpit v2
-- dedicated adjustment desk
-- scenario engine
-
-### Tasks
-
-- promote grouped positions into a clearer backend contract
-- improve live PnL and broker Greeks normalization
-- create:
+- introduce backend-owned `GroupedPosition` contracts
+- normalize grouped strategy identity using positions, orders, and trades rather than frontend heuristics
+- rebuild Portfolio around:
+  - live grouped positions
+  - holdings
+  - capital
+  - lifecycle explorer
+  - concentration views
+- rebuild Risk around:
+  - live Greek aggregates
   - stress matrix
-  - concentration view
   - margin ladder
-  - repair queue
-  - before/after scenario comparison
-- separate:
-  - broker-confirmed values
-  - analytical scenario values
+  - broker-confirmed versus analytical labels
+- elevate adjustment logic into a dedicated desk or risk subdesk with before/after payoff and repair preview deltas
 
-### Current File Impacts
+### Repo Areas Touched
 
-- `src/domains/portfolio/*`
-- `src/domains/risk/*`
-- `src/domains/adjustment/*`
+- `src/domains/portfolio/portfolioStore.tsx`
+- `src/domains/risk/riskStore.tsx`
+- `src/domains/adjustment/adjustmentStore.tsx`
 - `src/app/workspaces/PortfolioWorkspace.tsx`
 - `src/app/workspaces/RiskWorkspace.tsx`
-- backend position normalization paths
+- `backend/app/services/portfolio/*`
+- `backend/app/services/risk/*`
 
 ### Exit Criteria
 
-- position, risk, and repair views share one coherent grouped-book model
+- grouped positions are backend-authoritative
+- risk and repair views share one canonical book model
+- every surface clearly labels analytical versus broker-confirmed values
 
 ---
 
-## Phase 8: Automation Center and Review System V2
+### Phase 7: Automation, Review, and Operations Center
 
 ### Objective
 
-Complete the discipline loop from idea to execution to review.
+Close the loop from opportunity to rule to execution to callback to review.
 
-### Deliverables
+### Concrete Tasks
 
-- automation control center
-- callback audit timeline
-- richer review analytics
-- linked playbook performance
+- rebuild Automation as a control center with:
+  - rule grid
+  - trigger timeline
+  - action builder
+  - callback stream
+  - execution audit
+  - dry-run panel
+- rebuild Journal as Review with:
+  - journal cases
+  - lifecycle timeline
+  - playbook compliance
+  - mistake clusters
+  - regime and structure analytics
+  - adjustment effectiveness analytics
+- add Operations workspace for:
+  - backend health
+  - websocket health
+  - rate limits
+  - auth mode
+  - diagnostic logs
+- persist layouts, playbooks, automation events, and review artifacts through the new storage layer
 
-### Tasks
+### Repo Areas Touched
 
-- strengthen automation authoring UX
-- add dry-run mode and trigger timeline
-- add callback inspection
-- deepen review analytics:
-  - outcome attribution
-  - adjustment effectiveness
-  - regime x structure performance
-  - mistake cluster trends
-- persist editable playbooks in backend if cross-device authoring is required
-
-### Current File Impacts
-
-- `src/domains/automation/*`
-- `src/domains/journal/*`
 - `src/app/workspaces/AutomationWorkspace.tsx`
 - `src/app/workspaces/JournalWorkspace.tsx`
-- backend automation and review services
+- new `src/app/workspaces/OpsWorkspace.tsx`
+- `src/domains/automation/automationStore.tsx`
+- `src/domains/journal/journalStore.tsx`
+- `backend/app/services/automation/*`
+- `backend/app/services/reviews/*`
+- `backend/app/services/diagnostics/*`
 
 ### Exit Criteria
 
-- trader can trace a setup from idea -> rule -> execution -> callback -> review
+- a trader can trace a setup from idea to automation to callback to review
+- operational diagnostics are always visible during live trading
 
 ---
 
-## Phase 9: Backend Modularization
+### Phase 8: Hardening, Performance, and Rollout Safety
 
 ### Objective
 
-Split the monolithic backend into maintainable modules without losing current behavior.
+Make the new architecture safe to operate and safe to keep extending.
 
-### Deliverables
+### Concrete Tasks
 
-- routed backend package structure
-- extracted Breeze client wrappers
-- separated automation, review, market, and execution services
-
-### Tasks
-
-- extract:
-  - auth middleware
-  - rate limiter
-  - tick store
-  - candle store
-  - execution preview logic
-  - automation manager
-  - review manager
-  - position normalization
-- preserve route contracts while restructuring internals
-- add unit coverage around extracted services
-
-### Exit Criteria
-
-- `kaggle_backend.py` no longer serves as the sole service module
-
----
-
-## Phase 10: Hardening, Performance, and Ops
-
-### Objective
-
-Make the terminal operationally credible under sustained use.
-
-### Deliverables
-
-- route and service tests
-- performance profiling
-- observability
-- failure-mode handling
-
-### Tasks
-
-- add route-level backend tests for:
-  - preview
-  - margin
-  - repair preview
-  - automation rules
-  - callbacks
-  - review state
+- virtualize all large grids
+- profile chain updates and multi-panel rerender behavior
+- add route and service tests for all new route families
 - add client tests for:
-  - terminal state
   - layout persistence
-  - opportunity ranking
-  - adjustment hydration
-- add metrics and audit streams
-- profile large-grid rendering and stream update behavior
+  - keyboard flows
+  - staged execution state machine
+  - grouped position derivation
+  - automation timeline behavior
+- add audit event coverage for every live mutation
+- add failure-mode handling for:
+  - stream degradation
+  - backend disconnect
+  - preview failures
+  - callback auth failures
+  - persistence write failures
 
 ### Exit Criteria
 
-- terminal is safe to iterate on without regressions
-- live workflows are observable in production
+- live workflows are observable
+- the terminal remains fast under load
+- the migration can continue without regressions becoming invisible
 
 ---
 
-## 7. Recommended Immediate Build Order
+## 8. API Migration Matrix
 
-If only one sequence can be executed next, use this order:
+The backend migration should use compatibility adapters, not a one-shot route break.
 
-1. Phase 1: State spine refactor
-2. Phase 2: Router and layout engine
-3. Phase 3: Workstation design system
-4. Phase 4: Market and Chain desk rebuild
-5. Phase 6: Execution desk and OMS upgrade
-6. Phase 7: Portfolio, Risk, and Adjustment desk
-7. Phase 8: Automation and Review V2
-8. Phase 9: Backend modularization
-9. Phase 10: Hardening and ops
-
-Reason:
-
-- shell and state architecture improvements multiply the value of every later workspace
-- market, chain, and execution are the highest-traffic desks
-- backend modularization should happen after the target service boundaries are proven by the new client architecture
+| Current Route | Target Route |
+| --- | --- |
+| `/api/connect` | `/api/session/connect` |
+| `/api/disconnect` | `/api/session/disconnect` |
+| `/api/expiries` | `/api/market/expiries` |
+| `/api/spot` | `/api/market/spot` |
+| `/api/optionchain` | `/api/market/chain` |
+| `/api/quote` | `/api/market/quote` |
+| `/api/historical` | `/api/market/candles` |
+| `/api/depth` | `/api/market/depth` |
+| `/api/ws/subscribe` | `/api/stream/subscribe` |
+| `/ws/ticks` | `/ws/stream` |
+| `/api/ticks` | `/api/stream/poll` |
+| `/api/preview` | `/api/execution/preview` |
+| `/api/margin` | `/api/execution/margin` |
+| `/api/repair-preview` | `/api/execution/repair-preview` |
+| `/api/order` | `/api/orders` |
+| `/api/order/cancel` | `/api/orders/{id}/cancel` |
+| `/api/order/modify` | `/api/orders/{id}` |
+| `/api/strategy/execute` | `/api/orders/basket` |
+| `/api/squareoff` | `/api/orders/squareoff` |
+| `/api/orders` | `/api/portfolio/orders` |
+| `/api/trades` | `/api/portfolio/trades` |
+| `/api/positions` | `/api/portfolio/positions` |
+| `/api/funds` | `/api/portfolio/funds` |
+| `/api/automation/rules` | `/api/automation/rules` |
+| `/api/automation/evaluate` | `/api/automation/evaluate` |
+| `/api/automation/callbacks` | `/api/automation/events` |
+| `/api/automation/callbacks/webhook` | `/api/automation/events/webhook` |
+| `/api/reviews/state` | `/api/reviews/journal` |
+| `/api/diagnostics/execution-validation` | `/api/diagnostics/execution-validation` |
+| `/api/ratelimit` | `/api/diagnostics/rate-limit` |
+| `/api/checksum` | `/api/session/checksum` |
 
 ---
 
-## 8. Definition of Done for the Program
+## 9. Program Acceptance Gates
 
-The master plan should be considered fulfilled only when:
+The program should only be considered successful when all of the following are true:
 
-- the terminal supports saved high-density workstation layouts
-- market, chain, strategy, execution, portfolio, risk, automation, and review all use a consistent design system
-- backend-authoritative broker workflows are clearly distinguished from analytical projections
-- grouped positions and lifecycle attribution are reliable
-- repair workflows are fast and previewed
-- automation and callbacks are operationally auditable
-- the product feels like a terminal rather than a collection of screens
+1. The shell supports saved multi-panel layouts, deep links, keyboard workflows, and a persistent bottom dock.
+2. Market, Chain, Strategy, Execution, Portfolio, Risk, Automation, Review, and Ops all use a shared workstation language.
+3. Broker truth, normalized truth, and analytical truth are visibly distinct on all live desks.
+4. Execution, repair, automation, and review flows emit auditable events.
+5. Grouped positions, lifecycle attribution, and close-out analytics are backend-authoritative.
+6. Diagnostics for streams, auth, rate limits, and callbacks are always available.
+7. The terminal remains responsive under live updates and large datasets.
 
 ---
 
-## 9. Immediate Next Tasks
+## 10. Immediate Build Order
 
-If work resumes in the next session, start here:
+If execution starts now, use this sequence:
 
-1. Decide the client state stack and routing/layout direction formally.
-2. Implement the terminal state spine and layout engine skeleton.
-3. Reintroduce a proper bottom blotter dock and multi-panel workspace persistence.
-4. Split Market and Chain into separate but linked desks.
+1. Phase 0
+2. Phase 1
+3. Phase 2
+4. Phase 3
+5. Phase 4
+6. Phase 5
+7. Phase 6
+8. Phase 7
+9. Phase 8
+
+This order is deliberate:
+
+- the platform spine and shell changes multiply every later workspace
+- backend modularization should begin early enough to stop further monolith growth
+- market, chain, strategy, and execution are the most visible and highest-value trading desks
+- portfolio, risk, automation, review, and ops depend on the same canonical contracts
+
+---
+
+## 11. First PR Sequence
+
+To keep the rollout pragmatic, the first implementation tranche should be split into these pull requests:
+
+1. `platform-foundation`
+   - dependency additions
+   - React Router skeleton
+   - Query client setup
+   - Zustand terminal state skeleton
+   - streaming event bus skeleton
+2. `shell-layout-v1`
+   - top ribbon
+   - left launcher
+   - bottom dock
+   - saved layout persistence
+   - route migration from custom history hook
+3. `backend-app-structure`
+   - `backend/app` package
+   - route modules
+   - Breeze client extraction
+   - compatibility adapters in `kaggle_backend.py`
+4. `market-chain-launchpad`
+   - launchpad workspace
+   - chain workspace
+   - market desk split
+   - shared workstation primitives
+5. `strategy-execution-oms`
+   - strategy compare flow
+   - explicit execution state machine
+   - order and repair drilldowns
+6. `portfolio-risk-adjustment`
+   - backend grouped positions
+   - portfolio and risk rebuild
+   - adjustment desk
+7. `automation-review-ops`
+   - storage-backed automation and review
+   - operations workspace
+   - audit and diagnostics surfaces
+8. `hardening`
+   - performance profiling
+   - regression tests
+   - rollout safety checks
+
+This is the implementation plan to build against.
