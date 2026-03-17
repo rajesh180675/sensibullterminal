@@ -1,7 +1,12 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { SYMBOL_CONFIG } from '../../config/market';
-import type { ExecutionBlotterItem, ExecutionPreview, ExecutionValidationSummary, OptionLeg, Position } from '../../types/index';
+import type { ExecutionBlotterItem, ExecutionPreview, OptionLeg, Position } from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
+import {
+  useCancelOrderMutation,
+  usePlaceOrderMutation,
+  usePreviewMutation,
+} from '../../services/api/terminalQueryHooks';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { buildPayoff, findBreakevens, maxProfitLoss } from '../../utils/math';
 import { useMarketStore } from '../market/marketStore';
@@ -68,44 +73,6 @@ export function buildExecutionPreview(legs: OptionLeg[]): ExecutionPreview {
   };
 }
 
-function enrichPreview(base: ExecutionPreview, patch?: Partial<ExecutionPreview>): ExecutionPreview {
-  if (!patch) return base;
-  return {
-    ...base,
-    ...patch,
-    maxProfit: patch.maxProfit ?? base.maxProfit,
-    maxLoss: patch.maxLoss ?? base.maxLoss,
-    breakevens: patch.breakevens ?? base.breakevens,
-  };
-}
-
-function mergeValidation(
-  previewValidation?: ExecutionValidationSummary,
-  marginValidation?: ExecutionValidationSummary,
-): ExecutionValidationSummary | undefined {
-  if (!previewValidation && !marginValidation) return undefined;
-  const marginLegValidation = previewValidation?.margin ?? (
-    marginValidation
-      ? {
-          kind: 'margin',
-          captured_at: marginValidation.captured_at,
-          leg_count: marginValidation.leg_count,
-          rawTopLevelFields: marginValidation.rawTopLevelFields ?? [],
-          successFields: marginValidation.successFields ?? [],
-          captureFile: marginValidation.captureFile,
-        }
-      : undefined
-  );
-  return {
-    kind: 'preview',
-    captured_at: previewValidation?.captured_at ?? marginValidation?.captured_at ?? Date.now(),
-    leg_count: previewValidation?.leg_count ?? marginValidation?.leg_count ?? 0,
-    captureFile: previewValidation?.captureFile ?? marginValidation?.captureFile,
-    previewLegs: previewValidation?.previewLegs ?? [],
-    margin: marginLegValidation,
-  };
-}
-
 export function buildBackendLegPayload(legs: OptionLeg[]) {
   const cfg = SYMBOL_CONFIG[legs[0].symbol];
   return legs.map((leg) => ({
@@ -120,6 +87,17 @@ export function buildBackendLegPayload(legs: OptionLeg[]) {
     right: leg.type === 'CE' ? 'call' : 'put',
     strike_price: String(leg.strike),
   }));
+}
+
+function enrichPreview(base: ExecutionPreview, patch?: Partial<ExecutionPreview>): ExecutionPreview {
+  if (!patch) return base;
+  return {
+    ...base,
+    ...patch,
+    maxProfit: patch.maxProfit ?? base.maxProfit,
+    maxLoss: patch.maxLoss ?? base.maxLoss,
+    breakevens: patch.breakevens ?? base.breakevens,
+  };
 }
 
 interface ExecutionStoreValue {
@@ -151,6 +129,9 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
   const { notify } = useNotificationStore();
   const { session } = useSessionStore();
   const { stream } = useMarketStore();
+  const previewMutation = usePreviewMutation(session);
+  const placeOrderMutation = usePlaceOrderMutation(session);
+  const cancelOrderMutation = useCancelOrderMutation(session);
   const [draftMeta, setDraftMeta] = useState<{ id: string; createdAt: number } | null>(null);
   const [legs, setLegs] = useState<OptionLeg[]>([]);
   const [blotter, setBlotter] = useState<ExecutionBlotterItem[]>([]);
@@ -231,32 +212,8 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     setPreviewStatus('loading');
 
     const loadPreview = async () => {
-      const requestLegs = buildBackendLegPayload(legs);
-      const [previewResult, marginResult] = await Promise.all([
-        brokerGatewayClient.execution.previewStrategy(session, requestLegs),
-        brokerGatewayClient.execution.fetchMargin(session, legs),
-      ]);
-
+      const merged = enrichPreview(localPreview, await previewMutation.mutateAsync(legs));
       if (cancelled) return;
-
-      if (!previewResult.ok && !marginResult.ok) {
-        setPreview(localPreview);
-        setPreviewStatus('fallback');
-        notify({
-          title: 'Backend preview unavailable',
-          message: previewResult.error || marginResult.error || 'Falling back to local execution estimates.',
-          tone: 'warning',
-        });
-        return;
-      }
-
-      const merged = enrichPreview(localPreview, {
-        ...previewResult.data,
-        ...marginResult.data,
-        source: 'backend',
-        updatedAt: previewResult.data?.updated_at ?? marginResult.data?.updated_at ?? Date.now(),
-        validation: mergeValidation(previewResult.data?.validation, marginResult.data?.validation),
-      });
       setPreview(merged);
       setPreviewStatus('ready');
     };
@@ -275,7 +232,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [legs, localPreview, notify, session]);
+  }, [legs, localPreview, notify, previewMutation, session]);
 
   const activeBasket = useMemo<ExecutionBlotterItem | null>(() => {
     if (legs.length === 0 || !draftMeta) return null;
@@ -356,121 +313,37 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     }
 
     setIsExecuting(true);
-    const cfg = SYMBOL_CONFIG[selectedLegs[0].symbol];
     const results: string[] = [];
     let basketInterrupted = false;
 
     try {
-      if (brokerGatewayClient.session.isBackend(session.proxyBase)) {
-        const base = session.proxyBase.replace(/\/api\/?$/, '').replace(/\/$/, '');
-        for (let index = 0; index < selectedLegs.length; index += 1) {
-          const leg = selectedLegs[index];
-          patchBlotterItem(blotterId, (item) => updateLegState(item, leg.id, { status: 'sending', sentAt: Date.now(), updatedAt: Date.now() }));
-
-          try {
-            const response = await fetch(`${base}/api/strategy/execute`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                legs: [{
-                  stock_code: cfg.breezeStockCode,
-                  exchange_code: cfg.breezeExchangeCode,
-                  action: leg.action.toLowerCase(),
-                  quantity: String(leg.lots * cfg.lotSize),
-                  expiry_date: leg.expiry,
-                  right: leg.type === 'CE' ? 'call' : 'put',
-                  strike_price: String(leg.strike),
-                  order_type: leg.orderType ?? 'market',
-                  price: leg.orderType === 'limit' ? String(leg.limitPrice ?? leg.ltp) : '0',
-                }],
-              }),
-            });
-
-            const data = await response.json() as {
-              results?: Array<{ success: boolean; order_id?: string; error?: string }>;
-            };
-            const result = data.results?.[0];
-
-            if (result?.success) {
-              results.push(`${leg.type} ${leg.strike} ${leg.action} -> ${result.order_id}`);
-              patchBlotterItem(blotterId, (item) => updateLegState(item, leg.id, {
-                    status: 'pending',
-                    orderId: result.order_id,
-                    updatedAt: Date.now(),
-                  }));
-            } else {
-              const error = result?.error || 'Rejected by broker.';
-              results.push(`${leg.type} ${leg.strike} failed -> ${error}`);
-              patchBlotterItem(blotterId, (item) => updateBasketState(
-                updateLegState(item, leg.id, {
-                  status: 'rejected',
-                  error,
-                  updatedAt: Date.now(),
-                }),
-                {
-                  status: index === 0 ? 'all_failed' : 'partial_failure',
-                  recoveryAction: index === 0 ? 'none' : 'manual_intervention',
-                },
-              ));
-              basketInterrupted = true;
-              break;
-            }
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            results.push(`${leg.type} ${leg.strike} failed -> ${message}`);
-            patchBlotterItem(blotterId, (item) => updateBasketState(
-              updateLegState(item, leg.id, {
-                status: 'failed',
-                error: message,
-                updatedAt: Date.now(),
-              }),
-              {
-                status: index === 0 ? 'all_failed' : 'partial_failure',
-                recoveryAction: index === 0 ? 'none' : 'manual_intervention',
-                },
-              ));
-            basketInterrupted = true;
-            break;
-          }
-        }
-      } else {
-        for (const leg of selectedLegs) {
-          patchBlotterItem(blotterId, (item) => updateLegState(item, leg.id, { status: 'sending', sentAt: Date.now(), updatedAt: Date.now() }));
-          try {
-            const result = await brokerGatewayClient.orders.placeDirectLeg(session, {
-              stockCode: cfg.breezeStockCode,
-              exchangeCode: cfg.breezeExchangeCode,
-              right: leg.type === 'CE' ? 'call' : 'put',
-              strikePrice: String(leg.strike),
-              expiryDate: leg.expiry,
-              action: leg.action.toLowerCase() as 'buy' | 'sell',
-              quantity: String(leg.lots * cfg.lotSize),
-              orderType: (leg.orderType ?? 'market') as 'market' | 'limit',
-              price: leg.orderType === 'limit' ? String(leg.limitPrice ?? leg.ltp) : '0',
-            });
-            results.push(`${leg.type} ${leg.strike} ${leg.action} -> ${result.order_id}`);
-            patchBlotterItem(blotterId, (item) => updateLegState(item, leg.id, {
-                  status: 'pending',
-                  orderId: result.order_id,
-                  updatedAt: Date.now(),
-                }));
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            results.push(`${leg.type} ${leg.strike} failed -> ${message}`);
-            patchBlotterItem(blotterId, (item) => updateBasketState(
-              updateLegState(item, leg.id, {
-                status: 'failed',
-                error: message,
-                updatedAt: Date.now(),
-              }),
-              {
-                status: results.length === 1 ? 'all_failed' : 'partial_failure',
-                recoveryAction: results.length === 1 ? 'none' : 'manual_intervention',
-                },
-              ));
-            basketInterrupted = true;
-            break;
-          }
+      for (let index = 0; index < selectedLegs.length; index += 1) {
+        const leg = selectedLegs[index];
+        patchBlotterItem(blotterId, (item) => updateLegState(item, leg.id, { status: 'sending', sentAt: Date.now(), updatedAt: Date.now() }));
+        try {
+          const result = await placeOrderMutation.mutateAsync(leg);
+          results.push(`${leg.type} ${leg.strike} ${leg.action} -> ${result.orderId}`);
+          patchBlotterItem(blotterId, (item) => updateLegState(item, leg.id, {
+            status: 'pending',
+            orderId: result.orderId,
+            updatedAt: Date.now(),
+          }));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          results.push(`${leg.type} ${leg.strike} failed -> ${message}`);
+          patchBlotterItem(blotterId, (item) => updateBasketState(
+            updateLegState(item, leg.id, {
+              status: message.toLowerCase().includes('reject') ? 'rejected' : 'failed',
+              error: message,
+              updatedAt: Date.now(),
+            }),
+            {
+              status: index === 0 ? 'all_failed' : 'partial_failure',
+              recoveryAction: index === 0 ? 'none' : 'manual_intervention',
+            },
+          ));
+          basketInterrupted = true;
+          break;
         }
       }
     } catch (error) {
@@ -491,7 +364,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
       message: results.join(' | ') || 'No orders sent.',
       tone: basketInterrupted && results.length <= 1 ? 'error' : basketInterrupted ? 'warning' : 'success',
     });
-  }, [activeBasket, notify, patchBlotterItem, preview, previewStatus, session, stream]);
+  }, [activeBasket, notify, patchBlotterItem, placeOrderMutation, preview, previewStatus, session, stream]);
 
   const retryFailedBasket = useCallback(async (basketId: string) => {
     if (!session?.isConnected) return;
@@ -519,21 +392,11 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
           updatedAt: Date.now(),
         }));
         try {
-          const result = await brokerGatewayClient.orders.placeDirectLeg(session, {
-            stockCode: SYMBOL_CONFIG[leg.symbol].breezeStockCode,
-            exchangeCode: SYMBOL_CONFIG[leg.symbol].breezeExchangeCode,
-            right: leg.type === 'CE' ? 'call' : 'put',
-            strikePrice: String(leg.strike),
-            expiryDate: leg.expiry,
-            action: leg.action.toLowerCase() as 'buy' | 'sell',
-            quantity: String(leg.lots * SYMBOL_CONFIG[leg.symbol].lotSize),
-            orderType: (leg.orderType ?? 'market') as 'market' | 'limit',
-            price: leg.orderType === 'limit' ? String(leg.limitPrice ?? leg.ltp) : '0',
-          });
-          messages.push(`${leg.type} ${leg.strike} retried -> ${result.order_id}`);
+          const result = await placeOrderMutation.mutateAsync(leg);
+          messages.push(`${leg.type} ${leg.strike} retried -> ${result.orderId}`);
           patchBlotterItem(basketId, (item) => updateLegState(item, leg.id, {
             status: 'pending',
-            orderId: result.order_id,
+            orderId: result.orderId,
             error: undefined,
             updatedAt: Date.now(),
           }));
@@ -552,7 +415,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setRecoveringBasketId(null);
     }
-  }, [blotter, legSnapshotMap, patchBlotterItem, session]);
+  }, [blotter, legSnapshotMap, patchBlotterItem, placeOrderMutation, session]);
 
   const cancelRemainingBasket = useCallback(async (basketId: string) => {
     if (!session?.isConnected) return;
@@ -565,15 +428,18 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     const messages: string[] = [];
     try {
       for (const leg of pendingLegs) {
-        const result = await brokerGatewayClient.orders.cancel(session, leg.orderId!, SYMBOL_CONFIG[basket.symbol].breezeExchangeCode);
-        if (result.ok) {
+        try {
+          await cancelOrderMutation.mutateAsync({
+            orderId: leg.orderId!,
+            exchangeCode: SYMBOL_CONFIG[basket.symbol].breezeExchangeCode,
+          });
           messages.push(`${leg.summary} cancelled`);
           patchBlotterItem(basketId, (item) => updateLegState(item, leg.legId, {
             status: 'cancelled',
             updatedAt: Date.now(),
           }));
-        } else {
-          messages.push(`${leg.summary} cancel failed -> ${result.error || 'Unknown error'}`);
+        } catch (error) {
+          messages.push(`${leg.summary} cancel failed -> ${error instanceof Error ? error.message : String(error)}`);
         }
       }
 
@@ -588,7 +454,7 @@ export function ExecutionProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setRecoveringBasketId(null);
     }
-  }, [blotter, patchBlotterItem, session]);
+  }, [blotter, cancelOrderMutation, patchBlotterItem, session]);
 
   const squareOffFilledBasket = useCallback(async (basketId: string) => {
     if (!session?.isConnected) return;

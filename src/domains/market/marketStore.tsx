@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { DEFAULT_SPOT_PRICES, MARKET_INDICES, SYMBOL_CONFIG, getExpiries } from '../../config/market';
-import { generateChain, simulateTick } from '../../data/mock';
+import { DEFAULT_SPOT_PRICES, MARKET_INDICES, getExpiries } from '../../config/market';
+import { simulateTick } from '../../data/mock';
 import { truthDescriptor, type TruthDescriptor } from '../../lib/truth';
 import type {
   ExpiryDate,
@@ -11,6 +11,7 @@ import type {
   WatchlistItem,
 } from '../../types/index';
 import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
+import { useChainQuery } from '../../services/api/terminalQueryHooks';
 import { terminalEventBus } from '../../services/streaming/eventBus';
 import {
   createInitialStreamMetrics,
@@ -21,13 +22,13 @@ import {
 import { UnifiedStreamingManager } from '../../services/streaming/unifiedStreamingManager';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { useSpotPriceStore } from '../../state/market/spotPriceStore';
+import { useStreamStore } from '../../state/streaming/streamStore';
 import type { BackendMarketDepth, HistoricalCandle } from '../../utils/kaggleClient';
 import type { TickUpdate } from '../../utils/breezeWs';
 import { useSessionStore } from '../session/sessionStore';
 import {
   applyTicksToChain,
   deriveSpotFromMedian,
-  mergeQuotesToChain,
   updateIndicesWithSpot,
 } from './marketTransforms';
 import { buildWatchlist } from './marketDerived';
@@ -144,12 +145,9 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
   const [expiry, setExpiryState] = useState<ExpiryDate>(getExpiries(DEFAULT_SYMBOL)[0]);
   const [availableExpiries, setAvailableExpiries] = useState<ExpiryDate[]>(getExpiries(DEFAULT_SYMBOL));
   const spotPrice = useSpotPriceStore((state) => state.prices[symbol] ?? DEFAULT_SPOT_PRICES[symbol]);
-  const [chain, setChain] = useState<OptionRow[]>(() => generateChain(DEFAULT_SYMBOL, useSpotPriceStore.getState().getSpot(DEFAULT_SYMBOL)));
   const [lastUpdate, setLastUpdate] = useState(new Date());
   const [spotTruth, setSpotTruth] = useState<TruthDescriptor>(() => truthDescriptor('analytical', 'mock_spot_seed'));
   const [chainTruth, setChainTruth] = useState<TruthDescriptor>(() => truthDescriptor('analytical', 'mock_chain_seed'));
-  const [isLoading, setIsLoading] = useState(false);
-  const [chainError, setChainError] = useState<string | null>(null);
   const [liveIndices, setLiveIndices] = useState<MarketIndex[]>(MARKET_INDICES);
   const [watchlist, setWatchlist] = useState<WatchlistItem[]>([]);
   const [marketDepth, setMarketDepth] = useState<MarketDepthSnapshot>(() => emptyDepth());
@@ -157,10 +155,28 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
   const [chartInterval, setChartInterval] = useState(DEFAULT_INTERVAL);
   const [isHistoricalLoading, setIsHistoricalLoading] = useState(false);
   const [streamMetrics, setStreamMetrics] = useState<StreamMetrics>(() => createInitialStreamMetrics());
+  const chainKey = `${symbol}:${expiry.breezeValue}`;
+  const chainOverlay = useStreamStore((state) => state.chainOverlay[chainKey]);
+  const setStreamStatus = useStreamStore((state) => state.setStreamStatus);
+  const setStreamOverlay = useStreamStore((state) => state.setChainOverlay);
+  const clearStreamOverlay = useStreamStore((state) => state.clearChainOverlay);
+  const setStreamSpotPrice = useStreamStore((state) => state.setSpotPrice);
+  const chainQuery = useChainQuery({
+    session,
+    symbol,
+    expiry,
+    spotPrice,
+  });
+  const snapshotChain = chainQuery.data ?? [];
+  const chain = chainOverlay ?? snapshotChain;
+  const isLoading = chainQuery.isLoading || chainQuery.isFetching;
+  const chainError = chainQuery.error?.message ?? null;
 
   const currentChain = useRef<OptionRow[]>(chain);
   const currentSymbol = useRef<SymbolCode>(symbol);
   const currentInterval = useRef<string>(chartInterval);
+  const currentExpiry = useRef<ExpiryDate>(expiry);
+  const currentChainKey = useRef(chainKey);
   const demoTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const skipNextExpiryReload = useRef<string | null>(null);
   const lastDepthRefresh = useRef<number>(0);
@@ -168,16 +184,19 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => { currentChain.current = chain; }, [chain]);
   useEffect(() => { currentSymbol.current = symbol; }, [symbol]);
   useEffect(() => { currentInterval.current = chartInterval; }, [chartInterval]);
+  useEffect(() => { currentExpiry.current = expiry; }, [expiry]);
+  useEffect(() => { currentChainKey.current = chainKey; }, [chainKey]);
 
   const updateSpot = useCallback((nextSpot: number, nextSymbol = currentSymbol.current, nextTruth?: TruthDescriptor) => {
     const accepted = useSpotPriceStore.getState().setSpot(nextSymbol, nextSpot);
     if (!accepted) return;
+    setStreamSpotPrice(nextSymbol, nextSpot);
     if (nextTruth) {
       setSpotTruth(nextTruth);
     }
     const dayOpen = useSpotPriceStore.getState().dayOpens[nextSymbol];
     setLiveIndices((current) => updateIndicesWithSpot(current, nextSymbol, nextSpot, dayOpen));
-  }, []);
+  }, [setStreamSpotPrice]);
 
   const refreshHistorical = useCallback(async () => {
     setIsHistoricalLoading(true);
@@ -311,12 +330,14 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       currentChain.current,
       update.ticks,
       activeSpot,
-      expiry.daysToExpiry,
+      currentExpiry.current.daysToExpiry,
     );
-    setChain(updatedChain);
-    currentChain.current = updatedChain;
-    setLastUpdate(new Date());
-    setChainTruth(truthDescriptor('normalized', 'breeze_ws_accumulated', update.ts));
+    if (updatedChain !== currentChain.current) {
+      setStreamOverlay(currentChainKey.current, updatedChain, update.version);
+      currentChain.current = updatedChain;
+      setLastUpdate(new Date());
+      setChainTruth(truthDescriptor('normalized', 'breeze_ws_accumulated', update.ts));
+    }
 
     const nextSymbol = currentSymbol.current;
     const broadcastSpot = update.spot_prices?.[nextSymbol] ?? update.spot_prices?.NIFTY;
@@ -353,7 +374,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       versionGap: current.lastTickVersion === null ? 0 : Math.max(0, update.version - current.lastTickVersion - 1),
       processingMs: Math.max(0, Date.now() - startedAt),
     }));
-  }, [expiry.daysToExpiry, updateSpot]);
+  }, [setStreamOverlay, updateSpot]);
 
   const fetchLiveChain = useCallback(async (
     nextSymbol: SymbolCode,
@@ -362,27 +383,14 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     nextSpot: number,
   ) => {
     if (!brokerGatewayClient.session.isBackend(nextSession.proxyBase)) return;
-    setIsLoading(true);
-    setChainError(null);
     setStatusMessage('Fetching option chain snapshot...');
 
     try {
-      const [calls, puts] = await Promise.all([
-        brokerGatewayClient.market.fetchOptionSide(nextSymbol, nextExpiry.breezeValue, 'Call', nextSession),
-        brokerGatewayClient.market.fetchOptionSide(nextSymbol, nextExpiry.breezeValue, 'Put', nextSession),
-      ]);
-
-      const merged = mergeQuotesToChain(
-        calls.data ?? [],
-        puts.data ?? [],
-        nextSpot,
-        SYMBOL_CONFIG[nextSymbol].strikeStep,
-        nextExpiry.daysToExpiry,
-      );
+      clearStreamOverlay(`${nextSymbol}:${nextExpiry.breezeValue}`);
+      const result = await chainQuery.refetch();
+      const merged = result.data ?? [];
 
       if (merged.length > 0) {
-        setChain(merged);
-        currentChain.current = merged;
         setLastUpdate(new Date());
         setChainTruth(truthDescriptor('normalized', 'breeze_rest_snapshot'));
         setStatusMessage(`Loaded ${merged.length} strikes. Subscribing live stream...`);
@@ -410,17 +418,14 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setChainError(message);
       setStatusMessage(message);
       notify({
         title: 'Option chain load failed',
         message,
         tone: 'error',
       });
-    } finally {
-      setIsLoading(false);
     }
-  }, [notify, refreshMarketDepth, setStatusMessage]);
+  }, [chainQuery, clearStreamOverlay, notify, refreshMarketDepth, setStatusMessage]);
 
   const initializeLiveSession = useCallback(async (nextSymbol: SymbolCode, nextSession: NonNullable<typeof session>) => {
     if (!brokerGatewayClient.session.isBackend(nextSession.proxyBase)) {
@@ -433,11 +438,10 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
       setAvailableExpiries(staticExpiries);
       setExpiryState(staticExpiries[0]);
       updateSpot(DEFAULT_SPOT_PRICES[nextSymbol], nextSymbol, truthDescriptor('analytical', 'static_spot_seed'));
-      setChain(generateChain(nextSymbol));
       setChainTruth(truthDescriptor('analytical', 'mock_chain_seed'));
       setHistorical([]);
       setMarketDepth(emptyDepth());
-      setChainError(null);
+      clearStreamOverlay(`${nextSymbol}:${getExpiries(nextSymbol)[0].breezeValue}`);
       setLastUpdate(new Date());
       setStreamMetrics(createInitialStreamMetrics());
       setStatusMessage('Browser-direct session connected. Backend-native depth and candles are unavailable.');
@@ -463,6 +467,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => terminalEventBus.on('stream:status', ({ status, transport, at }) => {
       if (transport === 'system' && status === 'disconnected') return;
+      setStreamStatus(status, transport, at);
       setStreamMetrics((current) => ({
         ...current,
         transport,
@@ -480,7 +485,19 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
               ? 'WebSocket unavailable. REST polling fallback active.'
               : 'Market stream disconnected'
       );
-  }), [setStatusMessage]);
+  }), [setStatusMessage, setStreamStatus]);
+
+  useEffect(() => {
+    if (snapshotChain.length === 0) return;
+    clearStreamOverlay(chainKey);
+    currentChain.current = snapshotChain;
+    setLastUpdate(new Date(chainQuery.dataUpdatedAt || Date.now()));
+    setChainTruth(
+      session?.isConnected && brokerGatewayClient.session.isBackend(session.proxyBase)
+        ? truthDescriptor('normalized', 'breeze_rest_snapshot')
+        : truthDescriptor('analytical', 'mock_chain_seed'),
+    );
+  }, [chainKey, chainQuery.dataUpdatedAt, clearStreamOverlay, session, snapshotChain]);
 
   const resetToDemo = useCallback((nextSymbol: SymbolCode) => {
     streamingManager.disconnect();
@@ -489,19 +506,20 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     setAvailableExpiries(expiries);
     setExpiryState(expiries[0]);
     updateSpot(DEFAULT_SPOT_PRICES[nextSymbol], nextSymbol, truthDescriptor('analytical', 'mock_spot_seed'));
-    setChain(generateChain(nextSymbol));
     setChainTruth(truthDescriptor('analytical', 'mock_chain_seed'));
     setHistorical([]);
     setMarketDepth(emptyDepth());
-    setChainError(null);
+    clearStreamOverlay(`${nextSymbol}:${expiries[0].breezeValue}`);
     setLastUpdate(new Date());
     setStreamMetrics(createInitialStreamMetrics());
     demoTickRef.current = setInterval(() => {
-      setChain((current) => simulateTick(current));
+      const next = simulateTick(currentChain.current);
+      setStreamOverlay(`${currentSymbol.current}:${currentExpiry.current.breezeValue}`, next, null);
+      currentChain.current = next;
       setChainTruth(truthDescriptor('analytical', 'mock_tick_simulation'));
       setLastUpdate(new Date());
     }, 2500);
-  }, [updateSpot]);
+  }, [clearStreamOverlay, setStreamOverlay, updateSpot]);
 
   useEffect(() => {
     currentSymbol.current = symbol;
@@ -548,7 +566,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
 
   const refreshMarket = useCallback(async () => {
     if (!session?.isConnected) {
-      setChain(generateChain(symbol, spotPrice));
+      await chainQuery.refetch();
       setChainTruth(truthDescriptor('analytical', 'mock_chain_seed'));
       setHistorical([]);
       setMarketDepth(emptyDepth());
@@ -557,7 +575,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     }
 
     if (!brokerGatewayClient.session.isBackend(session.proxyBase)) {
-      setChain(generateChain(symbol, spotPrice));
+      await chainQuery.refetch();
       setChainTruth(truthDescriptor('analytical', 'mock_chain_seed'));
       setHistorical([]);
       setMarketDepth(emptyDepth());
@@ -569,7 +587,7 @@ export function MarketProvider({ children }: { children: React.ReactNode }) {
     const liveSpot = await fetchAndSetSpot(symbol, session);
     await fetchLiveChain(symbol, expiry, session, liveSpot);
     await Promise.all([refreshHistorical(), refreshMarketDepth(true)]);
-  }, [session, symbol, spotPrice, expiry, fetchAndSetSpot, fetchLiveChain, refreshHistorical, refreshMarketDepth, setStatusMessage]);
+  }, [chainQuery, session, symbol, expiry, fetchAndSetSpot, fetchLiveChain, refreshHistorical, refreshMarketDepth, setStatusMessage]);
 
   useEffect(() => {
     if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) return;

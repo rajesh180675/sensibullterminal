@@ -1,10 +1,13 @@
-import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
-import { getMockPositions } from '../../data/mock';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { PortfolioSummary, Position } from '../../types/index';
-import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { useNotificationStore } from '../../stores/notificationStore';
 import type { FundsData, OrderBookRow, TradeBookRow } from '../../utils/kaggleClient';
-import { mapBreezePositions } from '../market/marketTransforms';
+import {
+  useFundsQuery,
+  useOrdersQuery,
+  usePositionsQuery,
+  useTradesQuery,
+} from '../../services/api/terminalQueryHooks';
 import { useMarketStore } from '../market/marketStore';
 import { useSessionStore } from '../session/sessionStore';
 
@@ -59,69 +62,49 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const { notify } = useNotificationStore();
   const { session } = useSessionStore();
   const { stream } = useMarketStore();
-  const [livePositions, setLivePositions] = useState<Position[]>(() => getMockPositions());
-  const [selectedPosition, setSelectedPosition] = useState<Position | null>(() => getMockPositions()[0] ?? null);
-  const [funds, setFunds] = useState<FundsData | null>(null);
-  const [orders, setOrders] = useState<OrderBookRow[]>([]);
-  const [trades, setTrades] = useState<TradeBookRow[]>([]);
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const positionsQuery = usePositionsQuery({
+    session,
+    canRefreshBrokerData: stream.canRefreshBrokerData,
+  });
+  const fundsQuery = useFundsQuery({
+    session,
+    canRefreshBrokerData: stream.canRefreshBrokerData,
+  });
+  const ordersQuery = useOrdersQuery({
+    session,
+    canRefreshBrokerData: stream.canRefreshBrokerData,
+  });
+  const tradesQuery = useTradesQuery({
+    session,
+    canRefreshBrokerData: stream.canRefreshBrokerData,
+  });
+  const livePositions = positionsQuery.data ?? [];
+  const funds = fundsQuery.data ?? null;
+  const orders = ordersQuery.data ?? [];
+  const trades = tradesQuery.data ?? [];
+  const isRefreshing = positionsQuery.isFetching || fundsQuery.isFetching || ordersQuery.isFetching || tradesQuery.isFetching;
+  const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
+
+  useEffect(() => {
+    setSelectedPosition((current) => livePositions.find((position) => position.id === current?.id) ?? livePositions[0] ?? null);
+  }, [livePositions]);
 
   const refreshPortfolioSurface = useCallback(async () => {
-    if (!stream.canRefreshBrokerData) {
-      const mockPositions = getMockPositions();
-      setLivePositions(mockPositions);
-      setSelectedPosition((current) => current ?? mockPositions[0] ?? null);
-      setFunds({
-        cash_balance: 325000,
-        utilized_margin: 84500,
-        available_margin: 240500,
-      });
-      setOrders([]);
-      setTrades([]);
-      return;
-    }
-
-    if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) {
-      const mockPositions = getMockPositions();
-      setLivePositions(mockPositions);
-      setSelectedPosition((current) => current ?? mockPositions[0] ?? null);
-      setFunds({
-        cash_balance: 325000,
-        utilized_margin: 84500,
-        available_margin: 240500,
-      });
-      setOrders([]);
-      setTrades([]);
-      return;
-    }
-
-    setIsRefreshing(true);
     try {
-      const [positionsResult, fundsResult, ordersResult, tradesResult] = await Promise.all([
-        brokerGatewayClient.portfolio.fetchPositions(session),
-        brokerGatewayClient.portfolio.fetchFunds(session),
-        brokerGatewayClient.portfolio.fetchOrders(session),
-        brokerGatewayClient.portfolio.fetchTrades(session),
+      await Promise.all([
+        positionsQuery.refetch(),
+        fundsQuery.refetch(),
+        ordersQuery.refetch(),
+        tradesQuery.refetch(),
       ]);
-
-      if (positionsResult.ok && positionsResult.data) {
-        const mapped = mapBreezePositions(positionsResult.data);
-        setLivePositions(mapped);
-        setSelectedPosition((current) => mapped.find((position) => position.id === current?.id) ?? mapped[0] ?? null);
-      }
-      if (fundsResult.ok && fundsResult.data) setFunds(fundsResult.data);
-      if (ordersResult.ok) setOrders(ordersResult.data);
-      if (tradesResult.ok) setTrades(tradesResult.data);
     } catch (error) {
       notify({
         title: 'Portfolio refresh failed',
         message: error instanceof Error ? error.message : String(error),
         tone: 'error',
       });
-    } finally {
-      setIsRefreshing(false);
     }
-  }, [notify, session, stream.canRefreshBrokerData]);
+  }, [fundsQuery, notify, ordersQuery, positionsQuery, tradesQuery]);
 
   const refreshPositions = useCallback(async () => {
     await refreshPortfolioSurface();
