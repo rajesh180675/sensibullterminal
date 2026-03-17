@@ -1,16 +1,35 @@
+import { useEffect } from 'react';
+import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom';
 import { AppProviders } from './app/AppProviders';
+import { normalizeWorkspacePath } from './app/router';
 import { AppShell } from './app/shell/AppShell';
-import { useWorkspaceRoute } from './app/useWorkspaceRoute';
+import { useWorkspaceStore } from './state/workspace/workspaceStore';
 
 function AppRoot() {
-  const { path, navigate } = useWorkspaceRoute();
-  return <AppShell currentPath={path} onNavigate={navigate} />;
+  const location = useLocation();
+  const navigate = useNavigate();
+  const currentPath = normalizeWorkspacePath(location.pathname);
+  const setActivePath = useWorkspaceStore((state) => state.setActivePath);
+
+  useEffect(() => {
+    setActivePath(currentPath);
+  }, [currentPath, setActivePath]);
+
+  useEffect(() => {
+    if (location.pathname !== currentPath) {
+      navigate(`${currentPath}${location.hash}`, { replace: true });
+    }
+  }, [currentPath, location.hash, location.pathname, navigate]);
+
+  return <AppShell currentPath={currentPath} onNavigate={(path) => navigate(path)} />;
 }
 
 export function App() {
   return (
-    <AppProviders>
-      <AppRoot />
-    </AppProviders>
+    <BrowserRouter>
+      <AppProviders>
+        <AppRoot />
+      </AppProviders>
+    </BrowserRouter>
   );
 }

@@ -1,8 +1,9 @@
 import { Cable, ShieldCheck } from 'lucide-react';
+import { TruthPill } from '../../components/TruthPill';
 import { useSessionStore } from '../../domains/session/sessionStore';
 
 export function ConnectionsWorkspace({ onOpenConnections }: { onOpenConnections: () => void }) {
-  const { session, capabilities, health, openConnectionCenter } = useSessionStore();
+  const { session, capabilities, health, statusTruth, openConnectionCenter } = useSessionStore();
 
   return (
     <div className="grid h-full gap-4 p-4 xl:grid-cols-[1.1fr,0.9fr]">
@@ -14,6 +15,10 @@ export function ConnectionsWorkspace({ onOpenConnections }: { onOpenConnections:
         <div className="mt-4 rounded-3xl bg-white/5 p-4 text-sm text-slate-300">
           <div>Proxy: {session?.proxyBase || 'No active broker session'}</div>
           <div className="mt-2">Status: {health.backendMessage}</div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <TruthPill descriptor={health} />
+            <TruthPill descriptor={statusTruth} compact />
+          </div>
         </div>
         <button
           onClick={() => {

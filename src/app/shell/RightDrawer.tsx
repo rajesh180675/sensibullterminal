@@ -1,4 +1,5 @@
 import { Activity, Cable, Radar, ShieldCheck } from 'lucide-react';
+import { TruthPill } from '../../components/TruthPill';
 import { useSessionStore } from '../../domains/session/sessionStore';
 
 const toneClass = {
@@ -10,7 +11,7 @@ const toneClass = {
 } as const;
 
 export function RightDrawer() {
-  const { session, health, capabilities } = useSessionStore();
+  const { session, health, capabilities, statusTruth } = useSessionStore();
 
   return (
     <aside className="hidden w-[320px] flex-col border-l border-white/8 bg-[#09111f]/95 p-4 xl:flex">
@@ -21,6 +22,10 @@ export function RightDrawer() {
         </div>
         <div className={`mt-3 rounded-2xl border px-3 py-2 text-sm ${toneClass[health.streamStatus]}`}>
           Stream {health.streamStatus}
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <TruthPill descriptor={health} />
+          <TruthPill descriptor={statusTruth} compact />
         </div>
         <div className="mt-3 space-y-2 text-sm text-slate-300">
           <div className="flex items-center justify-between">

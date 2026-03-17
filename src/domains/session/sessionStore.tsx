@@ -1,6 +1,8 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { truthDescriptor, type TruthDescriptor } from '../../lib/truth';
 import type { BreezeSession } from '../../types/index';
 import { brokerGatewayClient, type BrokerCapabilities, type BrokerHealthSnapshot } from '../../services/broker/brokerGatewayClient';
+import { terminalEventBus } from '../../services/streaming/eventBus';
 import { useNotificationStore } from '../../stores/notificationStore';
 import type { WsStatus } from '../../utils/breezeWs';
 
@@ -11,6 +13,7 @@ interface SessionStoreValue {
   statusMessage: string;
   capabilities: BrokerCapabilities;
   health: BrokerHealthSnapshot;
+  statusTruth: TruthDescriptor;
   isLive: boolean;
   openConnectionCenter: () => void;
   closeConnectionCenter: () => void;
@@ -29,11 +32,15 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   const [showConnectionCenter, setShowConnectionCenter] = useState(false);
   const [wsStatus, setWsStatusState] = useState<WsStatus>('disconnected');
   const [statusMessage, setStatusMessage] = useState('Demo mode');
+  const [statusTruth, setStatusTruth] = useState<TruthDescriptor>(() => truthDescriptor('analytical', 'demo_mode'));
   const [health, setHealth] = useState<BrokerHealthSnapshot>({
     backendReachable: false,
     backendMessage: 'Disconnected',
     backendConnected: false,
     streamStatus: 'disconnected',
+    authority: 'broker',
+    source: 'session_disconnected',
+    asOf: Date.now(),
   });
 
   const capabilities = useMemo(() => brokerGatewayClient.session.capabilities(session), [session]);
@@ -43,6 +50,21 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     const token = brokerGatewayClient.session.extractApiSession();
     if (token) setShowConnectionCenter(true);
   }, []);
+
+  useEffect(() => terminalEventBus.on('stream:status', ({ status, transport, at }) => {
+    setWsStatusState(status);
+    setHealth((current) => ({
+      ...current,
+      streamStatus: status,
+      asOf: at,
+      source: transport === 'websocket' ? 'stream_status_ws' : transport === 'polling' ? 'stream_status_polling' : 'stream_status_system',
+    }));
+    setStatusTruth(truthDescriptor(
+      transport === 'system' && status === 'disconnected' ? 'analytical' : 'broker',
+      transport === 'websocket' ? 'stream_status_ws' : transport === 'polling' ? 'stream_status_polling' : 'stream_status_system',
+      at,
+    ));
+  }), []);
 
   const refreshHealth = useCallback(async () => {
     const next = await brokerGatewayClient.session.checkHealth(session, wsStatus);
@@ -55,7 +77,12 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
   const setWsStatus = useCallback((status: WsStatus) => {
     setWsStatusState(status);
-    setHealth((current) => ({ ...current, streamStatus: status }));
+    setHealth((current) => ({
+      ...current,
+      streamStatus: status,
+      asOf: Date.now(),
+      source: 'session_store_override',
+    }));
   }, []);
 
   const connectSession = useCallback(async (nextSession: BreezeSession) => {
@@ -63,6 +90,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     setSession(nextSession);
     setShowConnectionCenter(false);
     setStatusMessage('Connected. Initializing broker workspace...');
+    setStatusTruth(truthDescriptor('broker', 'session_connected'));
     notify({
       title: 'Session connected',
       message: nextSession.proxyBase,
@@ -75,6 +103,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     setSession(null);
     setWsStatusState('disconnected');
     setStatusMessage('Disconnected');
+    setStatusTruth(truthDescriptor('analytical', 'session_disconnected'));
     notify({
       title: 'Session disconnected',
       message: 'Terminal returned to demo mode.',
@@ -87,6 +116,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     showConnectionCenter,
     wsStatus,
     statusMessage,
+    statusTruth,
     capabilities,
     health,
     isLive,
@@ -97,7 +127,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     setWsStatus,
     setStatusMessage,
     refreshHealth,
-  }), [session, showConnectionCenter, wsStatus, statusMessage, capabilities, health, isLive, connectSession, disconnectSession, setWsStatus, refreshHealth]);
+  }), [session, showConnectionCenter, wsStatus, statusMessage, statusTruth, capabilities, health, isLive, connectSession, disconnectSession, setWsStatus, refreshHealth]);
 
   return <SessionStore.Provider value={value}>{children}</SessionStore.Provider>;
 }

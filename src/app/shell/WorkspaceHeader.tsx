@@ -1,4 +1,6 @@
 import { Command, RefreshCw, Sparkles, Wifi, WifiOff } from 'lucide-react';
+import { TruthPill } from '../../components/TruthPill';
+import type { TruthDescriptor } from '../../lib/truth';
 import { ALL_SYMBOLS, SYMBOL_CONFIG } from '../../config/market';
 import type { MarketIndex, SymbolCode } from '../../types/index';
 import { WORKSPACE_ROUTE_BY_PATH, type WorkspacePath } from '../router';
@@ -10,9 +12,12 @@ export function WorkspaceHeader({
   onOpenConnections,
   onRefresh,
   statusMessage,
+  statusTruth,
   isLive,
   lastUpdate,
   liveIndices,
+  spotTruth,
+  chainTruth,
 }: {
   currentPath: WorkspacePath;
   symbol: SymbolCode;
@@ -20,9 +25,12 @@ export function WorkspaceHeader({
   onOpenConnections: () => void;
   onRefresh: () => void;
   statusMessage: string;
+  statusTruth: TruthDescriptor;
   isLive: boolean;
   lastUpdate: Date;
   liveIndices: MarketIndex[];
+  spotTruth: TruthDescriptor;
+  chainTruth: TruthDescriptor;
 }) {
   const route = WORKSPACE_ROUTE_BY_PATH[currentPath];
 
@@ -40,6 +48,8 @@ export function WorkspaceHeader({
             <span className={`rounded-full px-3 py-1 text-xs font-medium ${isLive ? 'bg-emerald-500/12 text-emerald-200' : 'bg-amber-500/12 text-amber-200'}`}>
               {isLive ? 'Live broker path' : 'Preview mode'}
             </span>
+            <TruthPill descriptor={spotTruth} compact />
+            <TruthPill descriptor={chainTruth} compact />
           </div>
           <p className="mt-2 max-w-3xl text-sm text-slate-400">{route.subtitle}</p>
         </div>
@@ -101,6 +111,9 @@ export function WorkspaceHeader({
               Desk Notes
             </div>
             <div className="mt-2 text-sm text-white">{statusMessage}</div>
+            <div className="mt-2">
+              <TruthPill descriptor={statusTruth} compact />
+            </div>
             <div className="mt-2 flex items-center gap-2 text-xs text-slate-400">
               <Command size={12} />
               `Ctrl+K` palette · `Shift+C` connections

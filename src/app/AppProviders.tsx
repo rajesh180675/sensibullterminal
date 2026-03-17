@@ -1,4 +1,5 @@
 import React from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { AdjustmentProvider } from '../domains/adjustment/adjustmentStore';
 import { AutomationProvider } from '../domains/automation/automationStore';
 import { SessionProvider } from '../domains/session/sessionStore';
@@ -8,30 +9,33 @@ import { ExecutionProvider } from '../domains/execution/executionStore';
 import { JournalProvider } from '../domains/journal/journalStore';
 import { RiskProvider } from '../domains/risk/riskStore';
 import { SellerIntelligenceProvider } from '../domains/seller/sellerIntelligenceStore';
+import { terminalQueryClient } from '../services/api/queryClient';
 import { NotificationProvider } from '../stores/notificationStore';
 
 export function AppProviders({ children }: { children: React.ReactNode }) {
   return (
-    <NotificationProvider>
-      <SessionProvider>
-        <MarketProvider>
-          <PortfolioProvider>
-            <ExecutionProvider>
-              <RiskProvider>
-                <SellerIntelligenceProvider>
-                  <JournalProvider>
-                    <AdjustmentProvider>
-                      <AutomationProvider>
-                        {children}
-                      </AutomationProvider>
-                    </AdjustmentProvider>
-                  </JournalProvider>
-                </SellerIntelligenceProvider>
-              </RiskProvider>
-            </ExecutionProvider>
-          </PortfolioProvider>
-        </MarketProvider>
-      </SessionProvider>
-    </NotificationProvider>
+    <QueryClientProvider client={terminalQueryClient}>
+      <NotificationProvider>
+        <SessionProvider>
+          <MarketProvider>
+            <PortfolioProvider>
+              <ExecutionProvider>
+                <RiskProvider>
+                  <SellerIntelligenceProvider>
+                    <JournalProvider>
+                      <AdjustmentProvider>
+                        <AutomationProvider>
+                          {children}
+                        </AutomationProvider>
+                      </AdjustmentProvider>
+                    </JournalProvider>
+                  </SellerIntelligenceProvider>
+                </RiskProvider>
+              </ExecutionProvider>
+            </PortfolioProvider>
+          </MarketProvider>
+        </SessionProvider>
+      </NotificationProvider>
+    </QueryClientProvider>
   );
 }

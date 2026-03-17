@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { PanelsTopLeft } from 'lucide-react';
+import { useWorkspaceStore } from '../../state/workspace/workspaceStore';
 import { WORKSPACE_ROUTE_BY_PATH, type WorkspacePath } from '../router';
 
 function readHash() {
@@ -9,25 +10,26 @@ function readHash() {
 export function WorkspaceSubnav({ currentPath }: { currentPath: WorkspacePath }) {
   const route = WORKSPACE_ROUTE_BY_PATH[currentPath];
   const sections = route.sections;
-  const [activeSection, setActiveSection] = useState(sections[0]?.id ?? '');
+  const activeSection = useWorkspaceStore((state) => state.activeSectionByPath[currentPath] ?? sections[0]?.id ?? '');
+  const setActiveSection = useWorkspaceStore((state) => state.setActiveSection);
 
   useEffect(() => {
     const syncFromHash = () => {
       const hash = readHash();
-      setActiveSection(hash || sections[0]?.id || '');
+      setActiveSection(currentPath, hash || sections[0]?.id || '');
     };
 
     syncFromHash();
     window.addEventListener('hashchange', syncFromHash);
     return () => window.removeEventListener('hashchange', syncFromHash);
-  }, [currentPath, sections]);
+  }, [currentPath, sections, setActiveSection]);
 
   if (sections.length === 0) {
     return null;
   }
 
   const navigateToSection = (id: string) => {
-    setActiveSection(id);
+    setActiveSection(currentPath, id);
     const nextUrl = `${window.location.pathname}#${id}`;
     window.history.replaceState({}, '', nextUrl);
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });

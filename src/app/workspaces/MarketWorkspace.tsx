@@ -11,6 +11,7 @@ import {
   TrendingUp,
 } from 'lucide-react';
 import { OptionChain } from '../../components/OptionChain';
+import { TruthPill } from '../../components/TruthPill';
 import { ALL_SYMBOLS, SYMBOL_CONFIG } from '../../config/market';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
@@ -26,6 +27,8 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
     chain,
     spotPrice,
     lastUpdate,
+    spotTruth,
+    chainTruth,
     isLoading,
     chainError,
     refreshMarket,
@@ -104,6 +107,10 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
                 <div className="text-slate-500">Updated</div>
                 <div className="mt-1 text-sm font-semibold text-white">{lastUpdate.toLocaleTimeString('en-IN')}</div>
               </div>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <TruthPill descriptor={spotTruth} />
+              <TruthPill descriptor={chainTruth} />
             </div>
           </div>
 
@@ -220,6 +227,8 @@ export function MarketWorkspace({ onOpenStrategy }: { onOpenStrategy: () => void
               <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-slate-300">
                 {expiry.label}
               </span>
+              <TruthPill descriptor={spotTruth} compact />
+              <TruthPill descriptor={chainTruth} compact />
               <span className={`rounded-full px-3 py-2 ${depthReady ? 'bg-emerald-500/12 text-emerald-200' : 'bg-amber-500/12 text-amber-200'}`}>
                 {depthReady ? 'Depth linked' : 'Depth awaiting backend'}
               </span>

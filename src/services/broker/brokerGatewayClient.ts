@@ -1,4 +1,5 @@
 import { SYMBOL_CONFIG } from '../../config/market';
+import type { TruthAuthority } from '../../lib/truth';
 import type { BreezeSession, SymbolCode } from '../../types/index';
 import { extractApiSession, placeLegOrder, validateSession } from '../../utils/breezeClient';
 import {
@@ -44,6 +45,9 @@ export interface BrokerHealthSnapshot {
   backendMessage: string;
   backendConnected: boolean;
   streamStatus: 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'error';
+  authority: TruthAuthority;
+  source: string;
+  asOf: number;
 }
 
 export const brokerGatewayClient = {
@@ -94,6 +98,9 @@ export const brokerGatewayClient = {
           backendMessage: 'Disconnected',
           backendConnected: false,
           streamStatus,
+          authority: 'broker',
+          source: 'session_disconnected',
+          asOf: Date.now(),
         };
       }
 
@@ -103,6 +110,9 @@ export const brokerGatewayClient = {
           backendMessage: 'Browser-direct diagnostic mode',
           backendConnected: true,
           streamStatus,
+          authority: 'analytical',
+          source: 'browser_direct_mode',
+          asOf: Date.now(),
         };
       }
 
@@ -112,6 +122,9 @@ export const brokerGatewayClient = {
         backendMessage: health.message,
         backendConnected: health.connected,
         streamStatus,
+        authority: 'broker',
+        source: 'backend_health_probe',
+        asOf: Date.now(),
       };
     },
     capabilities(session: BreezeSession | null): BrokerCapabilities {
