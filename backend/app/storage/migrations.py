@@ -30,6 +30,16 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS strategy_groups (
+        group_id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        status TEXT NOT NULL,
+        legs_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS workspace_layouts (
         layout_id TEXT PRIMARY KEY,
         workspace_id TEXT NOT NULL,

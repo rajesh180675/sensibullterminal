@@ -10,7 +10,6 @@ export class UnifiedStreamingManager {
     onTick: (update: TickUpdate) => void = () => undefined,
     onStatus: (status: WsStatus) => void = () => undefined,
   ): void {
-    this.disconnect();
     const publishStatus = (status: WsStatus, transport: StreamTransport) => {
       terminalEventBus.emit('stream:status', {
         status,
@@ -33,6 +32,10 @@ export class UnifiedStreamingManager {
     }, (status) => {
       publishStatus(status, 'websocket');
       if (status === 'error') {
+        if (this.stopPolling) {
+          this.stopPolling();
+          this.stopPolling = null;
+        }
         this.stopPolling = startTickPolling(backendUrl, (update) => {
           publishStatus('connected', 'polling');
           publishTick(update, 'polling');

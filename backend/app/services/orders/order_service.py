@@ -51,7 +51,28 @@ class OrderService:
         if self.workflow is None:
             raise RuntimeError("Execution workflow is not configured")
         results = self.workflow.place_strategy_order(legs)
-        return {"success": all(result["success"] for result in results), "results": results}
+        success = all(result["success"] for result in results)
+
+        # If strategy was placed successfully, group it in the DB
+        if success and legs:
+            import json
+            import uuid
+            group_id = f"sg_{uuid.uuid4().hex[:8]}"
+            symbol = legs[0].get("stock_code", "UNKNOWN")
+
+            try:
+                self.engine.db.execute(
+                    """
+                    INSERT INTO strategy_groups (group_id, symbol, status, legs_json, created_at, updated_at)
+                    VALUES (?, ?, 'open', ?, strftime('%s', 'now'), strftime('%s', 'now'))
+                    """,
+                    (group_id, symbol, json.dumps(legs))
+                )
+                self.engine.db.commit()
+            except Exception as e:
+                self.engine.log.error(f"Failed to save strategy group: {e}")
+
+        return {"success": success, "results": results}
 
     def square_off(self, payload):
         if self.workflow is None:

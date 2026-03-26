@@ -17,7 +17,7 @@ export function TruthPill({
   const tone = freshnessTone(descriptor);
 
   return (
-    <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${toneClasses[tone]}`}>
+    <span className={`inline-flex items-center gap-2 rounded-md border px-3 py-1 text-xs transition-colors duration-200 ${toneClasses[tone]}`}>
       <span>{authorityLabel(descriptor.authority)}</span>
       {!compact && <span className="text-white/60">{descriptor.source}</span>}
       <span className="text-white/60">{freshnessLabel(descriptor)}</span>

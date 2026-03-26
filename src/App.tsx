@@ -4,12 +4,15 @@ import { AppProviders } from './app/AppProviders';
 import { normalizeWorkspacePath } from './app/router';
 import { AppShell } from './app/shell/AppShell';
 import { useTerminalStore } from './state/terminal/terminalStore';
+import { useGlobalKeyboard } from './hooks/useGlobalKeyboard';
 
 function AppRoot() {
   const location = useLocation();
   const navigate = useNavigate();
   const currentPath = normalizeWorkspacePath(location.pathname);
   const setActivePath = useTerminalStore((state) => state.setActivePath);
+
+  useGlobalKeyboard();
 
   useEffect(() => {
     setActivePath(currentPath);

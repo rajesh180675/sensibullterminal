@@ -122,21 +122,53 @@ class RealtimeManager:
             self.start_websocket()
             time.sleep(2)
 
-        count = 0
-        errors: list[str] = []
+        # 1. Compute desired subscriptions
+        desired_subs: set[str] = set()
         for strike in strikes:
             for right in rights:
                 right_norm = "Call" if right.lower().startswith("c") else "Put"
                 sub_key = f"{stock_code}:{strike}:{right_norm[0]}E:{expiry_date}"
-                if sub_key in self.engine.subscribed:
-                    continue
-                try:
+                desired_subs.add(sub_key)
+
+        # 2. Identify what to add and what to remove
+        current_subs: set[str] = self.engine.subscribed
+        to_add = desired_subs - current_subs
+        to_remove = current_subs - desired_subs
+
+        # 3. Unsubscribe old feeds (Intelligent diffing to respect 100-channel limit)
+        for sub_key in to_remove:
+            try:
+                parts = sub_key.split(":")
+                if len(parts) >= 4:
+                    stock, strike, right_abbr, expiry = parts
+                    right = "Call" if right_abbr.startswith("C") else "Put"
+                    self.engine.broker_client.unsubscribe_feeds(
+                        stock_code=stock,
+                        exchange_code="NFO" if stock == "NIFTY" else "BFO",
+                        product_type="options",
+                        expiry_date=expiry,
+                        strike_price=strike,
+                        right=right,
+                    )
+                self.engine.subscribed.discard(sub_key)
+            except Exception as exc:
+                self.engine.log.warning(f"[WS] Failed to unsubscribe {sub_key}: {exc}")
+
+        # 4. Subscribe to new feeds
+        count = 0
+        errors: list[str] = []
+        for sub_key in to_add:
+            try:
+                parts = sub_key.split(":")
+                if len(parts) >= 4:
+                    stock, strike, right_abbr, expiry = parts
+                    right_norm = "Call" if right_abbr.startswith("C") else "Put"
                     self.engine.broker_client.subscribe_feeds(
-                        stock_code=stock_code,
+                        stock_code=stock,
                         exchange_code=exchange_code,
                         product_type="options",
-                        expiry_date=expiry_date,
-                        strike_price=str(strike),
+                        expiry_date=expiry,
+                        strike_price=strike,
                         right=right_norm,
                         get_exchange_quotes=True,
                         get_market_depth=True,
@@ -144,10 +176,10 @@ class RealtimeManager:
                     self.engine.subscribed.add(sub_key)
                     count += 1
                     time.sleep(0.05)
-                except Exception as exc:
-                    errors.append(f"{sub_key}: {exc}")
+            except Exception as exc:
+                errors.append(f"{sub_key}: {exc}")
 
-        return {"subscribed": count, "total_subs": len(self.engine.subscribed), "errors": errors}
+        return {"subscribed": count, "unsubscribed": len(to_remove), "total_subs": len(self.engine.subscribed), "errors": errors}
 
     def unsubscribe_all(self) -> None:
         if not self.engine.ws_running or not self.engine.broker_client:

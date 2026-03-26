@@ -111,10 +111,28 @@ export class BreezeWsClient {
   // ── Public API ─────────────────────────────────────────────────────────────
 
   connect(backendUrl: string, onTick: TickCallback, onStatus: StatusCallback): void {
+    const isSameUrl = this.backendUrl === backendUrl;
+
+    // React StrictMode Double-Connect Guard:
+    // If we're already connecting or connected to the same URL, just swap callbacks and return.
+    if (isSameUrl && (this.isConnecting || this.isConnected())) {
+      this.onTick = onTick;
+      this.onStatus = onStatus;
+      this.onStatus(this.status); // Immediately inform the new caller of our current state
+      return;
+    }
+
     this.backendUrl = backendUrl;
     this.onTick     = onTick;
     this.onStatus   = onStatus;
     this.stopped    = false;
+
+    // Ensure any existing connection is closed before starting fresh
+    if (this.ws) {
+      try { this.ws.close(); } catch { /* ignore */ }
+      this.ws = null;
+    }
+
     this._connect();
   }
 

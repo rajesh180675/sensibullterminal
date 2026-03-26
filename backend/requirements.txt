@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+breeze-connect
+websockets
+pydantic
+pytest
+httpx

@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      # Mount the app folder for hot-reloading in dev if needed
+      # - ./backend/app:/app/app
+    environment:
+      - DATABASE_URL=sqlite:////data/terminal.db
+      - ENVIRONMENT=production
+    restart: unless-stopped
