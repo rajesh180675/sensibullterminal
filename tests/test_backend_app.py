@@ -7,6 +7,9 @@ from fastapi.testclient import TestClient
 
 from backend.app.core.state import BackendState
 from backend.app.create_app import create_app
+from backend.app.services.market.market_data_service import MarketDataService
+from backend.app.services.market.market_service import MarketService
+from backend.app.services.orders.order_service import OrderService
 from backend.app.storage.audit_log_repo import AuditLogRepository
 from backend.app.storage.database import init_sqlite
 from backend.app.storage.layout_repo import LayoutRepository
@@ -109,7 +112,12 @@ class FakeTickStore:
         }]
 
     def get_spot_prices(self):
-        return {"NIFTY": 22105.4}
+        result = {}
+        for key, tick in self.ticks.items():
+            parts = key.split(":")
+            if len(parts) == 2 and parts[1] == "SPOT":
+                result[parts[0]] = tick.get("ltp", 0)
+        return result
 
 
 class FakeCandleStore:
@@ -141,11 +149,25 @@ class FakeRateLimiter:
     calls_last_minute = 3
     queue_depth = 0
 
+    def enqueue(self, fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
 
 class FakeBreeze:
     def get_quotes(self, **kwargs):
         _ = kwargs
         return {"Success": [{"ltp": 22105.4}]}
+
+
+class FakeBrokerClient:
+    def __init__(self, quotes=None):
+        self.quotes = quotes if quotes is not None else {"Success": [{"ltp": 22105.4}]}
+
+    def get_quotes(self, **kwargs):
+        _ = kwargs
+        if isinstance(self.quotes, Exception):
+            raise self.quotes
+        return self.quotes
 
 
 class FakeEngine:
@@ -160,6 +182,10 @@ class FakeEngine:
         self.candle_store = FakeCandleStore()
         self.validation_capture = FakeValidationCapture()
         self.breeze = FakeBreeze()
+        self.broker_client = FakeBrokerClient()
+        self.market_data_service = self
+        self.execution_workflow = self
+        self.realtime_manager = self
 
     def connect(self, api_key, api_secret, session_token):
         return {
@@ -407,3 +433,87 @@ def test_sqlite_layout_recovery_and_error_cases(tmp_path):
 
     missing_delete = client.delete("/api/layouts/does-not-exist")
     assert missing_delete.status_code == 404
+
+
+def test_market_service_returns_error_when_spot_quote_is_unusable():
+    engine = FakeEngine()
+    engine.broker_client = FakeBrokerClient({"Success": [{"ltp": 0, "close": 0}]})
+    engine.tick_store.ticks = {}
+    engine.market_data_service = None
+    service = MarketService(engine)
+    service.market_data = engine.market_data_service = MarketDataService(engine)
+
+    payload = service.get_spot("NIFTY", "NSE")
+
+    assert payload["success"] is False
+    assert "No spot price returned" in payload["error"]
+
+
+def test_market_service_returns_broker_error_when_quote_call_raises():
+    engine = FakeEngine()
+    engine.broker_client = FakeBrokerClient(RuntimeError("quote failure"))
+    engine.tick_store.ticks = {}
+    engine.market_data_service = None
+    service = MarketService(engine)
+    service.market_data = engine.market_data_service = MarketDataService(engine)
+
+    payload = service.get_spot("NIFTY", "NSE")
+
+    assert payload == {"success": False, "error": "quote failure"}
+
+
+class FakeExecutionWorkflow:
+    def __init__(self, *, preview_error=None, place_results=None):
+        self.preview_error = preview_error
+        self.place_results = place_results if place_results is not None else [{"success": True, "order_id": "OID-1", "error": ""}]
+
+    def preview_strategy(self, legs):
+        if self.preview_error:
+            raise self.preview_error
+        return {"estimatedPremium": float(len(legs))}
+
+    def calculate_margin(self, legs):
+        return {
+            "margin_required": float(len(legs)) * 1000.0,
+            "available_margin": 50000.0,
+            "span_margin": 800.0,
+            "block_trade_margin": 200.0,
+            "order_margin": 1000.0,
+            "trade_margin": 950.0,
+            "validation": {"kind": "margin"},
+        }
+
+    def repair_preview(self, current_legs, repair_legs, meta):
+        return {"current": current_legs, "repair": repair_legs, "meta": meta}
+
+    def place_strategy_order(self, legs):
+        _ = legs
+        return self.place_results
+
+    def square_off_position(self, payload):
+        _ = payload
+        return {"Status": 500, "Error": "square off rejected"}
+
+
+def test_order_service_handles_failed_place_and_empty_execution_results():
+    engine = FakeEngine()
+    engine.execution_workflow = FakeExecutionWorkflow(place_results=[])
+    service = OrderService(engine)
+
+    result = service.place_order({"stock_code": "NIFTY"})
+
+    assert result["success"] is False
+    assert result["error"] == "No execution result returned"
+
+
+def test_preview_route_surfaces_execution_workflow_errors(tmp_path):
+    connection = init_sqlite(tmp_path / "preview-error.db")
+    engine = FakeEngine()
+    engine.execution_workflow = FakeExecutionWorkflow(preview_error=RuntimeError("preview exploded"))
+    state = BackendState(engine=engine, version="test", sqlite_connection=connection)
+    client = TestClient(create_app(state))
+
+    response = client.post("/api/preview", json={"legs": [{"stock_code": "NIFTY"}]})
+
+    assert response.status_code == 200
+    assert response.json() == {"success": False, "error": "preview exploded"}

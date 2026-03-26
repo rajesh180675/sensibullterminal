@@ -8,6 +8,7 @@ class StreamService:
     def __init__(self, engine: Any, tick_store_facade: Any):
         self.engine = engine
         self.tick_store_facade = tick_store_facade
+        self.realtime = getattr(engine, "realtime_manager", None)
 
     def subscribe_option_chain(
         self,
@@ -17,8 +18,10 @@ class StreamService:
         strikes: list[int | float | str],
         rights: list[str],
     ):
-        self.engine.unsubscribe_all()
-        return self.engine.subscribe_option_chain(stock_code, exchange_code, expiry_date, strikes, rights)
+        if self.realtime is None:
+            raise RuntimeError("Realtime manager is not configured")
+        self.realtime.unsubscribe_all()
+        return self.realtime.subscribe_option_chain(stock_code, exchange_code, expiry_date, strikes, rights)
 
     def build_heartbeat_payload(self):
         return {

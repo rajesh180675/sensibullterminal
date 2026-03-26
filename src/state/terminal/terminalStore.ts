@@ -4,6 +4,12 @@ import type { WorkspacePath } from '../../app/router';
 import type { SymbolCode } from '../../types/index';
 
 export type KeyboardMode = 'normal' | 'chain' | 'ticket' | 'command';
+export interface PersistedTerminalWorkspaceState {
+  activePath: WorkspacePath;
+  activeSectionByPath: Partial<Record<WorkspacePath, string>>;
+  linkedSymbol: SymbolCode;
+  stagedSourceId: string | null;
+}
 
 interface TerminalStoreState {
   activePath: WorkspacePath;
@@ -20,11 +26,13 @@ interface TerminalStoreState {
   setKeyboardMode: (mode: KeyboardMode) => void;
   setCommandPaletteOpen: (open: boolean) => void;
   toggleCommandPalette: () => void;
+  hydrateWorkspaceState: (state: Partial<PersistedTerminalWorkspaceState>) => void;
+  snapshotWorkspaceState: () => PersistedTerminalWorkspaceState;
 }
 
 export const useTerminalStore = create<TerminalStoreState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       activePath: '/market',
       activeSectionByPath: {},
       lastVisitedAtByPath: {},
@@ -59,14 +67,27 @@ export const useTerminalStore = create<TerminalStoreState>()(
           keyboardMode: nextOpen ? 'command' : 'normal',
         };
       }),
+      hydrateWorkspaceState: (payload) => set((state) => ({
+        activePath: payload.activePath ?? state.activePath,
+        activeSectionByPath: payload.activeSectionByPath && typeof payload.activeSectionByPath === 'object'
+          ? payload.activeSectionByPath
+          : state.activeSectionByPath,
+        linkedSymbol: payload.linkedSymbol ?? state.linkedSymbol,
+        stagedSourceId: payload.stagedSourceId ?? state.stagedSourceId,
+      })),
+      snapshotWorkspaceState: (): PersistedTerminalWorkspaceState => {
+        const state = get();
+        return {
+          activePath: state.activePath,
+          activeSectionByPath: state.activeSectionByPath,
+          linkedSymbol: state.linkedSymbol,
+          stagedSourceId: state.stagedSourceId,
+        };
+      },
     }),
     {
       name: 'terminal-state',
-      partialize: (state) => ({
-        activePath: state.activePath,
-        activeSectionByPath: state.activeSectionByPath,
-        linkedSymbol: state.linkedSymbol,
-      }),
+      partialize: (state) => state.snapshotWorkspaceState(),
     },
   ),
 );

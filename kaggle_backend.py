@@ -45,7 +45,10 @@ from backend.app.clients.breeze import BreezeBrokerClient
 from backend.app.create_app import create_app
 from backend.app.core.state import BackendState
 from backend.app.services.automation.manager import AutomationRuleManager
+from backend.app.services.market.market_data_service import MarketDataService
+from backend.app.services.orders.execution_workflow import ExecutionWorkflow
 from backend.app.services.review.review_state_manager import SellerReviewManager
+from backend.app.services.streaming.realtime_manager import RealtimeManager
 from backend.app.services.streaming.tick_store import CandleStore, TickStore, ValidationCaptureStore
 try:
     from automation_normalization import (
@@ -456,6 +459,9 @@ class BreezeEngine:
                 os.path.join(os.getcwd(), "logs", "seller_reviews.json"),
             ),
         )
+        self.market_data_service = MarketDataService(self)
+        self.execution_workflow = ExecutionWorkflow(self)
+        self.realtime_manager = RealtimeManager(self)
         self._ws_thread   = None
         self._ws_lock     = threading.Lock()
         log.info("[BreezeEngine] initialised")
@@ -546,42 +552,7 @@ class BreezeEngine:
         right: str = "Call",
         strike_price: str = "",
     ) -> List[dict]:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-
-        right_norm = "Call" if right.lower().startswith("c") else "Put"
-        log.info(f"[REST] get_option_chain_quotes {stock_code} {expiry_date} {right_norm}")
-
-        result = self.broker_client.get_option_chain_quotes(
-            stock_code=stock_code,
-            exchange_code=exchange_code,
-            product_type="options",
-            expiry_date=expiry_date,
-            right=right_norm,
-            strike_price=strike_price,
-        )
-        rows   = result.get("Success") if isinstance(result, dict) else []
-
-        if rows:
-            suffix = "CE" if right_norm == "Call" else "PE"
-            for row in rows:
-                try:
-                    strike = str(int(float(
-                        row.get("strike_price") or row.get("strike-price") or 0
-                    )))
-                    key = f"{stock_code}:{strike}:{suffix}"
-                    self.tick_store.update(key, {
-                        "ltp":    float(row.get("ltp")             or row.get("last_traded_price")    or 0),
-                        "oi":     float(row.get("open_interest")   or row.get("open-interest")        or 0),
-                        "volume": float(row.get("total_quantity_traded") or row.get("total-quantity-traded") or 0),
-                        "iv":     float(row.get("implied_volatility") or row.get("implied-volatility") or 0),
-                        "bid":    float(row.get("best_bid_price")  or row.get("best-bid-price")       or 0),
-                        "ask":    float(row.get("best_offer_price") or row.get("best-offer-price")    or 0),
-                    })
-                except Exception as exc:
-                    log.debug(f"seed tick error: {exc}")
-
-        return rows or []
+        return self.market_data_service.fetch_option_chain(stock_code, exchange_code, expiry_date, right, strike_price)
 
     # ── REST: Single Quote ────────────────────────────────────────────────────
 
@@ -593,17 +564,7 @@ class BreezeEngine:
         right: str,
         strike_price: str,
     ) -> dict:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-
-        return self.broker_client.get_quotes(
-            stock_code=stock_code,
-            exchange_code=exchange_code,
-            expiry_date=expiry_date,
-            right=right,
-            strike_price=strike_price,
-            product_type="options",
-        )
+        return self.market_data_service.get_quote(stock_code, exchange_code, expiry_date, right, strike_price)
 
     # ── REST: Orders ──────────────────────────────────────────────────────────
 
@@ -632,47 +593,10 @@ class BreezeEngine:
         )
 
     def place_strategy_order(self, legs: List[dict]) -> List[dict]:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-
-        results      = []
-        threads      = []
-        results_lock = threading.Lock()
-
-        def place_one(leg: dict, idx: int):
-            try:
-                r   = self.place_order(leg)
-                ok  = isinstance(r, dict) and r.get("Status") == 200
-                oid = (r.get("Success") or {}).get("order_id", "") if ok else ""
-                with results_lock:
-                    results.append({
-                        "leg_index": idx,
-                        "success":   ok,
-                        "order_id":  oid,
-                        "error":     r.get("Error", "") if not ok else "",
-                        "raw":       r,
-                    })
-            except Exception as exc:
-                with results_lock:
-                    results.append({"leg_index": idx, "success": False, "error": str(exc)})
-
-        for i, leg in enumerate(legs):
-            t = threading.Thread(target=place_one, args=(leg, i), daemon=True)
-            threads.append(t)
-            t.start()
-
-        for t in threads:
-            t.join(timeout=60)
-
-        results.sort(key=lambda x: x["leg_index"])
-        return results
+        return self.execution_workflow.place_strategy_order(legs)
 
     def square_off_position(self, leg: dict) -> dict:
-        original = (leg.get("action") or "buy").lower()
-        exit_leg = {**leg,
-                    "action":      "sell" if original == "buy" else "buy",
-                    "user_remark": "SquareOff_OptionsTerminal"}
-        return self.place_order(exit_leg)
+        return self.execution_workflow.square_off_position(leg)
 
     def cancel_order(self, order_id: str, exchange_code: str = "NFO") -> dict:
         if not self.connected:
@@ -763,438 +687,38 @@ class BreezeEngine:
         return result.get("Success", {}) if isinstance(result, dict) else {}
 
     def _normalise_execution_leg(self, leg: dict) -> dict:
-        right_norm = "call" if str(leg.get("right") or "call").lower().startswith("c") else "put"
-        order_type = str(leg.get("order_type") or "market").lower()
-        return {
-            "stock_code": str(leg.get("stock_code", "")),
-            "exchange_code": str(leg.get("exchange_code", "NFO")),
-            "product": str(leg.get("product", "options")),
-            "action": str(leg.get("action", "buy")).lower(),
-            "order_type": order_type,
-            "price": str(leg.get("price", "0") if order_type == "limit" else leg.get("price", "0")),
-            "quantity": str(leg.get("quantity", "0")),
-            "expiry_date": str(leg.get("expiry_date", "")),
-            "right": right_norm,
-            "strike_price": str(leg.get("strike_price", "0")),
-            "stoploss": str(leg.get("stoploss", "0")),
-        }
+        return self.execution_workflow.normalise_execution_leg(leg)
 
     def _extract_success_payload(self, result: dict) -> dict:
-        if not isinstance(result, dict):
-            return {}
-        payload = result.get("Success", result.get("success", {}))
-        if isinstance(payload, list):
-            return payload[0] if payload and isinstance(payload[0], dict) else {}
-        return payload if isinstance(payload, dict) else {}
+        return self.execution_workflow.extract_success_payload(result)
 
     def _collect_field_names(self, payload: Any) -> List[str]:
-        if isinstance(payload, dict):
-            return sorted(str(key) for key in payload.keys())
-        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-            return sorted(str(key) for key in payload[0].keys())
-        return []
+        return self.execution_workflow.collect_field_names(payload)
 
     def _record_execution_validation(self, kind: str, legs: List[dict], raw_response: Any, payload: Any) -> dict:
-        captured_at = time.time()
-        record = {
-            "kind": kind,
-            "captured_at": captured_at,
-            "leg_count": len(legs),
-            "request_legs": legs,
-            "raw_top_level_fields": self._collect_field_names(raw_response),
-            "success_fields": self._collect_field_names(payload),
-            "raw_response": raw_response,
-            "success_payload": payload,
-        }
-        try:
-            self.validation_capture.append(record)
-        except Exception as exc:
-            log.warning(f"[Engine] validation capture failed: {exc}")
-        return {
-            "kind": kind,
-            "captured_at": captured_at,
-            "leg_count": len(legs),
-            "rawTopLevelFields": record["raw_top_level_fields"],
-            "successFields": record["success_fields"],
-            "captureFile": self.validation_capture.path,
-        }
+        return self.execution_workflow.record_execution_validation(kind, legs, raw_response, payload)
 
     def _build_margin_position(self, leg: dict) -> dict:
-        normalised = self._normalise_execution_leg(leg)
-        return {
-            "strike_price": normalised["strike_price"],
-            "quantity": normalised["quantity"],
-            "right": "Call" if normalised["right"] == "call" else "Put",
-            "product": normalised["product"],
-            "action": normalised["action"].capitalize(),
-            "price": normalised["price"],
-            "stock_code": normalised["stock_code"],
-            "expiry_date": normalised["expiry_date"],
-            "fresh_order_type": normalised["order_type"].capitalize(),
-            "cover_order_flow": "N",
-            "cover_limit_rate": "",
-            "cover_sltp_price": "",
-            "fresh_limit_rate": normalised["price"],
-            "open_quantity": normalised["quantity"],
-        }
+        return self.execution_workflow.build_margin_position(leg)
 
     def _sum_known_charge_fields(self, payload: dict) -> tuple[float, float, Dict[str, float], Dict[str, Any]]:
-        exchange_turnover = _safe_float(
-            payload.get("exchange_turnover_charge") or payload.get("exchange_turnover_charges")
-        )
-        sebi_charges = _safe_float(payload.get("sebi_charges"))
-        gst = _safe_float(payload.get("gst"))
-        stt = _safe_float(payload.get("stt"))
-        stamp_duty = _safe_float(payload.get("stamp_duty"))
-        transaction_charges = _safe_float(payload.get("transaction_charges"))
-        ipft = _safe_float(payload.get("ipft"))
-        other_charges = _safe_float(payload.get("other_charges"))
-        total_tax = _safe_float(payload.get("total_tax"))
-
-        component_charges = {
-            "exchangeTurnoverCharges": exchange_turnover,
-            "sebiCharges": sebi_charges,
-            "gst": gst,
-            "stt": stt,
-            "stampDuty": stamp_duty,
-            "transactionCharges": transaction_charges,
-            "ipft": ipft,
-            "otherCharges": other_charges,
-            "totalTax": total_tax,
-        }
-        component_charges = {key: value for key, value in component_charges.items() if value > 0}
-
-        turnover_and_sebi = _safe_float(payload.get("total_turnover_and_sebi_charges"))
-        if turnover_and_sebi <= 0:
-            turnover_and_sebi = exchange_turnover + sebi_charges + transaction_charges + ipft
-
-        taxes_and_duties = total_tax
-        if taxes_and_duties <= 0:
-            taxes_and_duties = gst + stt + stamp_duty
-
-        broker_other_charges = _safe_float(payload.get("total_other_charges"))
-        if broker_other_charges <= 0:
-            broker_other_charges = turnover_and_sebi + taxes_and_duties + other_charges
-
-        brokerage = _safe_float(payload.get("brokerage"))
-        total_fees = _safe_float(payload.get("total_brokerage") or payload.get("total_charges") or payload.get("charges"))
-        if total_fees <= 0:
-            total_fees = brokerage + broker_other_charges
-
-        charges = {
-            "brokerage": brokerage,
-            "brokerReportedTurnoverAndSebiCharges": turnover_and_sebi,
-            "brokerReportedOtherCharges": broker_other_charges,
-            "taxesAndDuties": taxes_and_duties,
-            "totalFees": total_fees,
-            **component_charges,
-        }
-        charges = {key: value for key, value in charges.items() if value > 0}
-
-        charge_summary = {
-            "brokerage": brokerage,
-            "brokerReportedOtherCharges": broker_other_charges,
-            "brokerReportedTurnoverAndSebiCharges": turnover_and_sebi,
-            "taxesAndDuties": taxes_and_duties,
-            "totalFees": total_fees,
-            "componentCharges": component_charges,
-            "calculationMode": "broker_rollup"
-            if _safe_float(payload.get("total_other_charges")) > 0 or _safe_float(payload.get("total_brokerage")) > 0
-            else "component_fallback",
-        }
-        return brokerage, total_fees, charges, charge_summary
+        return self.execution_workflow.sum_known_charge_fields(payload)
 
     def calculate_margin(self, legs: List[dict]) -> dict:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-        if not legs:
-            return {
-                "margin_required": 0.0,
-                "available_margin": 0.0,
-                "span_margin": 0.0,
-                "block_trade_margin": 0.0,
-                "order_margin": 0.0,
-                "trade_margin": 0.0,
-                "raw": {},
-                "validation": {
-                    "kind": "margin",
-                    "captured_at": time.time(),
-                    "leg_count": 0,
-                    "rawTopLevelFields": [],
-                    "successFields": [],
-                    "captureFile": self.validation_capture.path,
-                },
-            }
-
-        positions = [self._build_margin_position(leg) for leg in legs]
-        exchange_code = str(legs[0].get("exchange_code", "NFO"))
-        result = self.broker_client.margin_calculator(positions, exchange_code)
-        payload = self._extract_success_payload(result)
-        validation = self._record_execution_validation("margin", legs, result, payload)
-        funds = self.get_funds()
-
-        order_margin = _safe_float(
-            payload.get("order_margin")
-            or payload.get("orderMargin")
-            or payload.get("total_order_margin")
-        )
-        trade_margin = _safe_float(
-            payload.get("trade_margin")
-            or payload.get("tradeMargin")
-            or payload.get("total_trade_margin")
-        )
-        span_margin = _safe_float(payload.get("span_margin") or payload.get("spanMargin"))
-        block_trade_margin = _safe_float(
-            payload.get("block_trade_margin")
-            or payload.get("blockTradeMargin")
-            or payload.get("non_span_margin_required")
-            or payload.get("block_margin")
-        )
-        if span_margin <= 0:
-            span_margin = _safe_float(payload.get("span_margin_required"))
-        margin_required = max(
-            order_margin,
-            trade_margin,
-            span_margin + block_trade_margin,
-            _safe_float(payload.get("total_margin") or payload.get("margin_required")),
-        )
-
-        return {
-            "margin_required": margin_required,
-            "available_margin": _safe_float(funds.get("available_margin")),
-            "span_margin": span_margin,
-            "block_trade_margin": block_trade_margin,
-            "order_margin": order_margin,
-            "trade_margin": trade_margin,
-            "raw": payload,
-            "validation": validation,
-        }
+        return self.execution_workflow.calculate_margin(legs)
 
     def preview_strategy(self, legs: List[dict]) -> dict:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-        if not legs:
-            return {
-                "estimatedPremium": 0.0,
-                "estimatedFees": 0.0,
-                "slippage": 0.0,
-                "capitalAtRisk": 0.0,
-                "marginRequired": 0.0,
-                "availableMargin": _safe_float(self.get_funds().get("available_margin")),
-                "spanMargin": 0.0,
-                "blockTradeMargin": 0.0,
-                "orderMargin": 0.0,
-                "tradeMargin": 0.0,
-                "totalBrokerage": 0.0,
-                "chargesBreakdown": {},
-                "notes": [],
-                "updated_at": time.time(),
-                "validation": {
-                    "kind": "preview",
-                    "captured_at": time.time(),
-                    "leg_count": 0,
-                    "captureFile": self.validation_capture.path,
-                    "previewLegs": [],
-                    "margin": {
-                        "kind": "margin",
-                        "captured_at": time.time(),
-                        "leg_count": 0,
-                        "rawTopLevelFields": [],
-                        "successFields": [],
-                        "captureFile": self.validation_capture.path,
-                    },
-                },
-            }
-
-        preview_rows = []
-        validation_rows = []
-        total_brokerage = 0.0
-        total_charges = 0.0
-        charges_breakdown: Dict[str, float] = {}
-        aggregated_charge_summary = {
-            "brokerage": 0.0,
-            "brokerReportedOtherCharges": 0.0,
-            "brokerReportedTurnoverAndSebiCharges": 0.0,
-            "taxesAndDuties": 0.0,
-            "totalFees": 0.0,
-            "componentCharges": {},
-            "calculationMode": "component_fallback",
-        }
-        notes: List[str] = []
-        estimated_premium = 0.0
-        capital_at_risk = 0.0
-        slippage = 0.0
-
-        for leg in legs:
-            normalised = self._normalise_execution_leg(leg)
-            price = _safe_float(normalised["price"])
-            quantity = _safe_float(normalised["quantity"])
-            preview_price = "0" if normalised["order_type"] == "market" else normalised["price"]
-            estimated_premium += price * quantity * (1 if normalised["action"] == "sell" else -1)
-            capital_at_risk += abs(price * quantity)
-            slippage += abs(price * quantity) * 0.0006
-
-            response = self.broker_client.preview_order(
-                stock_code=normalised["stock_code"],
-                exchange_code=normalised["exchange_code"],
-                product=normalised["product"],
-                order_type=normalised["order_type"],
-                price=preview_price,
-                action=normalised["action"],
-                quantity=normalised["quantity"],
-                expiry_date=normalised["expiry_date"],
-                right=normalised["right"],
-                strike_price=normalised["strike_price"],
-                specialflag="N",
-                stoploss=normalised["stoploss"],
-                order_rate_fresh="",
-            )
-            payload = self._extract_success_payload(response)
-            validation_rows.append(self._record_execution_validation("preview", [normalised], response, payload))
-            brokerage, total, charges, charge_summary = self._sum_known_charge_fields(payload)
-            total_brokerage += brokerage
-            total_charges += total
-            for key, value in charges.items():
-                charges_breakdown[key] = charges_breakdown.get(key, 0.0) + value
-            aggregated_charge_summary["brokerage"] += _safe_float(charge_summary.get("brokerage"))
-            aggregated_charge_summary["brokerReportedOtherCharges"] += _safe_float(charge_summary.get("brokerReportedOtherCharges"))
-            aggregated_charge_summary["brokerReportedTurnoverAndSebiCharges"] += _safe_float(charge_summary.get("brokerReportedTurnoverAndSebiCharges"))
-            aggregated_charge_summary["taxesAndDuties"] += _safe_float(charge_summary.get("taxesAndDuties"))
-            aggregated_charge_summary["totalFees"] += _safe_float(charge_summary.get("totalFees"))
-            if charge_summary.get("calculationMode") == "broker_rollup":
-                aggregated_charge_summary["calculationMode"] = "broker_rollup"
-            component_bucket = aggregated_charge_summary["componentCharges"]
-            for key, value in charge_summary.get("componentCharges", {}).items():
-                component_bucket[key] = component_bucket.get(key, 0.0) + _safe_float(value)
-            error = ""
-            if isinstance(response, dict):
-                error = str(response.get("Error") or response.get("error") or "")
-            if error:
-                notes.append(error)
-            preview_rows.append(payload)
-
-        margin = self.calculate_margin(legs)
-        margin_required = max(margin["margin_required"], capital_at_risk + total_charges)
-
-        return {
-            "estimatedPremium": estimated_premium,
-            "estimatedFees": total_charges,
-            "slippage": slippage,
-            "capitalAtRisk": capital_at_risk + total_charges,
-            "marginRequired": margin_required,
-            "availableMargin": margin["available_margin"],
-            "spanMargin": margin["span_margin"],
-            "blockTradeMargin": margin["block_trade_margin"],
-            "orderMargin": margin["order_margin"],
-            "tradeMargin": margin["trade_margin"],
-            "totalBrokerage": total_brokerage,
-            "chargesBreakdown": charges_breakdown,
-            "chargeSummary": aggregated_charge_summary,
-            "notes": notes,
-            "updated_at": time.time(),
-            "legs": preview_rows,
-            "validation": {
-                "kind": "preview",
-                "captured_at": time.time(),
-                "leg_count": len(legs),
-                "captureFile": self.validation_capture.path,
-                "previewLegs": validation_rows,
-                "margin": margin.get("validation", {}),
-            },
-        }
+        return self.execution_workflow.preview_strategy(legs)
 
     @staticmethod
     def _inventory_key(leg: dict) -> tuple:
-        right = "call" if str(leg.get("right") or "").lower().startswith("c") else "put"
-        return (
-            str(leg.get("stock_code", "")),
-            str(leg.get("exchange_code", "NFO")),
-            str(leg.get("expiry_date", "")),
-            right,
-            str(leg.get("strike_price", "")),
-        )
+        return self.execution_workflow.inventory_key(leg)
 
     def _apply_repair_legs(self, current_legs: List[dict], repair_legs: List[dict]) -> List[dict]:
-        buckets: Dict[tuple, dict] = {}
-        for source in current_legs:
-            leg = self._normalise_execution_leg(source)
-            key = self._inventory_key(leg)
-            quantity = _safe_float(leg.get("quantity"))
-            signed = quantity if leg.get("action") == "buy" else -quantity
-            if key not in buckets:
-                buckets[key] = dict(leg)
-                buckets[key]["_net_quantity"] = signed
-            else:
-                buckets[key]["_net_quantity"] += signed
-
-        for source in repair_legs:
-            leg = self._normalise_execution_leg(source)
-            key = self._inventory_key(leg)
-            quantity = _safe_float(leg.get("quantity"))
-            signed = quantity if leg.get("action") == "buy" else -quantity
-            if key not in buckets:
-                buckets[key] = dict(leg)
-                buckets[key]["_net_quantity"] = signed
-            else:
-                buckets[key]["_net_quantity"] += signed
-
-        result: List[dict] = []
-        for leg in buckets.values():
-            net_quantity = _safe_float(leg.pop("_net_quantity", 0))
-            if abs(net_quantity) < 0.5:
-                continue
-            rebuilt = dict(leg)
-            rebuilt["action"] = "buy" if net_quantity > 0 else "sell"
-            rebuilt["quantity"] = str(int(abs(net_quantity)))
-            result.append(rebuilt)
-        return result
+        return self.execution_workflow.apply_repair_legs(current_legs, repair_legs)
 
     def repair_preview(self, current_legs: List[dict], repair_legs: List[dict], meta: Optional[dict] = None) -> dict:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-        current_normalized = [self._normalise_execution_leg(leg) for leg in current_legs]
-        repair_normalized = [self._normalise_execution_leg(leg) for leg in repair_legs]
-        resulting_legs = self._apply_repair_legs(current_normalized, repair_normalized)
-        incremental = self.preview_strategy(repair_normalized) if repair_normalized else self.preview_strategy([])
-        current_margin = self.calculate_margin(current_normalized) if current_normalized else self.calculate_margin([])
-        resulting_margin = self.calculate_margin(resulting_legs) if resulting_legs else self.calculate_margin([])
-        repair_type = str((meta or {}).get("repair_type") or "repair")
-        strategy_family = str((meta or {}).get("strategy_family") or "custom")
-        thesis_preservation = 0.56
-        if repair_type in {"roll_tested_side", "roll_spread_wider", "recenter_structure"}:
-            thesis_preservation = 0.86
-        elif repair_type in {"add_wings", "reduce_winning_side"}:
-            thesis_preservation = 0.72
-        elif repair_type in {"close_tested_side"}:
-            thesis_preservation = 0.58
-        elif repair_type == "flatten_all":
-            thesis_preservation = 0.2
-        if strategy_family in {"calendar", "broken_wing", "ratio_repair", "expiry_day"}:
-            thesis_preservation = min(0.95, thesis_preservation + 0.05)
-
-        margin_relief = max(0.0, current_margin["margin_required"] - resulting_margin["margin_required"])
-        denominator = max(abs(incremental.get("estimatedFees", 0.0)) + abs(incremental.get("marginRequired", 0.0)) * 0.01, 1.0)
-        credit_efficiency = abs(incremental.get("estimatedPremium", 0.0)) / denominator
-        ranking = {
-            "creditEfficiency": round(credit_efficiency, 4),
-            "marginRelief": round(margin_relief, 2),
-            "thesisPreservation": round(thesis_preservation, 4),
-            "score": round(
-                min(100.0, credit_efficiency * 18.0 + (margin_relief / max(current_margin["margin_required"], 1.0)) * 40.0 + thesis_preservation * 35.0),
-                2,
-            ),
-        }
-        notes = list(incremental.get("notes", []))
-        notes.append("Repair preview is incremental: premium and fees reflect repair legs, margin delta compares live book before and after the repair.")
-        return {
-            "incrementalPreview": incremental,
-            "currentMargin": current_margin,
-            "resultingMargin": resulting_margin,
-            "resultingLegs": resulting_legs,
-            "ranking": ranking,
-            "notes": notes,
-            "updated_at": time.time(),
-        }
+        return self.execution_workflow.repair_preview(current_legs, repair_legs, meta)
 
     # ── REST: Historical OHLCV ────────────────────────────────────────────────
 
@@ -1209,29 +733,7 @@ class BreezeEngine:
         right: str = "",
         strike_price: str = "",
     ) -> List[dict]:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-
-        kwargs: dict = dict(
-            interval=interval,
-            from_date=from_date,
-            to_date=to_date,
-            stock_code=stock_code,
-            exchange_code=exchange_code,
-        )
-        if expiry_date:
-            kwargs["expiry_date"]  = expiry_date
-            kwargs["product_type"] = "options"
-        if right:
-            kwargs["right"] = right
-        if strike_price:
-            kwargs["strike_price"] = strike_price
-
-        result = self.broker_client.get_historical_data_v2(**kwargs)
-        candles = result.get("Success", []) if isinstance(result, dict) else []
-        if candles and not expiry_date:
-            self.candle_store.seed(stock_code.upper(), interval, candles)
-        return candles
+        return self.market_data_service.get_historical(stock_code, exchange_code, interval, from_date, to_date, expiry_date, right, strike_price)
 
     def get_market_depth(
         self,
@@ -1241,160 +743,18 @@ class BreezeEngine:
         right: str,
         strike_price: str,
     ) -> dict:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-
-        right_norm = "Call" if right.lower().startswith("c") else "Put"
-
-        result = self.broker_client.get_market_depth(
-            stock_code=stock_code,
-            exchange_code=exchange_code,
-            product_type="options",
-            expiry_date=expiry_date,
-            right=right_norm,
-            strike_price=strike_price,
-        )
-        rows = result.get("Success") if isinstance(result, dict) else []
-        if isinstance(rows, dict):
-            rows = [rows]
-        if not rows:
-            return {
-                "bids": [],
-                "asks": [],
-                "spread": 0,
-                "imbalance": 0,
-                "updated_at": time.time(),
-                "instrument_label": f"{stock_code} {expiry_date} {strike_price} {right_norm}",
-                "contract_key": f"{stock_code}:{strike_price}:{'CE' if right_norm == 'Call' else 'PE'}",
-            }
-
-        row = rows[0]
-        bids: List[dict] = []
-        asks: List[dict] = []
-        for level in range(1, 6):
-            bid_price = _safe_float(
-                row.get(f"best_bid_price_{level}") or row.get(f"buy_price_{level}") or row.get(f"BidPrice{level}")
-            )
-            bid_qty = _safe_float(
-                row.get(f"best_bid_quantity_{level}") or row.get(f"buy_quantity_{level}") or row.get(f"BidQty{level}")
-            )
-            ask_price = _safe_float(
-                row.get(f"best_offer_price_{level}") or row.get(f"sell_price_{level}") or row.get(f"AskPrice{level}")
-            )
-            ask_qty = _safe_float(
-                row.get(f"best_offer_quantity_{level}") or row.get(f"sell_quantity_{level}") or row.get(f"AskQty{level}")
-            )
-            if bid_price > 0:
-                bids.append({"price": bid_price, "quantity": bid_qty, "orders": 1})
-            if ask_price > 0:
-                asks.append({"price": ask_price, "quantity": ask_qty, "orders": 1})
-
-        total_bid = sum(level["quantity"] for level in bids)
-        total_ask = sum(level["quantity"] for level in asks)
-        spread = max(0.0, (asks[0]["price"] - bids[0]["price"])) if bids and asks else 0.0
-        imbalance = ((total_bid - total_ask) / (total_bid + total_ask)) if (total_bid + total_ask) else 0.0
-        return {
-            "bids": bids,
-            "asks": asks,
-            "spread": spread,
-            "imbalance": imbalance,
-            "updated_at": time.time(),
-            "instrument_label": f"{stock_code} {expiry_date} {strike_price} {right_norm}",
-            "contract_key": f"{stock_code}:{strike_price}:{'CE' if right_norm == 'Call' else 'PE'}",
-        }
+        return self.market_data_service.get_market_depth(stock_code, exchange_code, expiry_date, right, strike_price)
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
 
     def _on_ticks(self, ticks) -> None:
-        if not ticks:
-            return
-        if isinstance(ticks, dict):
-            ticks = [ticks]
-        for tick in ticks:
-            try:
-                stock     = (tick.get("stock_code") or tick.get("symbol") or "").upper()
-                strike    = tick.get("strike_price") or tick.get("strike") or "0"
-                right_raw = (tick.get("right") or tick.get("option_type") or "CE").upper()
-                right     = "CE" if right_raw.startswith("C") else "PE"
-                if not stock:
-                    continue
-                key = f"{stock}:{strike}:{right}"
-                self.tick_store.update(key, {
-                    "ltp":        float(tick.get("last_traded_price") or tick.get("ltp") or 0),
-                    "oi":         float(tick.get("open_interest")     or tick.get("oi")  or 0),
-                    "volume":     float(tick.get("total_quantity_traded") or tick.get("volume") or 0),
-                    "iv":         float(tick.get("implied_volatility") or tick.get("iv") or 0),
-                    "bid":        float(tick.get("best_bid_price")    or tick.get("bid_price") or 0),
-                    "ask":        float(tick.get("best_offer_price")  or tick.get("ask_price") or 0),
-                    "change_pct": float(tick.get("change_percent")    or tick.get("change_pct") or 0),
-                    "feed_time":  str(tick.get("exchange_feed_time")  or ""),
-                })
-                log.debug(f"[WS tick] {key} ltp={tick.get('last_traded_price', 0)}")
-
-                # ── FIX: Capture underlying index spot price from option tick ──
-                # Breeze includes the index value in each option feed tick under
-                # several possible field names depending on SDK version.
-                # This is the MOST RELIABLE live spot source — capture it.
-                underlying = 0.0
-                for field in ("index_close_price", "UnderlyingValue", "underlying_value",
-                              "close_price", "index_price", "underlying_spot_price"):
-                    v = tick.get(field)
-                    if v:
-                        try:
-                            underlying = float(v)
-                        except (ValueError, TypeError):
-                            pass
-                        if underlying > 0:
-                            break
-                if underlying > 1000:  # sanity: NIFTY > 1000, SENSEX > 10000
-                    spot_key = f"{stock}:SPOT"
-                    self.tick_store.update(spot_key, {
-                        "ltp":      underlying,
-                        "is_spot":  True,
-                        "source":   "ws_tick",
-                    })
-                    self.candle_store.update(
-                        stock,
-                        underlying,
-                        _safe_float(tick.get("total_quantity_traded") or tick.get("volume")),
-                    )
-                    log.debug(f"[WS spot] {stock} underlying={underlying}")
-
-            except Exception as exc:
-                log.warning(f"[WS] parse error: {exc}")
+        self.realtime_manager.on_ticks(ticks)
 
     def start_websocket(self) -> None:
-        if not self.connected:
-            raise RuntimeError("Not connected")
-        with self._ws_lock:
-            if self._ws_thread and self._ws_thread.is_alive():
-                log.info("[WS] already running")
-                return
-
-            def _run():
-                try:
-                    self.broker_client.set_on_ticks(self._on_ticks)
-                    self.broker_client.ws_connect()
-                    self.ws_running = True
-                    log.info("[WS] ws_connect() established")
-                except Exception as exc:
-                    log.error(f"[WS] ws_connect() failed: {exc}")
-                    self.ws_running = False
-
-            self._ws_thread = threading.Thread(target=_run, daemon=True, name="BreezeWS")
-            self._ws_thread.start()
-            deadline = time.time() + 15
-            while not self.ws_running and time.time() < deadline:
-                time.sleep(0.5)
+        self.realtime_manager.start_websocket()
 
     def _stop_ws(self) -> None:
-        if self.broker_client and self.ws_running:
-            try:
-                self.broker_client.ws_disconnect()
-            except Exception:
-                pass
-        self.ws_running = False
-        self.subscribed.clear()
+        self.realtime_manager.stop_websocket()
 
     def subscribe_option_chain(
         self,
@@ -1404,65 +764,10 @@ class BreezeEngine:
         strikes: List[int],
         rights: List[str] = None,
     ) -> dict:
-        if rights is None:
-            rights = ["Call", "Put"]
-        if not self.ws_running:
-            self.start_websocket()
-            time.sleep(2)
-
-        count  = 0
-        errors = []
-
-        for strike in strikes:
-            for right in rights:
-                right_norm = "Call" if right.lower().startswith("c") else "Put"
-                sub_key    = f"{stock_code}:{strike}:{right_norm[0]}E:{expiry_date}"
-                if sub_key in self.subscribed:
-                    continue
-                try:
-                    self.broker_client.subscribe_feeds(
-                        stock_code=stock_code,
-                        exchange_code=exchange_code,
-                        product_type="options",
-                        expiry_date=expiry_date,
-                        strike_price=str(strike),
-                        right=right_norm,
-                        get_exchange_quotes=True,
-                        get_market_depth=True,
-                    )
-                    self.subscribed.add(sub_key)
-                    count += 1
-                    time.sleep(0.05)
-                except Exception as exc:
-                    errors.append(f"{sub_key}: {exc}")
-
-        return {
-            "subscribed":  count,
-            "total_subs":  len(self.subscribed),
-            "errors":      errors,
-        }
+        return self.realtime_manager.subscribe_option_chain(stock_code, exchange_code, expiry_date, strikes, rights)
 
     def unsubscribe_all(self) -> None:
-        if not self.ws_running or not self.broker_client:
-            return
-        for sub_key in list(self.subscribed):
-            try:
-                parts = sub_key.split(":")
-                if len(parts) >= 4:
-                    stock, strike, right_abbr, expiry = parts
-                    right = "Call" if right_abbr.startswith("C") else "Put"
-                    self.broker_client.unsubscribe_feeds(
-                        stock_code=stock,
-                        exchange_code="NFO" if stock == "NIFTY" else "BFO",
-                        product_type="options",
-                        expiry_date=expiry,
-                        strike_price=strike,
-                        right=right,
-                    )
-            except Exception:
-                pass
-        self.subscribed.clear()
-        log.info("[WS] all feeds unsubscribed")
+        self.realtime_manager.unsubscribe_all()
 
 
 # ── Singleton ──────────────────────────────────────────────────────────────────

@@ -12,7 +12,8 @@ import { BottomDock } from './BottomDock';
 import { WorkspaceHeader } from './WorkspaceHeader';
 import { WorkspaceNav } from './WorkspaceNav';
 import { WorkspaceSubnav } from './WorkspaceSubnav';
-import { type WorkspacePath } from '../router';
+import { normalizeWorkspacePath, type WorkspacePath } from '../router';
+import type { SymbolCode } from '../../types/index';
 
 const MarketWorkspace = lazy(() => import('../workspaces/MarketWorkspace').then((module) => ({ default: module.MarketWorkspace })));
 const StrategyWorkspace = lazy(() => import('../workspaces/StrategyWorkspace').then((module) => ({ default: module.StrategyWorkspace })));
@@ -36,7 +37,13 @@ export function AppShell({
 }) {
   const { legs } = useExecutionStore();
   const { symbol, setSymbol, refreshMarket, lastUpdate, liveIndices, spotTruth, chainTruth, stream } = useMarketStore();
+  const activePath = useTerminalStore((state) => state.activePath);
+  const activeSectionByPath = useTerminalStore((state) => state.activeSectionByPath);
+  const linkedSymbol = useTerminalStore((state) => state.linkedSymbol);
+  const stagedSourceId = useTerminalStore((state) => state.stagedSourceId);
   const setLinkedSymbol = useTerminalStore((state) => state.setLinkedSymbol);
+  const hydrateWorkspaceState = useTerminalStore((state) => state.hydrateWorkspaceState);
+  const snapshotWorkspaceState = useTerminalStore((state) => state.snapshotWorkspaceState);
   const commandPaletteOpen = useTerminalStore((state) => state.commandPaletteOpen);
   const setCommandPaletteOpen = useTerminalStore((state) => state.setCommandPaletteOpen);
   const setKeyboardMode = useTerminalStore((state) => state.setKeyboardMode);
@@ -55,6 +62,40 @@ export function AppShell({
     connectSession,
   } = useSessionStore();
   const [layoutHydrated, setLayoutHydrated] = useState(false);
+
+  const applyPersistedPanels = (panels: Record<string, unknown>) => {
+    const nestedLayout = typeof panels.layout === 'object' && panels.layout && !Array.isArray(panels.layout)
+      ? panels.layout as Record<string, unknown>
+      : panels;
+    hydrateLayout(nestedLayout);
+
+    const nestedTerminal = typeof panels.terminal === 'object' && panels.terminal && !Array.isArray(panels.terminal)
+      ? panels.terminal as Record<string, unknown>
+      : panels;
+    const nextPath = typeof nestedTerminal.activePath === 'string'
+      ? normalizeWorkspacePath(nestedTerminal.activePath)
+      : undefined;
+    const nextSymbol = typeof nestedTerminal.linkedSymbol === 'string'
+      ? nestedTerminal.linkedSymbol as SymbolCode
+      : undefined;
+    hydrateWorkspaceState({
+      activePath: nextPath,
+      activeSectionByPath: typeof nestedTerminal.activeSectionByPath === 'object' && nestedTerminal.activeSectionByPath && !Array.isArray(nestedTerminal.activeSectionByPath)
+        ? nestedTerminal.activeSectionByPath as Record<WorkspacePath, string>
+        : undefined,
+      linkedSymbol: nextSymbol,
+      stagedSourceId: typeof nestedTerminal.stagedSourceId === 'string' || nestedTerminal.stagedSourceId === null
+        ? nestedTerminal.stagedSourceId as string | null
+        : undefined,
+    });
+    if (nextSymbol) {
+      setSymbol(nextSymbol);
+      setLinkedSymbol(nextSymbol);
+    }
+    if (nextPath && nextPath !== currentPath) {
+      onNavigate(nextPath);
+    }
+  };
 
   useEffect(() => {
     setLinkedSymbol(symbol);
@@ -75,7 +116,7 @@ export function AppShell({
       const result = await brokerGatewayClient.layout.fetch(session, SHELL_LAYOUT_ID);
       if (cancelled) return;
       if (result.ok && result.layout && !Array.isArray(result.layout.panels)) {
-        hydrateLayout(result.layout.panels as Record<string, unknown>);
+        applyPersistedPanels(result.layout.panels as Record<string, unknown>);
       }
       setLayoutHydrated(true);
     })();
@@ -91,16 +132,32 @@ export function AppShell({
     }
     const timer = window.setTimeout(() => {
       const panels = snapshotLayout();
+      const terminal = snapshotWorkspaceState();
       void brokerGatewayClient.layout.save(session, SHELL_LAYOUT_ID, {
         workspace_id: SHELL_WORKSPACE_ID,
         name: SHELL_LAYOUT_NAME,
-        panels: panels as unknown as Record<string, unknown>,
+        panels: {
+          layout: panels as unknown as Record<string, unknown>,
+          terminal,
+        },
         is_default: true,
       });
     }, 350);
 
     return () => window.clearTimeout(timer);
-  }, [bottomDockHeight, bottomDockOpen, layoutHydrated, rightDrawerOpen, session, snapshotLayout]);
+  }, [
+    activePath,
+    activeSectionByPath,
+    bottomDockHeight,
+    bottomDockOpen,
+    layoutHydrated,
+    linkedSymbol,
+    rightDrawerOpen,
+    session,
+    snapshotLayout,
+    snapshotWorkspaceState,
+    stagedSourceId,
+  ]);
 
   useEffect(() => {
     if (commandPaletteOpen) return;
