@@ -41,8 +41,12 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Callable
 from collections import deque
 import logging
+from backend.app.clients.breeze import BreezeBrokerClient
 from backend.app.create_app import create_app
 from backend.app.core.state import BackendState
+from backend.app.services.automation.manager import AutomationRuleManager
+from backend.app.services.review.review_state_manager import SellerReviewManager
+from backend.app.services.streaming.tick_store import CandleStore, TickStore, ValidationCaptureStore
 try:
     from automation_normalization import (
         extract_rule_id_hint,
@@ -407,742 +411,11 @@ class RateLimiter:
         return self._queue.qsize()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TickStore
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TickStore:
-    def __init__(self):
-        self._ticks   = {}
-        self._lock    = threading.Lock()
-        self._version = 0
-
-    def update(self, key: str, data: dict) -> None:
-        with self._lock:
-            existing = self._ticks.get(key, {})
-            existing.update(data)
-            existing["_ts"] = time.time()
-            self._ticks[key] = existing
-            self._version += 1
-
-    def get_all(self) -> dict:
-        with self._lock:
-            return {"ticks": dict(self._ticks), "version": self._version}
-
-    def get_version(self) -> int:
-        with self._lock:
-            return self._version
-
-    def clear(self) -> None:
-        with self._lock:
-            self._ticks.clear()
-            self._version = 0
-
-    def to_option_chain_delta(self) -> List[dict]:
-        with self._lock:
-            rows = []
-            for key, tick in self._ticks.items():
-                parts = key.split(":")
-                if len(parts) < 3:
-                    continue
-                stock, strike_str, right = parts[0], parts[1], parts[2]
-                # Skip spot price pseudo-entries
-                if right == "SPOT":
-                    continue
-                try:
-                    strike = int(float(strike_str))
-                except Exception:
-                    continue
-                rows.append({
-                    "stock_code":   stock,
-                    "strike":       strike,
-                    "right":        right,
-                    "ltp":          tick.get("ltp", 0),
-                    "oi":           tick.get("oi", 0),
-                    "volume":       tick.get("volume", 0),
-                    "iv":           tick.get("iv", 0),
-                    "bid":          tick.get("bid", 0),
-                    "ask":          tick.get("ask", 0),
-                    "change_pct":   tick.get("change_pct", 0),
-                    "last_updated": tick.get("_ts", 0),
-                })
-            return rows
-
-    def get_spot_prices(self) -> Dict[str, float]:
-        """Return dict of {stock_code: spot_price} captured from option tick underlying values."""
-        with self._lock:
-            result = {}
-            for key, tick in self._ticks.items():
-                parts = key.split(":")
-                if len(parts) == 2 and parts[1] == "SPOT":
-                    stock = parts[0]
-                    ltp = tick.get("ltp", 0)
-                    if ltp > 0:
-                        result[stock] = ltp
-            return result
-
-
 def _safe_float(value, default=0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _bucket_epoch(ts: float, interval: str) -> int:
-    dt = datetime.fromtimestamp(ts)
-    if interval == "1minute":
-        return int(dt.replace(second=0, microsecond=0).timestamp())
-    if interval == "5minute":
-        minute = dt.minute - (dt.minute % 5)
-        return int(dt.replace(minute=minute, second=0, microsecond=0).timestamp())
-    if interval == "30minute":
-        minute = dt.minute - (dt.minute % 30)
-        return int(dt.replace(minute=minute, second=0, microsecond=0).timestamp())
-    return int(dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-
-
-class ValidationCaptureStore:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.Lock()
-        self._recent = deque(maxlen=25)
-
-    def append(self, record: dict) -> None:
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        line = json.dumps(record, default=str)
-        with self._lock:
-            with open(self.path, "a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-            self._recent.appendleft(record)
-
-    def recent(self, limit: int = 10) -> List[dict]:
-        with self._lock:
-            return list(self._recent)[: max(1, min(limit, len(self._recent) or 1))]
-
-
-class CandleStore:
-    INTERVALS = ("1minute", "5minute", "30minute", "1day")
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._candles: Dict[str, Dict[str, Dict[int, dict]]] = {}
-
-    def clear(self) -> None:
-        with self._lock:
-            self._candles.clear()
-
-    def seed(self, symbol: str, interval: str, candles: List[dict]) -> None:
-        if interval not in self.INTERVALS:
-            return
-        with self._lock:
-            symbol_store = self._candles.setdefault(symbol, {})
-            bucket_store = symbol_store.setdefault(interval, {})
-            for candle in candles:
-                dt_raw = candle.get("datetime")
-                price = _safe_float(candle.get("close"))
-                if not dt_raw or price <= 0:
-                    continue
-                try:
-                    bucket = int(datetime.fromisoformat(str(dt_raw).replace("Z", "+00:00")).timestamp())
-                except ValueError:
-                    try:
-                        bucket = int(datetime.strptime(str(dt_raw), "%Y-%m-%d %H:%M:%S").timestamp())
-                    except ValueError:
-                        continue
-                bucket_store[bucket] = {
-                    "datetime": str(dt_raw),
-                    "open": _safe_float(candle.get("open"), price),
-                    "high": _safe_float(candle.get("high"), price),
-                    "low": _safe_float(candle.get("low"), price),
-                    "close": price,
-                    "volume": _safe_float(candle.get("volume")),
-                }
-
-    def update(self, symbol: str, price: float, volume: float = 0.0, ts: Optional[float] = None) -> None:
-        if price <= 0:
-            return
-        now = ts or time.time()
-        with self._lock:
-            symbol_store = self._candles.setdefault(symbol, {})
-            for interval in self.INTERVALS:
-                bucket = _bucket_epoch(now, interval)
-                interval_store = symbol_store.setdefault(interval, {})
-                candle = interval_store.get(bucket)
-                if candle is None:
-                    interval_store[bucket] = {
-                        "datetime": datetime.fromtimestamp(bucket).strftime("%Y-%m-%d %H:%M:%S"),
-                        "open": price,
-                        "high": price,
-                        "low": price,
-                        "close": price,
-                        "volume": volume,
-                    }
-                    continue
-                candle["high"] = max(candle["high"], price)
-                candle["low"] = min(candle["low"], price)
-                candle["close"] = price
-                candle["volume"] += volume
-
-    def to_stream_payload(self, limit: int = 2) -> Dict[str, Dict[str, List[dict]]]:
-        with self._lock:
-            payload: Dict[str, Dict[str, List[dict]]] = {}
-            for symbol, interval_map in self._candles.items():
-                for interval, bucket_map in interval_map.items():
-                    recent = [bucket_map[key] for key in sorted(bucket_map.keys())[-limit:]]
-                    if recent:
-                        payload.setdefault(symbol, {})[interval] = recent
-            return payload
-
-
-class JsonStateStore:
-    def __init__(self, path: str, default_factory: Callable[[], dict]):
-        self.path = path
-        self.default_factory = default_factory
-        self._lock = threading.Lock()
-
-    def load(self) -> dict:
-        with self._lock:
-            if not os.path.exists(self.path):
-                return self.default_factory()
-            try:
-                with open(self.path, "r", encoding="utf-8") as handle:
-                    payload = json.load(handle)
-                return payload if isinstance(payload, dict) else self.default_factory()
-            except Exception:
-                return self.default_factory()
-
-    def save(self, payload: dict) -> None:
-        directory = os.path.dirname(self.path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        tmp = self.path + ".tmp"
-        with self._lock:
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=True, indent=2)
-            os.replace(tmp, self.path)
-
-
-class AutomationRuleManager:
-    def __init__(self, engine: "BreezeEngine", path: str):
-        self.engine = engine
-        self.store = JsonStateStore(path, lambda: {"rules": [], "callbacks": []})
-        self.webhook_capture_store = ValidationCaptureStore("logs/automation_webhook_samples.jsonl")
-        self._lock = threading.Lock()
-        self._callbacks = deque(maxlen=200)
-        self._state = self.store.load()
-        for event in reversed(self._state.get("callbacks", [])[-50:]):
-            self._callbacks.appendleft(event)
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="automation-rule-loop", daemon=True)
-        self._thread.start()
-
-    def _loop(self) -> None:
-        while not self._stop_event.wait(5.0):
-            try:
-                self.evaluate_active_rules()
-            except Exception as exc:
-                log.warning(f"[Automation] background evaluation failed: {exc}")
-
-    def close(self) -> None:
-        self._stop_event.set()
-
-    @staticmethod
-    def _now_ts() -> float:
-        return time.time()
-
-    @staticmethod
-    def _fmt_run(ts: Optional[float]) -> str:
-        if not ts:
-            return "Never"
-        return datetime.fromtimestamp(ts).strftime("%d %b %H:%M")
-
-    def _persist_locked(self) -> None:
-        self.store.save({
-            "rules": self._state.get("rules", []),
-            "callbacks": list(self._callbacks),
-        })
-
-    def _append_event_locked(self, event: dict) -> None:
-        self._callbacks.appendleft(event)
-
-    def _find_rule_locked(self, rule_id: str) -> Optional[dict]:
-        for rule in self._state.get("rules", []):
-            if str(rule.get("id")) == rule_id:
-                return rule
-        return None
-
-    @staticmethod
-    def _normalise_status(status: str) -> str:
-        return status if status in {"active", "paused", "draft"} else "draft"
-
-    def _build_event(
-        self,
-        rule: dict,
-        event_type: str,
-        status: str,
-        message: str,
-        broker_results: Optional[List[dict]] = None,
-        meta: Optional[dict] = None,
-    ) -> dict:
-        return {
-            "id": f"automation-event-{int(self._now_ts() * 1000)}-{len(self._callbacks) + 1}",
-            "ruleId": str(rule.get("id", "")),
-            "ruleName": str(rule.get("name", "Automation rule")),
-            "kind": str(rule.get("kind", "gtt")),
-            "eventType": event_type,
-            "status": status,
-            "message": message,
-            "timestamp": self._now_ts(),
-            "brokerResults": broker_results or [],
-            "meta": meta or {},
-        }
-
-    def list_rules(self) -> List[dict]:
-        with self._lock:
-            return [dict(rule) for rule in self._state.get("rules", [])]
-
-    def list_callbacks(self, limit: int = 25) -> List[dict]:
-        with self._lock:
-            return list(self._callbacks)[: max(1, min(limit, len(self._callbacks) or 1))]
-
-    def _sanitize_trigger_config(self, trigger_config: Any) -> dict:
-        if not isinstance(trigger_config, dict):
-            return {"type": "manual"}
-        trigger_type = str(trigger_config.get("type") or "manual")
-        config = {"type": trigger_type}
-        for key in (
-            "referencePrice",
-            "lowerPrice",
-            "upperPrice",
-            "thresholdPrice",
-            "movePercent",
-            "maxDrawdown",
-            "profitTarget",
-            "netQuantity",
-        ):
-            if key in trigger_config:
-                config[key] = _safe_float(trigger_config.get(key))
-        if "direction" in trigger_config:
-            config["direction"] = str(trigger_config.get("direction") or "either")
-        return config
-
-    def _sanitize_action_config(self, action_config: Any) -> dict:
-        if not isinstance(action_config, dict):
-            return {"type": "notify"}
-        config = {
-            "type": str(action_config.get("type") or "notify"),
-        }
-        if "message" in action_config:
-            config["message"] = str(action_config.get("message") or "")
-        if isinstance(action_config.get("legs"), list):
-            config["legs"] = action_config.get("legs")
-        return config
-
-    def _build_rule(self, payload: dict, existing: Optional[dict] = None) -> dict:
-        now = self._now_ts()
-        prior = existing or {}
-        symbol = str(payload.get("symbol") or prior.get("symbol") or "NIFTY").upper()
-        return {
-            "id": str(payload.get("id") or prior.get("id") or f"rule-{int(now * 1000)}"),
-            "name": str(payload.get("name") or prior.get("name") or "Automation rule"),
-            "kind": str(payload.get("kind") or prior.get("kind") or "gtt"),
-            "status": self._normalise_status(str(payload.get("status") or prior.get("status") or "draft")),
-            "scope": str(payload.get("scope") or prior.get("scope") or "Strategy workspace"),
-            "trigger": str(payload.get("trigger") or prior.get("trigger") or "Manual review required"),
-            "action": str(payload.get("action") or prior.get("action") or "Notify operator"),
-            "lastRun": str(payload.get("lastRun") or prior.get("lastRun") or "Never"),
-            "nextRun": str(payload.get("nextRun") or prior.get("nextRun") or "Live"),
-            "notes": str(payload.get("notes") or prior.get("notes") or ""),
-            "symbol": symbol,
-            "triggerConfig": self._sanitize_trigger_config(payload.get("triggerConfig", prior.get("triggerConfig"))),
-            "actionConfig": self._sanitize_action_config(payload.get("actionConfig", prior.get("actionConfig"))),
-            "runCount": int(payload.get("runCount") or prior.get("runCount") or 0),
-            "updatedAt": now,
-        }
-
-    def create_rule(self, payload: dict) -> dict:
-        rule = self._build_rule(payload)
-        with self._lock:
-            self._state.setdefault("rules", []).insert(0, rule)
-            self._append_event_locked(self._build_event(rule, "created", "info", "Automation rule created."))
-            self._persist_locked()
-            return dict(rule)
-
-    def update_rule(self, rule_id: str, payload: dict) -> Optional[dict]:
-        with self._lock:
-            rule = self._find_rule_locked(rule_id)
-            if not rule:
-                return None
-            updated = self._build_rule(payload, rule)
-            rule.clear()
-            rule.update(updated)
-            self._append_event_locked(self._build_event(rule, "updated", "info", "Automation rule updated."))
-            self._persist_locked()
-            return dict(rule)
-
-    def delete_rule(self, rule_id: str) -> Optional[dict]:
-        with self._lock:
-            rules = self._state.setdefault("rules", [])
-            for index, rule in enumerate(rules):
-                if str(rule.get("id")) != rule_id:
-                    continue
-                removed = rules.pop(index)
-                tombstone = dict(removed)
-                tombstone["status"] = "paused"
-                self._append_event_locked(self._build_event(tombstone, "deleted", "info", "Automation rule deleted."))
-                self._persist_locked()
-                return dict(removed)
-        return None
-
-    def update_rule_status(self, rule_id: str, status: str) -> Optional[dict]:
-        with self._lock:
-            rule = self._find_rule_locked(rule_id)
-            if not rule:
-                return None
-            rule["status"] = self._normalise_status(status)
-            rule["updatedAt"] = self._now_ts()
-            rule["nextRun"] = "Live" if status == "active" else "Paused"
-            self._append_event_locked(self._build_event(rule, "status_changed", "info", f"Rule status changed to {status}.", meta={"status": status}))
-            self._persist_locked()
-            return dict(rule)
-
-    def receive_callback(self, payload: dict, source: str = "manual") -> dict:
-        normalized = self._normalise_callback_payload(payload, source)
-        if source == "webhook":
-            self._capture_webhook_sample(payload, normalized)
-        rule_id = str(normalized.get("ruleId") or "")
-        with self._lock:
-            rule = self._find_rule_locked(rule_id) or {
-                "id": rule_id or "manual-callback",
-                "name": str(normalized.get("ruleName") or payload.get("ruleName") or "Manual callback"),
-                "kind": str(normalized.get("kind") or payload.get("kind") or "alert"),
-            }
-            event = self._build_event(
-                rule,
-                str(normalized.get("eventType") or ("webhook" if source == "webhook" else "manual")),
-                str(normalized.get("status") or "info"),
-                str(normalized.get("message") or "Manual automation callback received."),
-                broker_results=normalized.get("brokerResults") or [],
-                meta=normalized.get("meta") if isinstance(normalized.get("meta"), dict) else {"source": source, "payload": payload},
-            )
-            self._append_event_locked(event)
-            self._persist_locked()
-            return event
-
-    def _capture_webhook_sample(self, payload: dict, normalized: dict) -> None:
-        record = {
-            "capturedAt": self._now_ts(),
-            "matchesIciciOrderUpdate": bool(is_icici_order_update_payload(payload)),
-            "ruleId": str(normalized.get("ruleId") or ""),
-            "eventType": str(normalized.get("eventType") or ""),
-            "status": str(normalized.get("status") or ""),
-            "payload": payload,
-        }
-        try:
-            self.webhook_capture_store.append(record)
-        except Exception as exc:
-            log.warning(f"[Automation] webhook capture failed: {exc}")
-
-    def _fetch_spot(self, symbol: str) -> float:
-        cached = self.engine.tick_store.get_spot_prices().get(symbol.upper())
-        if cached and cached > 0:
-            return cached
-        if not self.engine.connected or not self.engine.breeze:
-            return 0.0
-
-        exchange_code = "NSE" if symbol.upper() == "NIFTY" else "BSE"
-
-        def _call():
-            return self.engine.breeze.get_quotes(
-                stock_code=symbol.upper(),
-                exchange_code=exchange_code,
-                expiry_date="",
-                right="",
-                strike_price="",
-            )
-
-        try:
-            result = self.engine.rate_limiter.enqueue(_call)
-            rows = result.get("Success", []) if isinstance(result, dict) else []
-            if isinstance(rows, dict):
-                rows = [rows]
-            for row in rows:
-                for field in ("ltp", "last_traded_price", "close", "last_price", "LastPrice"):
-                    value = _safe_float(row.get(field))
-                    if value > 0:
-                        self.engine.tick_store.update(f"{symbol.upper()}:SPOT", {"ltp": value, "source": "rest"})
-                        return value
-        except Exception as exc:
-            log.warning(f"[Automation] spot fetch failed: {exc}")
-        return 0.0
-
-    @staticmethod
-    def _parse_numeric(value: Any) -> float:
-        return safe_float(value)
-
-    @staticmethod
-    def _first_present(payload: dict, keys: List[str]) -> Any:
-        return first_present(payload, keys)
-
-    @staticmethod
-    def _symbol_aliases(symbol: str) -> set[str]:
-        upper = str(symbol or "").upper()
-        aliases = {upper}
-        if upper == "NIFTY":
-            aliases.update({"NIFTY50", "NIFTY 50"})
-        if upper == "BSESEN":
-            aliases.update({"SENSEX", "BSE SENSEX"})
-        return aliases
-
-    def _row_symbol(self, row: dict) -> str:
-        return row_symbol(row)
-
-    def _match_symbol(self, row: dict, symbol: str) -> bool:
-        return match_symbol(row, symbol)
-
-    def _normalise_position_quantity(self, row: dict) -> float:
-        return _safe_float(normalize_position_row(row).get("quantity"))
-
-    def _normalise_position_mtm(self, row: dict, quantity: float) -> float:
-        normalized = normalize_position_row(row)
-        return _safe_float(normalized.get("mtm"))
-
-    def _normalise_position_row(self, row: dict) -> dict:
-        return normalize_position_row(row)
-
-    @staticmethod
-    def _extract_rule_id_hint(payload: dict) -> str:
-        return extract_rule_id_hint(payload)
-
-    def _normalise_broker_results(self, payload: dict) -> List[dict]:
-        return normalize_broker_results(payload)
-
-    def _normalise_callback_payload(self, payload: dict, source: str) -> dict:
-        return normalize_callback_payload(payload, source, normalized_at=self._now_ts())
-
-    def _fetch_position_metrics(self, symbol: str) -> dict:
-        snapshot = {"symbol": symbol.upper(), "mtm": 0.0, "netQuantity": 0.0, "positionsCount": 0, "matchedRows": []}
-        if not self.engine.connected:
-            return snapshot
-        try:
-            positions_payload = self.engine.get_positions()
-        except Exception as exc:
-            log.warning(f"[Automation] positions fetch failed: {exc}")
-            return snapshot
-
-        positions = positions_payload.get("positions", []) if isinstance(positions_payload, dict) else []
-        for row in positions:
-            if not isinstance(row, dict):
-                continue
-            if not self._match_symbol(row, symbol):
-                continue
-            normalized = self._normalise_position_row(row)
-            snapshot["mtm"] += _safe_float(normalized.get("mtm"))
-            snapshot["netQuantity"] += _safe_float(normalized.get("quantity"))
-            snapshot["positionsCount"] += 1
-            if len(snapshot["matchedRows"]) < 5:
-                snapshot["matchedRows"].append({
-                    "symbol": normalized.get("symbol"),
-                    "quantity": normalized.get("quantity"),
-                    "mtm": normalized.get("mtm"),
-                    "averagePrice": normalized.get("averagePrice"),
-                    "ltp": normalized.get("ltp"),
-                })
-        return snapshot
-
-    def _trigger_status(self, rule: dict) -> tuple[bool, str, dict]:
-        trigger = rule.get("triggerConfig") or {}
-        trigger_type = str(trigger.get("type") or "manual")
-        symbol = str(rule.get("symbol") or "NIFTY")
-        if trigger_type == "manual":
-            return False, "Manual rule pending operator action.", {}
-        if trigger_type == "spot_range_break":
-            spot = self._fetch_spot(symbol)
-            lower_price = _safe_float(trigger.get("lowerPrice"))
-            upper_price = _safe_float(trigger.get("upperPrice"))
-            if spot <= 0:
-                return False, "Spot price unavailable.", {"spot": spot}
-            if lower_price > 0 and spot <= lower_price:
-                return True, f"Spot {spot:.2f} broke below {lower_price:.2f}.", {"spot": spot, "threshold": lower_price, "direction": "down"}
-            if upper_price > 0 and spot >= upper_price:
-                return True, f"Spot {spot:.2f} broke above {upper_price:.2f}.", {"spot": spot, "threshold": upper_price, "direction": "up"}
-            return False, f"Spot {spot:.2f} remains inside rule range.", {"spot": spot, "lowerPrice": lower_price, "upperPrice": upper_price}
-        if trigger_type == "spot_cross_above":
-            spot = self._fetch_spot(symbol)
-            threshold = _safe_float(trigger.get("thresholdPrice"))
-            if spot <= 0:
-                return False, "Spot price unavailable.", {"spot": spot}
-            return (
-                threshold > 0 and spot >= threshold,
-                f"Spot {spot:.2f} vs cross-above level {threshold:.2f}.",
-                {"spot": spot, "threshold": threshold, "direction": "up"},
-            )
-        if trigger_type == "spot_cross_below":
-            spot = self._fetch_spot(symbol)
-            threshold = _safe_float(trigger.get("thresholdPrice"))
-            if spot <= 0:
-                return False, "Spot price unavailable.", {"spot": spot}
-            return (
-                threshold > 0 and spot <= threshold,
-                f"Spot {spot:.2f} vs cross-below level {threshold:.2f}.",
-                {"spot": spot, "threshold": threshold, "direction": "down"},
-            )
-        if trigger_type == "spot_pct_move":
-            spot = self._fetch_spot(symbol)
-            reference = _safe_float(trigger.get("referencePrice"))
-            move_percent = abs(_safe_float(trigger.get("movePercent")))
-            direction = str(trigger.get("direction") or "either").lower()
-            if spot <= 0 or reference <= 0 or move_percent <= 0:
-                return False, "Spot move reference unavailable.", {"spot": spot, "referencePrice": reference}
-            pct_move = ((spot - reference) / reference) * 100
-            hit = abs(pct_move) >= move_percent
-            if direction == "up":
-                hit = pct_move >= move_percent
-            elif direction == "down":
-                hit = pct_move <= -move_percent
-            return hit, f"Spot move {pct_move:.2f}% vs threshold {move_percent:.2f}%.", {
-                "spot": spot,
-                "referencePrice": reference,
-                "movePercent": move_percent,
-                "actualMovePercent": pct_move,
-                "direction": direction,
-            }
-        if trigger_type == "mtm_drawdown":
-            metrics = self._fetch_position_metrics(symbol)
-            threshold = _safe_float(trigger.get("maxDrawdown"))
-            current = _safe_float(metrics.get("mtm"))
-            return current <= threshold, f"Live MTM {current:.2f} vs drawdown threshold {threshold:.2f}.", {**metrics, "threshold": threshold}
-        if trigger_type == "mtm_profit_target":
-            metrics = self._fetch_position_metrics(symbol)
-            threshold = _safe_float(trigger.get("profitTarget"))
-            current = _safe_float(metrics.get("mtm"))
-            return current >= threshold, f"Live MTM {current:.2f} vs profit target {threshold:.2f}.", {**metrics, "threshold": threshold}
-        if trigger_type == "position_net_quantity_below":
-            metrics = self._fetch_position_metrics(symbol)
-            threshold = _safe_float(trigger.get("netQuantity"))
-            current = _safe_float(metrics.get("netQuantity"))
-            return current <= threshold, f"Live net quantity {current:.0f} vs floor {threshold:.0f}.", {**metrics, "threshold": threshold}
-        if trigger_type == "position_net_quantity_above":
-            metrics = self._fetch_position_metrics(symbol)
-            threshold = _safe_float(trigger.get("netQuantity"))
-            current = _safe_float(metrics.get("netQuantity"))
-            return current >= threshold, f"Live net quantity {current:.0f} vs ceiling {threshold:.0f}.", {**metrics, "threshold": threshold}
-        return False, f"Unsupported trigger type {trigger_type}.", {"triggerType": trigger_type}
-
-    def _normalise_action_legs(self, rule: dict) -> List[dict]:
-        action_config = rule.get("actionConfig") or {}
-        legs = action_config.get("legs") or []
-        normalised: List[dict] = []
-        for leg in legs:
-            order_type = str(leg.get("orderType") or "market").lower()
-            symbol = str(leg.get("symbol") or rule.get("symbol") or "NIFTY").upper()
-            exchange_code = str(leg.get("exchange_code") or ("NFO" if symbol == "NIFTY" else "BFO"))
-            lots = max(1, int(_safe_float(leg.get("lots"), 1)))
-            lot_size = 75 if symbol == "NIFTY" else 20
-            normalised.append({
-                "stock_code": str(leg.get("stock_code") or symbol),
-                "exchange_code": exchange_code,
-                "product": "options",
-                "action": str(leg.get("action") or "BUY").lower(),
-                "quantity": str(int(_safe_float(leg.get("quantity"), lots * lot_size))),
-                "price": str(leg.get("limitPrice") or leg.get("price") or 0),
-                "order_type": order_type,
-                "expiry_date": str(leg.get("expiry") or leg.get("expiry_date") or ""),
-                "right": "call" if str(leg.get("type") or leg.get("right") or "CE").upper().startswith("C") else "put",
-                "strike_price": str(leg.get("strike") or leg.get("strike_price") or 0),
-                "stoploss": str(leg.get("stoploss") or 0),
-            })
-        return normalised
-
-    def _execute_locked(self, rule: dict, trigger_meta: dict) -> dict:
-        action_config = rule.get("actionConfig") or {}
-        action_type = str(action_config.get("type") or "notify")
-        if action_type == "notify":
-            event = self._build_event(rule, "executed", "info", str(action_config.get("message") or rule.get("action") or "Automation notification triggered."), meta=trigger_meta)
-            self._append_event_locked(event)
-            rule["runCount"] = int(rule.get("runCount") or 0) + 1
-            rule["lastRun"] = self._fmt_run(self._now_ts())
-            rule["status"] = "paused" if str(rule.get("kind")) == "alert" else rule.get("status", "active")
-            rule["nextRun"] = "Paused" if rule["status"] == "paused" else "Live"
-            return event
-        if not self.engine.connected:
-            event = self._build_event(rule, "failed", "error", "Broker session is not connected.", meta=trigger_meta)
-            self._append_event_locked(event)
-            rule["lastRun"] = self._fmt_run(self._now_ts())
-            return event
-        legs = self._normalise_action_legs(rule)
-        if not legs:
-            event = self._build_event(rule, "failed", "error", "No automation legs configured.", meta=trigger_meta)
-            self._append_event_locked(event)
-            rule["lastRun"] = self._fmt_run(self._now_ts())
-            return event
-        results = self.engine.place_strategy_order(legs)
-        success = all(bool(item.get("success")) for item in results) if results else False
-        event = self._build_event(
-            rule,
-            "executed" if success else "failed",
-            "success" if success else "error",
-            "Broker automation execution completed." if success else "Broker automation execution had failures.",
-            broker_results=results,
-            meta=trigger_meta,
-        )
-        self._append_event_locked(event)
-        rule["runCount"] = int(rule.get("runCount") or 0) + 1
-        rule["lastRun"] = self._fmt_run(self._now_ts())
-        rule["status"] = "paused"
-        rule["nextRun"] = "Paused after trigger"
-        return event
-
-    def evaluate_active_rules(self) -> List[dict]:
-        events: List[dict] = []
-        with self._lock:
-            for rule in self._state.get("rules", []):
-                if str(rule.get("status")) != "active":
-                    continue
-                triggered, message, meta = self._trigger_status(rule)
-                if not triggered:
-                    continue
-                trigger_event = self._build_event(rule, "triggered", "warning", message, meta=meta)
-                self._append_event_locked(trigger_event)
-                events.append(trigger_event)
-                events.append(self._execute_locked(rule, meta))
-                rule["updatedAt"] = self._now_ts()
-            if events:
-                self._persist_locked()
-        return events
-
-
-class SellerReviewManager:
-    def __init__(self, path: str):
-        self.store = JsonStateStore(path, lambda: {"entries": [], "playbook_reviews": []})
-        self._lock = threading.Lock()
-        self._state = self.store.load()
-
-    def get_state(self) -> dict:
-        with self._lock:
-            return {
-                "entries": list(self._state.get("entries", [])),
-                "playbook_reviews": list(self._state.get("playbook_reviews", [])),
-            }
-
-    def replace_state(self, payload: dict) -> dict:
-        entries = payload.get("entries", []) if isinstance(payload, dict) else []
-        playbook_reviews = payload.get("playbookReviews", payload.get("playbook_reviews", [])) if isinstance(payload, dict) else []
-        if not isinstance(entries, list):
-            entries = []
-        if not isinstance(playbook_reviews, list):
-            playbook_reviews = []
-        with self._lock:
-            self._state = {
-                "entries": entries,
-                "playbook_reviews": playbook_reviews,
-            }
-            self.store.save(self._state)
-            return {
-                "entries": list(entries),
-                "playbook_reviews": list(playbook_reviews),
-            }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1151,7 +424,9 @@ class SellerReviewManager:
 
 class BreezeEngine:
     def __init__(self):
+        self.log          = log
         self.breeze       = None
+        self.broker_client = None
         self.session_key  = ""
         self.api_key      = ""
         self.api_secret   = ""
@@ -1159,6 +434,7 @@ class BreezeEngine:
         self.ws_running   = False
         self.subscribed   = set()
         self.rate_limiter = RateLimiter()
+        self.broker_client = BreezeBrokerClient(self.rate_limiter)
         self.tick_store   = TickStore()
         self.candle_store = CandleStore()
         self.validation_capture = ValidationCaptureStore(
@@ -1187,12 +463,10 @@ class BreezeEngine:
     # ── Authentication ────────────────────────────────────────────────────────
 
     def connect(self, api_key: str, api_secret: str, session_token: str) -> dict:
-        from breeze_connect import BreezeConnect
         self.api_key    = api_key
         self.api_secret = api_secret
         log.info(f"[Engine] connect — key:{api_key[:8]}... token:{session_token[:8]}...")
-        b = BreezeConnect(api_key=api_key)
-        b.generate_session(api_secret=api_secret, session_token=session_token)
+        b = self.broker_client.connect(api_key=api_key, api_secret=api_secret, session_token=session_token)
         self.breeze      = b
         self.session_key = b.session_key
         self.connected   = True
@@ -1202,7 +476,7 @@ class BreezeEngine:
 
         user_info = {}
         try:
-            det = b.get_customer_details()
+            det = self.broker_client.get_customer_details()
             if isinstance(det, dict) and det.get("Success"):
                 s = det["Success"]
                 user_info = {
@@ -1222,6 +496,8 @@ class BreezeEngine:
     def disconnect(self) -> None:
         self._stop_ws()
         self.breeze      = None
+        if self.broker_client:
+            self.broker_client.set_sdk(None)
         self.session_key = ""
         self.connected   = False
         self.subscribed.clear()
@@ -1276,17 +552,14 @@ class BreezeEngine:
         right_norm = "Call" if right.lower().startswith("c") else "Put"
         log.info(f"[REST] get_option_chain_quotes {stock_code} {expiry_date} {right_norm}")
 
-        def _call():
-            return self.breeze.get_option_chain_quotes(
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-                product_type="options",
-                expiry_date=expiry_date,
-                right=right_norm,
-                strike_price=strike_price,
-            )
-
-        result = self.rate_limiter.enqueue(_call)
+        result = self.broker_client.get_option_chain_quotes(
+            stock_code=stock_code,
+            exchange_code=exchange_code,
+            product_type="options",
+            expiry_date=expiry_date,
+            right=right_norm,
+            strike_price=strike_price,
+        )
         rows   = result.get("Success") if isinstance(result, dict) else []
 
         if rows:
@@ -1323,17 +596,14 @@ class BreezeEngine:
         if not self.connected:
             raise RuntimeError("Not connected")
 
-        def _call():
-            return self.breeze.get_quotes(
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-                expiry_date=expiry_date,
-                right=right,
-                strike_price=strike_price,
-                product_type="options",
-            )
-
-        return self.rate_limiter.enqueue(_call)
+        return self.broker_client.get_quotes(
+            stock_code=stock_code,
+            exchange_code=exchange_code,
+            expiry_date=expiry_date,
+            right=right,
+            strike_price=strike_price,
+            product_type="options",
+        )
 
     # ── REST: Orders ──────────────────────────────────────────────────────────
 
@@ -1343,26 +613,23 @@ class BreezeEngine:
 
         right_norm = "Call" if (leg.get("right") or "call").lower().startswith("c") else "Put"
 
-        def _call():
-            return self.breeze.place_order(
-                stock_code=leg["stock_code"],
-                exchange_code=leg.get("exchange_code", "NFO"),
-                product=leg.get("product", "options"),
-                action=leg.get("action", "buy").lower(),
-                order_type=leg.get("order_type", "market"),
-                stoploss=str(leg.get("stoploss", "0")),
-                quantity=str(leg["quantity"]),
-                price=str(leg.get("price", "0")),
-                validity="day",
-                validity_date=leg["expiry_date"],
-                disclosed_quantity="0",
-                expiry_date=leg["expiry_date"],
-                right=right_norm,
-                strike_price=str(leg["strike_price"]),
-                user_remark=leg.get("user_remark", "OptionsTerminalV7"),
-            )
-
-        return self.rate_limiter.enqueue(_call)
+        return self.broker_client.place_order(
+            stock_code=leg["stock_code"],
+            exchange_code=leg.get("exchange_code", "NFO"),
+            product=leg.get("product", "options"),
+            action=leg.get("action", "buy").lower(),
+            order_type=leg.get("order_type", "market"),
+            stoploss=str(leg.get("stoploss", "0")),
+            quantity=str(leg["quantity"]),
+            price=str(leg.get("price", "0")),
+            validity="day",
+            validity_date=leg["expiry_date"],
+            disclosed_quantity="0",
+            expiry_date=leg["expiry_date"],
+            right=right_norm,
+            strike_price=str(leg["strike_price"]),
+            user_remark=leg.get("user_remark", "OptionsTerminalV7"),
+        )
 
     def place_strategy_order(self, legs: List[dict]) -> List[dict]:
         if not self.connected:
@@ -1411,13 +678,7 @@ class BreezeEngine:
         if not self.connected:
             raise RuntimeError("Not connected")
 
-        def _call():
-            return self.breeze.cancel_order(
-                exchange_code=exchange_code,
-                order_id=order_id,
-            )
-
-        return self.rate_limiter.enqueue(_call)
+        return self.broker_client.cancel_order(exchange_code=exchange_code, order_id=order_id)
 
     def modify_order(
         self,
@@ -1431,17 +692,14 @@ class BreezeEngine:
         if not self.connected:
             raise RuntimeError("Not connected")
 
-        def _call():
-            return self.breeze.modify_order(
-                exchange_code=exchange_code,
-                order_id=order_id,
-                quantity=quantity,
-                price=price,
-                stoploss=stoploss,
-                validity=validity,
-            )
-
-        return self.rate_limiter.enqueue(_call)
+        return self.broker_client.modify_order(
+            exchange_code=exchange_code,
+            order_id=order_id,
+            quantity=quantity,
+            price=price,
+            stoploss=stoploss,
+            validity=validity,
+        )
 
     # ── REST: Books & Portfolio ───────────────────────────────────────────────
 
@@ -1449,8 +707,7 @@ class BreezeEngine:
         if not self.connected:
             raise RuntimeError("Not connected")
         now = datetime.now()
-        return self.rate_limiter.enqueue(
-            self.breeze.get_order_list,
+        return self.broker_client.get_order_list(
             exchange_code="NFO",
             from_date=now.strftime("%Y-%m-%dT00:00:00.000Z"),
             to_date=now.strftime("%Y-%m-%dT23:59:59.000Z"),
@@ -1460,8 +717,7 @@ class BreezeEngine:
         if not self.connected:
             raise RuntimeError("Not connected")
         now = datetime.now()
-        return self.rate_limiter.enqueue(
-            self.breeze.get_trade_list,
+        return self.broker_client.get_trade_list(
             exchange_code="NFO",
             from_date=now.strftime("%Y-%m-%dT00:00:00.000Z"),
             to_date=now.strftime("%Y-%m-%dT23:59:59.000Z"),
@@ -1470,8 +726,8 @@ class BreezeEngine:
     def get_positions(self) -> dict:
         if not self.connected:
             raise RuntimeError("Not connected")
-        pos = self.rate_limiter.enqueue(self.breeze.get_portfolio_positions)
-        hld = self.rate_limiter.enqueue(self.breeze.get_portfolio_holdings)
+        pos = self.broker_client.get_portfolio_positions()
+        hld = self.broker_client.get_portfolio_holdings()
         rows = pos.get("Success", []) if isinstance(pos, dict) else []
         return {
             "positions": rows,
@@ -1503,7 +759,7 @@ class BreezeEngine:
     def get_funds(self) -> dict:
         if not self.connected:
             raise RuntimeError("Not connected")
-        result = self.rate_limiter.enqueue(self.breeze.get_funds)
+        result = self.broker_client.get_funds()
         return result.get("Success", {}) if isinstance(result, dict) else {}
 
     def _normalise_execution_leg(self, leg: dict) -> dict:
@@ -1672,7 +928,7 @@ class BreezeEngine:
 
         positions = [self._build_margin_position(leg) for leg in legs]
         exchange_code = str(legs[0].get("exchange_code", "NFO"))
-        result = self.rate_limiter.enqueue(self.breeze.margin_calculator, positions, exchange_code)
+        result = self.broker_client.margin_calculator(positions, exchange_code)
         payload = self._extract_success_payload(result)
         validation = self._record_execution_validation("margin", legs, result, payload)
         funds = self.get_funds()
@@ -1778,8 +1034,7 @@ class BreezeEngine:
             capital_at_risk += abs(price * quantity)
             slippage += abs(price * quantity) * 0.0006
 
-            response = self.rate_limiter.enqueue(
-                self.breeze.preview_order,
+            response = self.broker_client.preview_order(
                 stock_code=normalised["stock_code"],
                 exchange_code=normalised["exchange_code"],
                 product=normalised["product"],
@@ -1957,24 +1212,22 @@ class BreezeEngine:
         if not self.connected:
             raise RuntimeError("Not connected")
 
-        def _call():
-            kwargs: dict = dict(
-                interval=interval,
-                from_date=from_date,
-                to_date=to_date,
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-            )
-            if expiry_date:
-                kwargs["expiry_date"]  = expiry_date
-                kwargs["product_type"] = "options"
-            if right:
-                kwargs["right"] = right
-            if strike_price:
-                kwargs["strike_price"] = strike_price
-            return self.breeze.get_historical_data_v2(**kwargs)
+        kwargs: dict = dict(
+            interval=interval,
+            from_date=from_date,
+            to_date=to_date,
+            stock_code=stock_code,
+            exchange_code=exchange_code,
+        )
+        if expiry_date:
+            kwargs["expiry_date"]  = expiry_date
+            kwargs["product_type"] = "options"
+        if right:
+            kwargs["right"] = right
+        if strike_price:
+            kwargs["strike_price"] = strike_price
 
-        result = self.rate_limiter.enqueue(_call)
+        result = self.broker_client.get_historical_data_v2(**kwargs)
         candles = result.get("Success", []) if isinstance(result, dict) else []
         if candles and not expiry_date:
             self.candle_store.seed(stock_code.upper(), interval, candles)
@@ -1993,17 +1246,14 @@ class BreezeEngine:
 
         right_norm = "Call" if right.lower().startswith("c") else "Put"
 
-        def _call():
-            return self.breeze.get_market_depth(
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-                product_type="options",
-                expiry_date=expiry_date,
-                right=right_norm,
-                strike_price=strike_price,
-            )
-
-        result = self.rate_limiter.enqueue(_call)
+        result = self.broker_client.get_market_depth(
+            stock_code=stock_code,
+            exchange_code=exchange_code,
+            product_type="options",
+            expiry_date=expiry_date,
+            right=right_norm,
+            strike_price=strike_price,
+        )
         rows = result.get("Success") if isinstance(result, dict) else []
         if isinstance(rows, dict):
             rows = [rows]
@@ -2123,8 +1373,8 @@ class BreezeEngine:
 
             def _run():
                 try:
-                    self.breeze.on_ticks = self._on_ticks
-                    self.breeze.ws_connect()
+                    self.broker_client.set_on_ticks(self._on_ticks)
+                    self.broker_client.ws_connect()
                     self.ws_running = True
                     log.info("[WS] ws_connect() established")
                 except Exception as exc:
@@ -2138,9 +1388,9 @@ class BreezeEngine:
                 time.sleep(0.5)
 
     def _stop_ws(self) -> None:
-        if self.breeze and self.ws_running:
+        if self.broker_client and self.ws_running:
             try:
-                self.breeze.ws_disconnect()
+                self.broker_client.ws_disconnect()
             except Exception:
                 pass
         self.ws_running = False
@@ -2170,7 +1420,7 @@ class BreezeEngine:
                 if sub_key in self.subscribed:
                     continue
                 try:
-                    self.breeze.subscribe_feeds(
+                    self.broker_client.subscribe_feeds(
                         stock_code=stock_code,
                         exchange_code=exchange_code,
                         product_type="options",
@@ -2193,7 +1443,7 @@ class BreezeEngine:
         }
 
     def unsubscribe_all(self) -> None:
-        if not self.ws_running or not self.breeze:
+        if not self.ws_running or not self.broker_client:
             return
         for sub_key in list(self.subscribed):
             try:
@@ -2201,7 +1451,7 @@ class BreezeEngine:
                 if len(parts) >= 4:
                     stock, strike, right_abbr, expiry = parts
                     right = "Call" if right_abbr.startswith("C") else "Put"
-                    self.breeze.unsubscribe_feeds(
+                    self.broker_client.unsubscribe_feeds(
                         stock_code=stock,
                         exchange_code="NFO" if stock == "NIFTY" else "BFO",
                         product_type="options",
@@ -2242,753 +1492,6 @@ app = create_app(
 )
 
 runtime_app = app
-
-LEGACY_ROUTE_ARCHIVE = r'''
-# ── Health ─────────────────────────────────────────────────────────────────────
-
-@app.get("/")
-@app.get("/health")
-async def health(request: Request):
-    return {
-        "status":         "online",
-        "connected":      engine.connected,
-        "ws_running":     engine.ws_running,
-        "subscriptions":  len(engine.subscribed),
-        "tick_count":     len(engine.tick_store.get_all()["ticks"]),
-        "rest_calls_min": engine.rate_limiter.calls_last_minute,
-        "queue_depth":    engine.rate_limiter.queue_depth,
-        "auth_enabled":   AUTH_ENABLED,
-        "version":        "7.0",
-        "timestamp":      datetime.utcnow().isoformat() + "Z",
-    }
-
-
-@app.get("/ping")
-async def ping():
-    return {"status": "online", "version": "7.0", "ts": datetime.utcnow().isoformat() + "Z"}
-
-
-# ── Connect / Disconnect ───────────────────────────────────────────────────────
-
-@app.post("/api/connect")
-async def api_connect(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    qp            = request.query_params
-    api_key       = body.get("api_key")       or qp.get("api_key")
-    api_secret    = body.get("api_secret")    or qp.get("api_secret")
-    session_token = (
-        body.get("session_token") or qp.get("session_token") or
-        body.get("apisession")    or qp.get("apisession")
-    )
-
-    if not all([api_key, api_secret, session_token]):
-        return JSONResponse(
-            status_code=400,
-            content={"success": False, "error": "Missing: api_key, api_secret, session_token"},
-        )
-
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, engine.connect, api_key, api_secret, session_token
-        )
-        return result
-    except Exception as exc:
-        msg  = str(exc)
-        hint = (
-            " → Token stale — get a fresh ?apisession= today."
-            if "null" in msg.lower()
-            else " → Check API Key/Secret."
-            if "key" in msg.lower()
-            else ""
-        )
-        return JSONResponse(
-            status_code=200,
-            content={"success": False, "error": msg + hint},
-        )
-
-
-@app.post("/api/disconnect")
-async def api_disconnect():
-    await asyncio.get_event_loop().run_in_executor(None, engine.disconnect)
-    return {"success": True, "message": "Disconnected"}
-
-
-# ── Expiry dates ───────────────────────────────────────────────────────────────
-
-@app.get("/api/expiries")
-async def api_expiries(
-    stock_code:    str = Query("NIFTY"),
-    exchange_code: str = Query("NFO"),
-):
-    expiries = BreezeEngine.get_weekly_expiries(stock_code, count=5)
-    return {"success": True, "stock_code": stock_code, "expiries": expiries}
-
-
-
-# ── Live Spot Price ─────────────────────────────────────────────────────────────
-# FIX: New endpoint to fetch the actual NIFTY/SENSEX index spot price directly
-# from Breeze, bypassing the inaccurate put-call parity derivation in the frontend.
-# NIFTY index: stock_code="NIFTY", exchange_code="NSE" (NSE cash market)
-# SENSEX index: stock_code="SENSEX", exchange_code="BSE" (BSE cash market)
-
-@app.get("/api/spot")
-async def api_spot(
-    stock_code:    str = Query("NIFTY"),
-    exchange_code: str = Query("NSE"),
-):
-    """
-    Fetch live index spot price directly from Breeze.
-    For NIFTY: stock_code=NIFTY, exchange_code=NSE
-    For SENSEX: stock_code=SENSEX, exchange_code=BSE
-
-    Priority 1: Return cached value from WS tick (index_close_price field).
-    Priority 2: Call get_quotes() as REST fallback (costs 1 rate-limiter slot).
-    """
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected — POST /api/connect first")
-
-    # Priority 1: Try tick store (populated from index_close_price in WS ticks)
-    spot_prices = engine.tick_store.get_spot_prices()
-    cached = spot_prices.get(stock_code.upper())
-    if cached and cached > 1000:
-        return {"success": True, "spot": cached, "source": "ws_tick",
-                "stock_code": stock_code, "exchange_code": exchange_code}
-
-    # Priority 2: REST call to Breeze get_quotes
-    try:
-        def _call():
-            return engine.breeze.get_quotes(
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-                expiry_date="",
-                right="",
-                strike_price="",
-            )
-        result = engine.rate_limiter.enqueue(_call)
-        rows = []
-        if isinstance(result, dict):
-            rows = result.get("Success", []) or []
-        if isinstance(rows, dict):
-            rows = [rows]
-        for row in rows:
-            ltp = 0.0
-            for field in ("ltp", "last_traded_price", "close", "last_price", "LastPrice"):
-                v = row.get(field)
-                if v:
-                    try:
-                        ltp = float(v)
-                    except (ValueError, TypeError):
-                        pass
-                    if ltp > 0:
-                        break
-            if ltp > 1000:
-                # Cache it in tick store for next WS push
-                engine.tick_store.update(f"{stock_code.upper()}:SPOT", {
-                    "ltp": ltp, "is_spot": True, "source": "rest"
-                })
-                return {"success": True, "spot": ltp, "source": "rest_quote",
-                        "stock_code": stock_code, "exchange_code": exchange_code}
-        return {"success": False,
-                "error": f"No spot price returned for {stock_code}/{exchange_code}. "
-                         f"Raw Breeze response: {str(result)[:200]}"}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── Option Chain ──────────────────────────────────────────────────────────────
-
-@app.get("/api/optionchain")
-async def api_optionchain(
-    stock_code:    str           = Query("NIFTY"),
-    exchange_code: str           = Query("NFO"),
-    expiry_date:   str           = Query(...),
-    right:         Optional[str] = Query("Call"),
-    strike_price:  str           = Query(""),
-):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected — POST /api/connect first")
-
-    right_norm = "Call" if (right or "Call").lower().startswith("c") else "Put"
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(
-            None,
-            engine.fetch_option_chain,
-            stock_code, exchange_code, expiry_date, right_norm, strike_price,
-        )
-        return {"success": True, "data": data, "count": len(data)}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── Single Quote ───────────────────────────────────────────────────────────────
-
-@app.get("/api/quote")
-async def api_quote(
-    stock_code:    str = Query(...),
-    exchange_code: str = Query(...),
-    expiry_date:   str = Query(...),
-    right:         str = Query(...),
-    strike_price:  str = Query(...),
-):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(
-            None, engine.get_quote,
-            stock_code, exchange_code, expiry_date, right, strike_price,
-        )
-        return {"success": True, "data": data}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── WebSocket subscription ─────────────────────────────────────────────────────
-
-@app.post("/api/ws/subscribe")
-async def api_ws_subscribe(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-
-    stock_code    = body.get("stock_code", "NIFTY")
-    exchange_code = body.get("exchange_code", "NFO")
-    expiry_date   = body.get("expiry_date", "")
-    strikes       = body.get("strikes", [])
-    rights        = body.get("rights", ["Call", "Put"])
-
-    if not expiry_date or not strikes:
-        return JSONResponse(
-            status_code=400,
-            content={"success": False, "error": "expiry_date and strikes required"},
-        )
-
-    await asyncio.get_event_loop().run_in_executor(None, engine.unsubscribe_all)
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            engine.subscribe_option_chain,
-            stock_code, exchange_code, expiry_date, strikes, rights,
-        )
-        return {"success": True, **result}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── WebSocket tick stream (frontend connects here) ────────────────────────────
-
-@app.websocket("/ws/ticks")
-async def ws_ticks(websocket: WebSocket):
-    await websocket.accept()
-    log.info(f"[WS] frontend connected: {websocket.client}")
-    last_version      = -1
-    heartbeat_counter = 0
-    try:
-        while True:
-            await asyncio.sleep(0.5)
-            current_version = engine.tick_store.get_version()
-            heartbeat_counter += 1
-
-            if current_version == last_version:
-                if heartbeat_counter % 10 == 0:
-                    await websocket.send_json({
-                        "type":           "heartbeat",
-                        "ts":             time.time(),
-                        "ws_live":        engine.ws_running,
-                        "candle_streams": engine.candle_store.to_stream_payload(limit=2),
-                    })
-                continue
-
-            last_version = current_version
-            await websocket.send_json({
-                "type":           "tick_update",
-                "version":        current_version,
-                "ticks":          engine.tick_store.to_option_chain_delta(),
-                "spot_prices":    engine.tick_store.get_spot_prices(),
-                "candle_streams": engine.candle_store.to_stream_payload(limit=2),
-                "ts":             time.time(),
-                "ws_live":        engine.ws_running,
-            })
-    except WebSocketDisconnect:
-        log.info("[WS] frontend disconnected")
-    except Exception as exc:
-        log.warning(f"[WS] error: {exc}")
-
-
-# ── Tick REST fallback ─────────────────────────────────────────────────────────
-
-@app.get("/api/ticks")
-async def api_ticks(since_version: int = Query(0)):
-    data = engine.tick_store.get_all()
-    if data["version"] <= since_version:
-        return {"changed": False, "version": data["version"]}
-    return {
-        "changed":        True,
-        "version":        data["version"],
-        "ticks":          engine.tick_store.to_option_chain_delta(),
-        "spot_prices":    engine.tick_store.get_spot_prices(),
-        "candle_streams": engine.candle_store.to_stream_payload(limit=2),
-        "ws_live":        engine.ws_running,
-    }
-
-
-# ── Orders ─────────────────────────────────────────────────────────────────────
-
-@app.post("/api/preview")
-async def api_preview(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-
-    legs = body.get("legs", [])
-    if not legs:
-        return {"success": True, "data": engine.preview_strategy([])}
-
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.preview_strategy, legs)
-        return {"success": True, "data": data}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.post("/api/margin")
-async def api_margin(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-
-    legs = body.get("legs", [])
-    if not legs:
-        return {"success": True, "data": engine.calculate_margin([])}
-
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.calculate_margin, legs)
-        return {
-            "success": True,
-            "data": {
-                "estimatedPremium": 0.0,
-                "estimatedFees": 0.0,
-                "slippage": 0.0,
-                "capitalAtRisk": 0.0,
-                "marginRequired": data["margin_required"],
-                "availableMargin": data["available_margin"],
-                "spanMargin": data["span_margin"],
-                "blockTradeMargin": data["block_trade_margin"],
-                "orderMargin": data["order_margin"],
-                "tradeMargin": data["trade_margin"],
-                "chargesBreakdown": {},
-                "notes": [],
-                "updated_at": time.time(),
-                "validation": data.get("validation"),
-            },
-        }
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.post("/api/repair-preview")
-async def api_repair_preview(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-
-    current_legs = body.get("current_legs", [])
-    repair_legs = body.get("repair_legs", [])
-    meta = body.get("meta", {})
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.repair_preview, current_legs, repair_legs, meta)
-        return {"success": True, "data": data}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.get("/api/diagnostics/execution-validation")
-async def api_execution_validation(limit: int = Query(10)):
-    return {
-        "success": True,
-        "capture_file": engine.validation_capture.path,
-        "records": engine.validation_capture.recent(limit),
-    }
-
-@app.post("/api/order")
-async def api_order(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-    try:
-        results = await asyncio.get_event_loop().run_in_executor(
-            None, engine.place_strategy_order, [body]
-        )
-        r = results[0]
-        return {
-            "success":  r["success"],
-            "order_id": r.get("order_id", ""),
-            "error":    r.get("error", ""),
-        }
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.post("/api/strategy/execute")
-async def api_strategy_execute(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-
-    legs = body.get("legs", [])
-    if not legs:
-        return JSONResponse(status_code=400, content={"success": False, "error": "No legs provided"})
-
-    try:
-        results = await asyncio.get_event_loop().run_in_executor(
-            None, engine.place_strategy_order, legs
-        )
-        return {"success": all(r["success"] for r in results), "results": results}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.get("/api/automation/rules")
-async def api_automation_rules():
-    return {"success": True, "rules": engine.automation_rules.list_rules()}
-
-
-@app.post("/api/automation/rules")
-async def api_automation_create_rule(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-    try:
-        rule = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.create_rule, body)
-        return {"success": True, "rule": rule}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.put("/api/automation/rules/{rule_id}")
-async def api_automation_update_rule(rule_id: str, request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-    rule = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.update_rule, rule_id, body)
-    if not rule:
-        return JSONResponse(status_code=404, content={"success": False, "error": "Rule not found"})
-    return {"success": True, "rule": rule}
-
-
-@app.delete("/api/automation/rules/{rule_id}")
-async def api_automation_delete_rule(rule_id: str):
-    rule = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.delete_rule, rule_id)
-    if not rule:
-        return JSONResponse(status_code=404, content={"success": False, "error": "Rule not found"})
-    return {"success": True, "rule": rule}
-
-
-@app.post("/api/automation/rules/{rule_id}/status")
-async def api_automation_update_rule_status(rule_id: str, request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    status = str(body.get("status") or "")
-    if status not in {"active", "paused", "draft"}:
-        return JSONResponse(status_code=400, content={"success": False, "error": "status must be active, paused, or draft"})
-    rule = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.update_rule_status, rule_id, status)
-    if not rule:
-        return JSONResponse(status_code=404, content={"success": False, "error": "Rule not found"})
-    return {"success": True, "rule": rule}
-
-
-@app.post("/api/automation/evaluate")
-async def api_automation_evaluate():
-    try:
-        events = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.evaluate_active_rules)
-        return {"success": True, "events": events, "count": len(events)}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.get("/api/automation/callbacks")
-async def api_automation_callbacks(limit: int = Query(25)):
-    return {"success": True, "events": engine.automation_rules.list_callbacks(limit=limit)}
-
-
-@app.get("/api/reviews/state")
-async def api_review_state():
-    return {"success": True, "data": engine.seller_reviews.get_state()}
-
-
-@app.put("/api/reviews/state")
-async def api_review_state_replace(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.seller_reviews.replace_state, body)
-        return {"success": True, "data": data}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.post("/api/automation/callbacks")
-async def api_automation_receive_callback(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        try:
-            form = await request.form()
-            body = dict(form)
-        except Exception:
-            return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-    try:
-        event = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.receive_callback, body)
-        return {"success": True, "event": event}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.post("/api/automation/callbacks/webhook")
-async def api_automation_receive_webhook(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        try:
-            form = await request.form()
-            body = dict(form)
-        except Exception:
-            return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-    try:
-        event = await asyncio.get_event_loop().run_in_executor(None, engine.automation_rules.receive_callback, body, "webhook")
-        return {"success": True, "event": event}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── Square Off ─────────────────────────────────────────────────────────────────
-
-@app.post("/api/squareoff")
-async def api_squareoff(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, engine.square_off_position, body
-        )
-        ok  = isinstance(result, dict) and result.get("Status") == 200
-        oid = (result.get("Success") or {}).get("order_id", "") if ok else ""
-        return {
-            "success":  ok,
-            "order_id": oid,
-            "error":    result.get("Error", "") if not ok else "",
-        }
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── Cancel / Modify ────────────────────────────────────────────────────────────
-
-@app.post("/api/order/cancel")
-async def api_cancel_order(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-
-    order_id      = body.get("order_id", "")
-    exchange_code = body.get("exchange_code", "NFO")
-    if not order_id:
-        return JSONResponse(status_code=400, content={"success": False, "error": "order_id required"})
-
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, engine.cancel_order, order_id, exchange_code
-        )
-        ok = isinstance(result, dict) and result.get("Status") == 200
-        return {"success": ok, "error": result.get("Error", "") if not ok else ""}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.patch("/api/order/modify")
-async def api_modify_order(request: Request):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid JSON"})
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            engine.modify_order,
-            body.get("order_id", ""),
-            body.get("exchange_code", "NFO"),
-            str(body.get("quantity", "0")),
-            str(body.get("price", "0")),
-            str(body.get("stoploss", "0")),
-            body.get("validity", "day"),
-        )
-        ok = isinstance(result, dict) and result.get("Status") == 200
-        return {"success": ok, "error": result.get("Error", "") if not ok else ""}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── Books ──────────────────────────────────────────────────────────────────────
-
-@app.get("/api/orders")
-async def api_order_book():
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_order_book)
-        return {"success": True, "data": data.get("Success", []) if isinstance(data, dict) else []}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.get("/api/trades")
-async def api_trade_book():
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_trade_book)
-        return {"success": True, "data": data.get("Success", []) if isinstance(data, dict) else []}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── Positions / Funds ──────────────────────────────────────────────────────────
-
-@app.get("/api/positions")
-async def api_positions():
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_positions)
-        return {"success": True, "data": data}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.get("/api/funds")
-async def api_funds():
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_funds)
-        return {"success": True, "data": data}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── Historical ─────────────────────────────────────────────────────────────────
-
-@app.get("/api/historical")
-async def api_historical(
-    stock_code:    str = Query(...),
-    exchange_code: str = Query(...),
-    interval:      str = Query("1day"),
-    from_date:     str = Query(...),
-    to_date:       str = Query(...),
-    expiry_date:   str = Query(""),
-    right:         str = Query(""),
-    strike_price:  str = Query(""),
-):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(
-            None,
-            engine.get_historical,
-            stock_code, exchange_code, interval, from_date, to_date,
-            expiry_date, right, strike_price,
-        )
-        return {"success": True, "data": data}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-@app.get("/api/depth")
-async def api_depth(
-    stock_code: str = Query(...),
-    exchange_code: str = Query(...),
-    expiry_date: str = Query(...),
-    right: str = Query(...),
-    strike_price: str = Query(...),
-):
-    if not engine.connected:
-        raise HTTPException(status_code=401, detail="Not connected")
-    try:
-        data = await asyncio.get_event_loop().run_in_executor(
-            None,
-            engine.get_market_depth,
-            stock_code, exchange_code, expiry_date, right, strike_price,
-        )
-        return {"success": True, "data": data}
-    except Exception as exc:
-        return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
-
-
-# ── Rate limit / Checksum ──────────────────────────────────────────────────────
-
-@app.get("/api/ratelimit")
-async def api_ratelimit():
-    return {
-        "calls_last_minute": engine.rate_limiter.calls_last_minute,
-        "max_per_minute":    100,
-        "min_interval_ms":   RateLimiter.MIN_INTERVAL_MS,
-        "queue_depth":       engine.rate_limiter.queue_depth,
-    }
-
-
-@app.post("/api/checksum")
-async def api_checksum(request: Request):
-    try:
-        body      = await request.json()
-        timestamp = body.get(
-            "timestamp",
-            datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-        )
-        checksum  = BreezeEngine.generate_checksum(
-            timestamp,
-            body.get("payload", {}),
-            body.get("secret", ""),
-        )
-        return {"checksum": checksum, "timestamp": timestamp}
-    except Exception as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc)})
-'''
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

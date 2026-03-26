@@ -1,9 +1,10 @@
-import React, { Suspense, lazy, useEffect } from 'react';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
 import { ChevronUp } from 'lucide-react';
 import { ConnectBrokerModal } from '../../components/ConnectBrokerModal';
 import { useExecutionStore } from '../../domains/execution/executionStore';
 import { useMarketStore } from '../../domains/market/marketStore';
 import { useSessionStore } from '../../domains/session/sessionStore';
+import { brokerGatewayClient } from '../../services/broker/brokerGatewayClient';
 import { useLayoutStore } from '../../state/layout/layoutStore';
 import { useTerminalStore } from '../../state/terminal/terminalStore';
 import { CommandPalette } from './CommandPalette';
@@ -22,6 +23,10 @@ const RiskWorkspace = lazy(() => import('../workspaces/RiskWorkspace').then((mod
 const AutomationWorkspace = lazy(() => import('../workspaces/AutomationWorkspace').then((module) => ({ default: module.AutomationWorkspace })));
 const ConnectionsWorkspace = lazy(() => import('../workspaces/ConnectionsWorkspace').then((module) => ({ default: module.ConnectionsWorkspace })));
 
+const SHELL_LAYOUT_ID = 'shell-default';
+const SHELL_WORKSPACE_ID = 'terminal-shell';
+const SHELL_LAYOUT_NAME = 'Terminal Shell';
+
 export function AppShell({
   currentPath,
   onNavigate,
@@ -37,7 +42,11 @@ export function AppShell({
   const setKeyboardMode = useTerminalStore((state) => state.setKeyboardMode);
   const toggleCommandPalette = useTerminalStore((state) => state.toggleCommandPalette);
   const bottomDockOpen = useLayoutStore((state) => state.bottomDockOpen);
+  const bottomDockHeight = useLayoutStore((state) => state.bottomDockHeight);
+  const rightDrawerOpen = useLayoutStore((state) => state.rightDrawerOpen);
   const setBottomDockOpen = useLayoutStore((state) => state.setBottomDockOpen);
+  const hydrateLayout = useLayoutStore((state) => state.hydrate);
+  const snapshotLayout = useLayoutStore((state) => state.snapshot);
   const {
     session,
     showConnectionCenter,
@@ -45,10 +54,53 @@ export function AppShell({
     closeConnectionCenter,
     connectSession,
   } = useSessionStore();
+  const [layoutHydrated, setLayoutHydrated] = useState(false);
 
   useEffect(() => {
     setLinkedSymbol(symbol);
   }, [setLinkedSymbol, symbol]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLayoutHydrated(false);
+
+    if (!session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) {
+      setLayoutHydrated(true);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void (async () => {
+      const result = await brokerGatewayClient.layout.fetch(session, SHELL_LAYOUT_ID);
+      if (cancelled) return;
+      if (result.ok && result.layout && !Array.isArray(result.layout.panels)) {
+        hydrateLayout(result.layout.panels as Record<string, unknown>);
+      }
+      setLayoutHydrated(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hydrateLayout, session]);
+
+  useEffect(() => {
+    if (!layoutHydrated || !session?.isConnected || !brokerGatewayClient.session.isBackend(session.proxyBase)) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      const panels = snapshotLayout();
+      void brokerGatewayClient.layout.save(session, SHELL_LAYOUT_ID, {
+        workspace_id: SHELL_WORKSPACE_ID,
+        name: SHELL_LAYOUT_NAME,
+        panels: panels as unknown as Record<string, unknown>,
+        is_default: true,
+      });
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [bottomDockHeight, bottomDockOpen, layoutHydrated, rightDrawerOpen, session, snapshotLayout]);
 
   useEffect(() => {
     if (commandPaletteOpen) return;

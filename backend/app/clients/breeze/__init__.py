@@ -1,1 +1,3 @@
-"""Breeze client wrappers extracted from the legacy backend."""
+from .client import BreezeBrokerClient
+
+__all__ = ["BreezeBrokerClient"]

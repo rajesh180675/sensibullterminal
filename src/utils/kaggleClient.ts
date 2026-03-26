@@ -451,6 +451,16 @@ export async function checkBackendHealth(backendUrl: string): Promise<HealthResu
   };
 }
 
+export interface BackendWorkspaceLayout {
+  layout_id: string;
+  workspace_id: string;
+  name: string;
+  panels: Record<string, unknown> | unknown[];
+  is_default?: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
 // ── Connect ───────────────────────────────────────────────────────────────────
 
 export async function connectToBreeze(params: {
@@ -864,6 +874,42 @@ export async function saveSellerReviewState(
       body: JSON.stringify(payload),
     });
     return data.success ? { ok: true, data: data.data } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function fetchLayout(
+  backendUrl: string,
+  layoutId: string,
+): Promise<{ ok: boolean; layout?: BackendWorkspaceLayout; error?: string }> {
+  const url = apiUrl(backendUrl, `/api/layouts/${encodeURIComponent(layoutId)}`);
+  try {
+    const data = await fetchJson<{ success: boolean; data?: BackendWorkspaceLayout; error?: string }>(url);
+    return data.success ? { ok: true, layout: data.data } : { ok: false, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function saveLayout(
+  backendUrl: string,
+  layoutId: string,
+  payload: {
+    workspace_id: string;
+    name: string;
+    panels: Record<string, unknown>;
+    is_default?: boolean;
+  },
+): Promise<{ ok: boolean; layout?: BackendWorkspaceLayout; error?: string }> {
+  const url = apiUrl(backendUrl, `/api/layouts/${encodeURIComponent(layoutId)}`);
+  try {
+    const data = await fetchJson<{ success: boolean; data?: BackendWorkspaceLayout; error?: string }>(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return data.success ? { ok: true, layout: data.data } : { ok: false, error: data.error };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }

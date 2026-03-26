@@ -14,6 +14,7 @@ import {
   fetchFunds,
   fetchExpiryDates,
   fetchHistorical,
+  fetchLayout,
   fetchMarginPreview,
   fetchMarketDepth,
   fetchOptionChain,
@@ -22,6 +23,7 @@ import {
   fetchRepairPreview,
   fetchSellerReviewState,
   saveSellerReviewState,
+  saveLayout,
   squareOffPosition,
   fetchSpotPrice,
   fetchTradeBook,
@@ -272,6 +274,18 @@ export const brokerGatewayClient = {
     },
     async saveState(session: BreezeSession, payload: Record<string, unknown>) {
       return saveSellerReviewState(session.proxyBase, payload);
+    },
+  },
+  layout: {
+    async fetch(session: BreezeSession, layoutId: string) {
+      return fetchLayout(session.proxyBase, layoutId);
+    },
+    async save(
+      session: BreezeSession,
+      layoutId: string,
+      payload: { workspace_id: string; name: string; panels: Record<string, unknown>; is_default?: boolean },
+    ) {
+      return saveLayout(session.proxyBase, layoutId, payload);
     },
   },
 };
