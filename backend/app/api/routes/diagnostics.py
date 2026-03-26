@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
-from ...core.state import get_backend_state
+from ...core.state import get_backend_state, require_audit_log
 
 router = APIRouter()
 
@@ -32,3 +32,9 @@ async def api_checksum(request: Request):
         timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
     checksum = backend.engine.__class__.generate_checksum(timestamp, body.get("payload", {}), body.get("secret", ""))
     return {"checksum": checksum, "timestamp": timestamp}
+
+
+@router.get("/api/diagnostics/audit-log")
+async def api_audit_log(request: Request, limit: int = Query(25)):
+    audit_log = require_audit_log(request)
+    return {"success": True, "records": audit_log.list_recent(limit)}

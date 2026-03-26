@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from .api.routes.automation import router as automation_router
 from .api.routes.compat import router as compat_router
 from .api.routes.diagnostics import router as diagnostics_router
+from .api.routes.layouts import router as layouts_router
 from .api.routes.market import router as market_router
 from .api.routes.orders import router as orders_router
 from .api.routes.portfolio import router as portfolio_router
@@ -15,6 +16,18 @@ from .api.routes.session import router as session_router
 from .api.routes.stream import router as stream_router
 from .core.settings import settings
 from .core.state import BackendState
+from .services.automation.rule_service import RuleService
+from .services.layout.layout_service import LayoutService
+from .services.market.market_service import MarketService
+from .services.orders.order_service import OrderService
+from .services.portfolio.portfolio_service import PortfolioService
+from .services.review.journal_service import JournalService
+from .services.session.connection_service import ConnectionService
+from .services.streaming.stream_service import StreamService
+from .services.streaming.tick_store import TickStoreFacade
+from .storage.audit_log_repo import AuditLogRepository
+from .storage.database import init_sqlite
+from .storage.layout_repo import LayoutRepository
 
 
 def _is_authed(request: Request, backend_state: BackendState) -> bool:
@@ -42,6 +55,33 @@ def create_app(
     include_routers: bool = True,
 ) -> FastAPI:
     state = backend_state or BackendState(engine=None, version="app")
+    if state.sqlite_connection is None:
+        state.sqlite_connection = init_sqlite(settings.sqlite_path)
+    if state.audit_log is None:
+        state.audit_log = AuditLogRepository(state.sqlite_connection)
+    if state.layout_service is None:
+        state.layout_service = LayoutService(LayoutRepository(state.sqlite_connection))
+    if state.engine is not None and state.rule_service is None:
+        state.rule_service = RuleService(state.engine.automation_rules, audit_log=state.audit_log)
+    if state.engine is not None and state.journal_service is None:
+        state.journal_service = JournalService(state.engine.seller_reviews, audit_log=state.audit_log)
+    if state.engine is not None and state.tick_store_facade is None:
+        state.tick_store_facade = TickStoreFacade(state.engine.tick_store)
+    if state.engine is not None and state.connection_service is None:
+        state.connection_service = ConnectionService(
+            state.engine,
+            auth_enabled=state.auth_enabled,
+            version=state.version,
+        )
+    if state.engine is not None and state.market_service is None:
+        state.market_service = MarketService(state.engine)
+    if state.engine is not None and state.order_service is None:
+        state.order_service = OrderService(state.engine)
+    if state.engine is not None and state.portfolio_service is None:
+        state.portfolio_service = PortfolioService(state.engine)
+    if state.engine is not None and state.stream_service is None:
+        state.stream_service = StreamService(state.engine, state.tick_store_facade)
+
     app = FastAPI(title=settings.app_name)
     app.state.backend_state = state
 
@@ -108,6 +148,7 @@ def create_app(
             automation_router,
             reviews_router,
             diagnostics_router,
+            layouts_router,
             compat_router,
         ):
             app.include_router(router)

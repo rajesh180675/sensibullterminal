@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from ...core.state import get_backend_state
+from ...core.state import get_backend_state, require_market_service
 
 router = APIRouter()
 
@@ -18,11 +18,10 @@ async def api_expiries(
     exchange_code: str = Query("NFO"),
 ):
     _ = exchange_code
-    backend = get_backend_state(request)
     return {
         "success": True,
         "stock_code": stock_code,
-        "expiries": backend.engine.__class__.get_weekly_expiries(stock_code, count=5),
+        "expiries": require_market_service(request).get_expiries(stock_code, count=5),
     }
 
 
@@ -43,29 +42,7 @@ async def api_spot(
         return {"success": True, "spot": cached, "source": "ws_tick", "stock_code": stock_code, "exchange_code": exchange_code}
 
     try:
-        def _call():
-            return engine.breeze.get_quotes(
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-                expiry_date="",
-                right="",
-                strike_price="",
-            )
-
-        result = engine.rate_limiter.enqueue(_call)
-        rows = result.get("Success", []) if isinstance(result, dict) else []
-        if isinstance(rows, dict):
-            rows = [rows]
-        for row in rows:
-            for field in ("ltp", "last_traded_price", "close", "last_price", "LastPrice"):
-                try:
-                    ltp = float(row.get(field) or 0)
-                except (TypeError, ValueError):
-                    ltp = 0.0
-                if ltp > 1000:
-                    engine.tick_store.update(f"{stock_code.upper()}:SPOT", {"ltp": ltp, "is_spot": True, "source": "rest"})
-                    return {"success": True, "spot": ltp, "source": "rest_quote", "stock_code": stock_code, "exchange_code": exchange_code}
-        return {"success": False, "error": f"No spot price returned for {stock_code}/{exchange_code}. Raw Breeze response: {str(result)[:200]}"}
+        return require_market_service(request).get_spot(stock_code, exchange_code)
     except Exception as exc:
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
@@ -84,15 +61,14 @@ async def api_optionchain(
     if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected - POST /api/connect first")
 
-    right_norm = "Call" if (right or "Call").lower().startswith("c") else "Put"
     try:
         data = await asyncio.get_event_loop().run_in_executor(
             None,
-            engine.fetch_option_chain,
+            require_market_service(request).fetch_option_chain,
             stock_code,
             exchange_code,
             expiry_date,
-            right_norm,
+            right or "Call",
             strike_price,
         )
         return {"success": True, "data": data, "count": len(data)}
@@ -115,7 +91,7 @@ async def api_quote(
         raise HTTPException(status_code=401, detail="Not connected")
     try:
         data = await asyncio.get_event_loop().run_in_executor(
-            None, engine.get_quote, stock_code, exchange_code, expiry_date, right, strike_price
+            None, require_market_service(request).get_quote, stock_code, exchange_code, expiry_date, right, strike_price
         )
         return {"success": True, "data": data}
     except Exception as exc:
@@ -141,7 +117,7 @@ async def api_historical(
     try:
         data = await asyncio.get_event_loop().run_in_executor(
             None,
-            engine.get_historical,
+            require_market_service(request).get_historical,
             stock_code,
             exchange_code,
             interval,
@@ -172,7 +148,7 @@ async def api_depth(
     try:
         data = await asyncio.get_event_loop().run_in_executor(
             None,
-            engine.get_market_depth,
+            require_market_service(request).get_depth,
             stock_code,
             exchange_code,
             expiry_date,

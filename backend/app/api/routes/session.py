@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from ...core.state import get_backend_state, iso_utc_now
+from ...core.state import get_backend_state, require_connection_service
 
 router = APIRouter()
 
@@ -14,26 +14,14 @@ router = APIRouter()
 @router.get("/")
 @router.get("/health")
 async def health(request: Request) -> dict[str, Any]:
-    backend = get_backend_state(request)
-    engine = backend.engine
-    return {
-        "status": "online",
-        "connected": engine.connected,
-        "ws_running": engine.ws_running,
-        "subscriptions": len(engine.subscribed),
-        "tick_count": len(engine.tick_store.get_all()["ticks"]),
-        "rest_calls_min": engine.rate_limiter.calls_last_minute,
-        "queue_depth": engine.rate_limiter.queue_depth,
-        "auth_enabled": backend.auth_enabled,
-        "version": backend.version,
-        "timestamp": iso_utc_now(),
-    }
+    service = require_connection_service(request)
+    return service.health()
 
 
 @router.get("/ping")
 async def ping(request: Request) -> dict[str, str]:
-    backend = get_backend_state(request)
-    return {"status": "online", "version": backend.version, "ts": iso_utc_now()}
+    service = require_connection_service(request)
+    return service.ping()
 
 
 @router.post("/api/connect")
@@ -62,8 +50,9 @@ async def api_connect(request: Request):
         )
 
     try:
+        service = require_connection_service(request)
         return await asyncio.get_event_loop().run_in_executor(
-            None, engine.connect, api_key, api_secret, session_token
+            None, service.connect, api_key, api_secret, session_token
         )
     except Exception as exc:
         msg = str(exc)
@@ -79,18 +68,12 @@ async def api_connect(request: Request):
 
 @router.post("/api/disconnect")
 async def api_disconnect(request: Request) -> dict[str, Any]:
-    backend = get_backend_state(request)
-    await asyncio.get_event_loop().run_in_executor(None, backend.engine.disconnect)
+    service = require_connection_service(request)
+    await asyncio.get_event_loop().run_in_executor(None, service.disconnect)
     return {"success": True, "message": "Disconnected"}
 
 
 @router.get("/api/ratelimit")
 async def api_ratelimit(request: Request) -> dict[str, Any]:
-    backend = get_backend_state(request)
-    engine = backend.engine
-    return {
-        "calls_last_minute": engine.rate_limiter.calls_last_minute,
-        "max_per_minute": 100,
-        "min_interval_ms": getattr(type(engine.rate_limiter), "MIN_INTERVAL_MS", 0),
-        "queue_depth": engine.rate_limiter.queue_depth,
-    }
+    service = require_connection_service(request)
+    return service.ratelimit()

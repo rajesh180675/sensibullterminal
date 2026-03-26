@@ -5,7 +5,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from ...core.state import get_backend_state
+from ...core.state import get_backend_state, require_portfolio_service
 
 router = APIRouter()
 
@@ -17,8 +17,8 @@ async def api_order_book(request: Request):
     if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_order_book)
-        return {"success": True, "data": data.get("Success", []) if isinstance(data, dict) else []}
+        data = await asyncio.get_event_loop().run_in_executor(None, require_portfolio_service(request).get_orders)
+        return {"success": True, "data": data}
     except Exception as exc:
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
@@ -30,8 +30,8 @@ async def api_trade_book(request: Request):
     if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_trade_book)
-        return {"success": True, "data": data.get("Success", []) if isinstance(data, dict) else []}
+        data = await asyncio.get_event_loop().run_in_executor(None, require_portfolio_service(request).get_trades)
+        return {"success": True, "data": data}
     except Exception as exc:
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
 
@@ -43,7 +43,7 @@ async def api_positions(request: Request):
     if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_positions)
+        data = await asyncio.get_event_loop().run_in_executor(None, require_portfolio_service(request).get_positions)
         return {"success": True, "data": data}
     except Exception as exc:
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})
@@ -56,7 +56,7 @@ async def api_funds(request: Request):
     if not engine.connected:
         raise HTTPException(status_code=401, detail="Not connected")
     try:
-        data = await asyncio.get_event_loop().run_in_executor(None, engine.get_funds)
+        data = await asyncio.get_event_loop().run_in_executor(None, require_portfolio_service(request).get_funds)
         return {"success": True, "data": data}
     except Exception as exc:
         return JSONResponse(status_code=200, content={"success": False, "error": str(exc)})

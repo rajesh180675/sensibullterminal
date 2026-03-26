@@ -2243,26 +2243,7 @@ app = create_app(
 
 runtime_app = app
 
-
-class _LegacyRouteSink:
-    """Absorb legacy decorators while the modular routers own the live app."""
-
-    def _decorator(self, *args, **kwargs):
-        _ = args, kwargs
-
-        def _wrap(fn):
-            return fn
-
-        return _wrap
-
-    get = post = put = delete = patch = websocket = _decorator
-
-
-# Legacy route declarations below are intentionally inert. The active
-# FastAPI surface comes from backend/app/api/routes/* through create_app().
-app = _LegacyRouteSink()
-
-
+LEGACY_ROUTE_ARCHIVE = r'''
 # ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -3007,6 +2988,7 @@ async def api_checksum(request: Request):
         return {"checksum": checksum, "timestamp": timestamp}
     except Exception as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
+'''
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
