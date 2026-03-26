@@ -2238,8 +2238,29 @@ app = create_app(
         automation_webhook_secret=AUTOMATION_WEBHOOK_SECRET,
         version="7.0",
     ),
-    include_routers=False,
+    include_routers=True,
 )
+
+runtime_app = app
+
+
+class _LegacyRouteSink:
+    """Absorb legacy decorators while the modular routers own the live app."""
+
+    def _decorator(self, *args, **kwargs):
+        _ = args, kwargs
+
+        def _wrap(fn):
+            return fn
+
+        return _wrap
+
+    get = post = put = delete = patch = websocket = _decorator
+
+
+# Legacy route declarations below are intentionally inert. The active
+# FastAPI surface comes from backend/app/api/routes/* through create_app().
+app = _LegacyRouteSink()
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -2994,7 +3015,7 @@ async def api_checksum(request: Request):
 
 def start_uvicorn_thread():
     t = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning"),
+        target=lambda: uvicorn.run(runtime_app, host="0.0.0.0", port=8000, log_level="warning"),
         daemon=True,
         name="uvicorn",
     )
